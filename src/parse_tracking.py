@@ -1,14 +1,18 @@
 """parse_tracking.py — стриминговый ридер файла трекинга (JSON Lines).
 
 Задача 03a: читаем 258 МБ построчно, отдаём header и итератор сэмплов.
-Дальше: 03b — парсер pose (десятичная запятая, проверка |q| ≈ 1.0), 03c — Head + Hand
-(5 точек на руку, флаг isActive), 03d — output/tracking.csv + статистика.
+Задача 03b: ``parse_pose()`` — строка "x,y,z,qx,qy,qz,qw" с десятичной запятой → 7 float
+(проверка |q| ≈ 1.0). Дальше: 03c — Head + Hand (5 точек на руку, флаг isActive),
+03d — output/tracking.csv и статистика.
 
 Формат файла (21 788 строк = header + 21 787 сэмплов):
   * строка 1 — header: ``timeStampNs`` (int), ``cameraIntrinsics`` и ``cameraExtrinsics``
     записаны JSON-строками; в ``cameraExtrinsics`` две матрицы 4×4 (16 чисел плоским
     массивом, row-major) склеены через ``"|"``,
   * строки 2… — по одному JSON-объекту на сэмпл (≈11.8 КБ), пустые строки пропускаем.
+
+Десятичная запятая в pose совпадает с разделителем полей: ``"-0,08517717,..."`` после
+``split(",")`` даёт два токена на число. ``parse_pose()`` склеивает пары.
 
 Запуск:
     python src/parse_tracking.py data/trackingData_20260505_165740.txt
@@ -18,11 +22,17 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
 Matrix4 = list[list[float]]
+
+#: Допуск проверки нормы кватерниона: в данных отклонения ≤ 1.5e-7, так что 1e-6 с запасом.
+QUAT_NORM_TOL = 1e-6
+
+_WHOLE_TOKEN = re.compile(r"[+-]?\d+")
 
 
 def _next_nonempty_line(fh) -> str:
@@ -125,6 +135,54 @@ def count_samples(path: str | Path) -> int:
     return sum(1 for _ in iter_samples(path))
 
 
+def parse_pose(s: str, where: str | None = None) -> list[float]:
+    """Строка позы с десятичной запятой → список float.
+
+    Формат: ``"x,y,z,qx,qy,qz,qw"``, где числа записаны с десятичной запятой, которая
+    совпадает с разделителем полей: ``"-0,08517717,-0,02745685,..."`` → 14 токенов.
+    Штатное правило (чётное число токенов): каждое число — пара ``<целая часть>,<дробная>``,
+    склеиваем ``float(t[i] + "." + t[i+1])`` с шагом 2.
+
+    Нечётное число токенов — стиль ``Body.va`` (``"0,0,0"``): числа записаны без дробной
+    части, поэтому токены берутся как есть, но только если все они целые; иначе формат
+    неоднозначен и бросается ValueError.
+
+    Для 7 чисел (поза) проверяется ``|q| ≈ 1.0`` с допуском :data:`QUAT_NORM_TOL`;
+    в сообщении об ошибке — ``where`` (например, «строка 1234, Head.pose»), чтобы было
+    видно, какой сэмпл сломан.
+    """
+    tokens = [token.strip() for token in s.split(",")]
+    if not s or s.isspace() or len(tokens) == 1:
+        raise ValueError(f"parse_pose{_ctx(where)}: пустая строка позы: {s!r}")
+
+    if len(tokens) % 2 == 0:
+        try:
+            values = [float(tokens[i] + "." + tokens[i + 1]) for i in range(0, len(tokens), 2)]
+        except ValueError as exc:
+            raise ValueError(f"parse_pose{_ctx(where)}: не число в {s!r}") from exc
+    elif all(_WHOLE_TOKEN.fullmatch(token) for token in tokens):
+        values = [float(token) for token in tokens]
+    else:
+        raise ValueError(
+            f"parse_pose{_ctx(where)}: нечётное число токенов ({len(tokens)}) и не все токены "
+            f"целые — формат неоднозначен: {s!r}"
+        )
+
+    if len(values) == 7:
+        norm = math.sqrt(sum(q * q for q in values[3:]))
+        if abs(norm - 1.0) > QUAT_NORM_TOL:
+            raise ValueError(
+                f"parse_pose{_ctx(where)}: |q| = {norm:.9f}, ожидалось 1.0 ± {QUAT_NORM_TOL:g} "
+                f"(q = {values[3:]})"
+            )
+    return values
+
+
+def _ctx(where: str | None) -> str:
+    """Суффикс с контекстом для сообщений об ошибках."""
+    return f" ({where})" if where else ""
+
+
 def main() -> None:
     """CLI: печатает header и сводку сэмплов."""
     parser = argparse.ArgumentParser(description="Прочитать header и посчитать сэмплы файла трекинга.")
@@ -157,6 +215,12 @@ def main() -> None:
     print(f"  сэмплов: {count}")
     if first_ts is not None and last_ts is not None:
         print(f"  t = {(first_ts - ts) / 1e9:.3f} … {(last_ts - ts) / 1e9:.3f} с от header")
+
+    first_sample = next(iter_samples(args.tracking), None)
+    if first_sample is not None and "Head" in first_sample:
+        pose = parse_pose(first_sample["Head"]["pose"], where="первый сэмпл, Head.pose")
+        norm = math.sqrt(sum(q * q for q in pose[3:]))
+        print(f"  первый Head.pose = {[round(v, 6) for v in pose]}, |q| = {norm:.7f}")
 
 
 if __name__ == "__main__":
