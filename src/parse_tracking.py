@@ -161,6 +161,27 @@ def count_samples(path: str | Path) -> int:
     return sum(1 for _ in iter_samples(path))
 
 
+def timestamp_range(path: str | Path) -> tuple[int, int]:
+    """Метки времени первого и последнего сэмплов (Unix ns), потоково.
+
+    Нужна синхронизации видео↔трекинг (задача 04a): конец трекинга — это
+    ``timeStampNs`` последнего сэмпла, а не ``header + tracking_duration_s``
+    (в ``video_meta.json`` это span first→last; разница 18.4 мс).
+    """
+    first: int | None = None
+    last: int | None = None
+    for sample in iter_samples(path):
+        timestamp = sample.get("timeStampNs")
+        if isinstance(timestamp, bool) or not isinstance(timestamp, int):
+            raise ValueError(f"{path}: сэмпл без целого timeStampNs: {timestamp!r}")
+        if first is None:
+            first = timestamp
+        last = timestamp
+    if first is None or last is None:
+        raise ValueError(f"{path}: нет сэмплов")
+    return first, last
+
+
 def parse_pose(s: str, where: str | None = None) -> list[float]:
     """Строка позы с десятичной запятой → список float.
 
