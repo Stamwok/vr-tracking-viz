@@ -26,6 +26,7 @@ from src.sync import (  # noqa: E402
     frame_time,
     iter_frame_poses,
     load_poses,
+    slerp,
 )
 
 DATA = next(iter(sorted((ROOT / "data").glob("trackingData_*.txt"))), None)
@@ -247,8 +248,8 @@ class PoseAtRealDataTest(unittest.TestCase):
         for axis_index in range(3):
             expected = a.head_pos[axis_index] + (b.head_pos[axis_index] - a.head_pos[axis_index]) * w
             self.assertAlmostEqual(pose.head_pos[axis_index], expected, places=12)
-        # кватернион — от ближайшего сэмпла (SLERP — задача 04c)
-        self.assertEqual(pose.head_quat, a.head_quat if w < 0.5 else b.head_quat)
+        # ориентация — SLERP от тех же двух сэмплов с тем же весом (04c); позиции — lerp
+        self.assertEqual(pose.head_quat, slerp(a.head_quat, b.head_quat, w))
 
     def test_first_and_last_samples_are_frozen(self) -> None:
         first = self.track.pose_at(self.header_ns)
