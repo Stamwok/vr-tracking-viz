@@ -1,0 +1,21 @@
+# --- Данные и артефакты (в репозиторий не коммитятся) ---
+# Входные файлы: CameraRecord_*.mp4 (~192 МБ) и trackingData_*.txt (~258 МБ)
+data/
+# Результаты прогонов: overlay.mp4, trajectory.html, tracking.csv
+output/
+*.mp4
+
+# --- Python ---
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.env
+
+# --- macOS / IDE ---
+.DS_Store
+.idea/
+.vscode/
