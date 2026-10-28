@@ -164,6 +164,11 @@ pose = pose_at(t_frame_k)   # позиция — линейно, кватерн�
 - Видео длиннее трекинга на **119 мс** → последние ~3.6 кадра без данных (допущение: замораживаем позу).
 - Пропуски в трекинге до 67.4 мс (≈ 0.6 % сэмплов) — интерполируются.
 - Единые часы: `header.timeStampNs` = первый кадр, `k/30` от него; `predictTime` не используем.
+- Реализация — `src/sync.py` (04a): `frame_time(k)` → `FrameTime(ts_ns, t_rel_s, in_tracking)`,
+  шаг = `duration/frame_count` = 33.3371 мс (не `1/fps` = 33.3360 мс, разница 8.7 мс к концу).
+  Конец трекинга — `parse_tracking.timestamp_range()` (последний сэмпл, +242.5607 с от header),
+  а не `tracking_duration_s` (это span first→last, 242.542 с). Граница «нет данных» — k = 7276,
+  зазор 0.31 мс; кадры 7276–7278 — хвост без сэмплов.
 
 ## 7. Принятые решения (не менять)
 
@@ -172,7 +177,7 @@ pose = pose_at(t_frame_k)   # позиция — линейно, кватерн�
 3. 3–5 точек на руку, не полный скелет из 26.
 4. Работаем с левой половиной SBS-кадра (моно); правая — опционально для проверки стерео.
 5. Один подход, маленькое законченное решение; «приблизительность» наложения допустима и объясняется.
-6. Структура: `data/`, `src/{parse_tracking,video_meta,camera_model,overlay_video,plot_trajectory}.py`,
+6. Структура: `data/`, `src/{parse_tracking,video_meta,sync,camera_model,overlay_video,plot_trajectory}.py`,
    `output/`, `docs/`, `requirements.txt`, `README.md`, `.gitignore`.
 7. **Коммиты — на английском** (conventional commits: `chore:`, `feat:`, `docs:` …, императив;
    в теле — что и почему). Зафиксировано пользователем 28.10.
