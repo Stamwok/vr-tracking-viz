@@ -13,10 +13,10 @@
 интерактивные графики траекторий через Plotly. Достаточно одного подхода.
 
 **Текущий статус (на 28.10, сверять с доской):** данные изучены полностью (разделы 3–6), план — 24
-атомарные задачи (раздел 8). Сделаны 01, 02, 02a–05a (в `main`); 05b и 05c — `in_review` (ветки
-`VTR-05b`, `VTR-05c`; 05c стоит на 05b — мержить по порядку); 07a–12 — `todo`. В репозитории есть
-`src/{parse_tracking,sync,camera_model,config}.py`, `tests/` и `docs/intrinsics.md`. Каждая
-выполненная задача сопровождается записью в `docs/NOTES.md` — см. **раздел 13**.
+атомарные задачи (раздел 8). Сделаны 01, 02, 02a–05c (в `main`); 07a — `in_review` (ветка
+`VTR-07a`); 07b–12 — `todo`. В репозитории есть
+`src/{parse_tracking,sync,camera_model,calib_frames,config}.py`, `tests/` и `docs/intrinsics.md`.
+Каждая выполненная задача сопровождается записью в `docs/NOTES.md` — см. **раздел 13**.
 
 **Рабочая директория:** `/Users/lungful/Projects/VRTrackingTestTask` (DSH workspace `c5608d2b-c7aa-4915-8e13-352692bc5539`).
 
@@ -192,8 +192,9 @@ pose = pose_at(t_frame_k)   # позиция — линейно, кватерн�
 3. 3–5 точек на руку, не полный скелет из 26.
 4. Работаем с левой половиной SBS-кадра (моно); правая — опционально для проверки стерео.
 5. Один подход, маленькое законченное решение; «приблизительность» наложения допустима и объясняется.
-6. Структура: `data/`, `src/{parse_tracking,video_meta,sync,camera_model,config,overlay_video,
-   plot_trajectory}.py`, `output/`, `docs/`, `requirements.txt`, `README.md`, `.gitignore`.
+6. Структура: `data/`, `src/{parse_tracking,video_meta,sync,camera_model,calib_frames,config,
+   overlay_video,plot_trajectory}.py`, `output/`, `docs/`, `requirements.txt`, `README.md`,
+   `.gitignore`. `src/calib_frames.py` — эталон калибровки (07a, см. раздел 12).
    `src/config.py` — единственный источник калибровочных констант (`T_head_cam`: смещение и
    yaw/pitch/roll камеры относительно головы); код камеры читает их оттуда и не хардкодит.
 7. **Коммиты — на английском** (conventional commits: `chore:`, `feat:`, `docs:` …, императив;
@@ -247,6 +248,11 @@ pose = pose_at(t_frame_k)   # позиция — линейно, кватерн�
 Порядок: `01 → 02 → 02a ∥ 03a → 03b → 03c → 03d ∥ 04a–04c ∥ 05a–05c → 07a → 07b → 07c → 08a → 08b → 11 → 10a → 10b → 10c → 12` (09 можно делать сразу после 03d, параллельно ветке 07).
 
 Объём ≈ 21.5 ч, критический путь ≈ 14 ч.
+
+**Эталон для 07b:** `src/calib_frames.py` (07a) — 5 кадров + рамки кистей в координатах левого
+глаза (`TOLERANCE_PX = 50`) и `ignore` для рук, которых в кадре нет. Метрика 07b: сустав, попавший
+внутрь кадра, должен лежать в рамке **своей** руки; PNG регенерируются
+`python src/calib_frames.py data/CameraRecord_*.mp4 --overlay` (в git не идут, `output/`).
 
 **Правила ветки 07:** 07a–07c помечены `urgent`. Риск: калибровка может занять больше времени, чем
 весь остальной пайплайн. Если суммарно ушло > 4 ч — переключаться на упрощённый вариант (только голова
@@ -310,6 +316,10 @@ python -c "import cv2;c=cv2.VideoCapture('data/CameraRecord_20260505_165740.mp4'
   (пинхол, дисторсии в header нет); вход для 05c.
 - `src/config.py` — калибровка «камера относительно головы» (`T_head_cam`): заглушка 05b (без
   поворота, 5 см вперёд), финальные значения — 07c. Менять только здесь.
+- `src/calib_frames.py` — эталон калибровки (07a): `CALIB_FRAMES` (5 кадров 02a + рамки кистей в
+  координатах левого глаза 1080×810, ±50 px, `ignore` для рук вне FOV), `validate_frames()`,
+  `as_json()` для 07b. PNG и `frames.md` — регенерируемый артефакт в `output/debug/calib/`
+  (`python src/calib_frames.py data/CameraRecord_*.mp4 --overlay`), в git не коммитится.
 
 ## 13. Дневник работы: `docs/NOTES.md` (обязателен)
 
