@@ -3,7 +3,8 @@
 Задача 03a: читаем 258 МБ построчно, отдаём header и итератор сэмплов.
 Задача 03b: ``parse_pose()`` — строка "x,y,z,qx,qy,qz,qw" с десятичной запятой → 7 float
 (проверка |q| ≈ 1.0). Задача 03c: ``extract_sample()`` — плоская запись: 3+4 головы,
-по 5 точек на руку, невалидные точки → NaN. Дальше: 03d — output/tracking.csv и статистика.
+по 5 точек на руку, невалидные точки → NaN. Задача 03d: ``write_tracking_csv()`` —
+output/tracking.csv + сводная статистика.
 
 Формат файла (21 788 строк = header + 21 787 сэмплов):
   * строка 1 — header: ``timeStampNs`` (int), ``cameraIntrinsics`` и ``cameraExtrinsics``
@@ -23,6 +24,7 @@ import argparse
 import json
 import math
 import re
+import statistics
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -36,6 +38,27 @@ _WHOLE_TOKEN = re.compile(r"[+-]?\d+")
 
 #: Точки OpenXR, попадающие в плоскую запись: (имя, индекс в HandJointLocations).
 HAND_JOINTS = (("palm", 0), ("wrist", 1), ("thumb", 5), ("index", 10), ("middle", 15))
+
+#: Колонки tracking.csv: время, поза головы, по 5 точек на руку, флаги активности.
+CSV_COLUMNS = (
+    "t_ns",
+    "t_rel_s",
+    "head_x",
+    "head_y",
+    "head_z",
+    "head_qx",
+    "head_qy",
+    "head_qz",
+    "head_qw",
+    *(
+        f"{side}_{name}_{axis}"
+        for side in ("left", "right")
+        for name, _ in HAND_JOINTS
+        for axis in ("x", "y", "z")
+    ),
+    "left_active",
+    "right_active",
+)
 
 
 def _next_nonempty_line(fh) -> str:
@@ -225,10 +248,60 @@ def extract_sample(sample: dict, where: str | None = None) -> dict:
     return record
 
 
+def _csv_row(record: dict, base_ts: int) -> dict:
+    """Строка CSV: t_ns/t_rel_s + остальные поля плоской записи."""
+    row = {
+        "t_ns": record["timeStampNs"],
+        "t_rel_s": round((record["timeStampNs"] - base_ts) / 1e9, 6),
+    }
+    for column in CSV_COLUMNS:
+        if column not in row:
+            row[column] = record[column]
+    return row
+
+
+def frame_stats(frame) -> dict:
+    """Сводка по DataFrame: строки, длительность, медиана dt, невалидные по рукам."""
+    timestamps = frame["t_ns"].tolist()
+    rows = len(timestamps)
+    dt_ms = [(b - a) / 1e6 for a, b in zip(timestamps, timestamps[1:])]
+    left_invalid = int((frame["left_active"] == 0).sum())
+    right_invalid = int((frame["right_active"] == 0).sum())
+    return {
+        "rows": rows,
+        "duration_s": (timestamps[-1] - timestamps[0]) / 1e9 if rows > 1 else 0.0,
+        "median_dt_ms": statistics.median(dt_ms) if dt_ms else 0.0,
+        "left_invalid": left_invalid,
+        "right_invalid": right_invalid,
+        "left_invalid_pct": 100.0 * left_invalid / rows if rows else 0.0,
+        "right_invalid_pct": 100.0 * right_invalid / rows if rows else 0.0,
+    }
+
+
+def write_tracking_csv(tracking_path: str | Path, out_path: str | Path, header: dict | None = None) -> dict:
+    """Читает txt потоково, пишет tracking.csv (NaN → пустые поля) и возвращает статистику.
+
+    pandas импортируется локально: read_header/parse_pose/extract_sample остаются
+    без зависимости от него.
+    """
+    import pandas as pd
+
+    header = header or read_header(tracking_path)
+    base_ts = header["timeStampNs"]
+    rows = [_csv_row(extract_sample(sample), base_ts) for sample in iter_samples(tracking_path)]
+
+    frame = pd.DataFrame(rows, columns=list(CSV_COLUMNS))
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(out_path, index=False)
+    return frame_stats(frame)
+
+
 def main() -> None:
-    """CLI: печатает header и сводку сэмплов."""
-    parser = argparse.ArgumentParser(description="Прочитать header и посчитать сэмплы файла трекинга.")
+    """CLI: печатает header и сводку; с -o пишет tracking.csv."""
+    parser = argparse.ArgumentParser(description="Прочитать файл трекинга; с -o записать tracking.csv.")
     parser.add_argument("tracking", type=Path, help="путь к txt, например data/trackingData_*.txt")
+    parser.add_argument("-o", "--out", type=Path, default=None, help="куда записать CSV (output/tracking.csv)")
     args = parser.parse_args()
 
     if not args.tracking.is_file():
@@ -245,18 +318,30 @@ def main() -> None:
         translation = matrix[0][3], matrix[1][3], matrix[2][3]
         print(f"    [{i}] 4-й столбец (t) = ({translation[0]:.4f}, {translation[1]:.4f}, {translation[2]:.4f})")
 
-    count = 0
-    first_ts = last_ts = None
-    for count, sample in enumerate(iter_samples(args.tracking), start=1):
-        sample_ts = sample.get("timeStampNs")
-        if sample_ts is None:
-            continue
-        if first_ts is None:
-            first_ts = sample_ts
-        last_ts = sample_ts
-    print(f"  сэмплов: {count}")
-    if first_ts is not None and last_ts is not None:
-        print(f"  t = {(first_ts - ts) / 1e9:.3f} … {(last_ts - ts) / 1e9:.3f} с от header")
+    if args.out is not None:
+        stats = write_tracking_csv(args.tracking, args.out, header)
+        print(
+            f"  строк: {stats['rows']}, длительность: {stats['duration_s']:.2f} с, "
+            f"медиана dt: {stats['median_dt_ms']:.2f} мс"
+        )
+        print(
+            f"  невалидные: левая {stats['left_invalid']} ({stats['left_invalid_pct']:.1f} %), "
+            f"правая {stats['right_invalid']} ({stats['right_invalid_pct']:.1f} %)"
+        )
+        print(f"  -> {args.out} ({len(CSV_COLUMNS)} колонок)")
+    else:
+        count = 0
+        first_ts = last_ts = None
+        for count, sample in enumerate(iter_samples(args.tracking), start=1):
+            sample_ts = sample.get("timeStampNs")
+            if sample_ts is None:
+                continue
+            if first_ts is None:
+                first_ts = sample_ts
+            last_ts = sample_ts
+        print(f"  сэмплов: {count}")
+        if first_ts is not None and last_ts is not None:
+            print(f"  t = {(first_ts - ts) / 1e9:.3f} … {(last_ts - ts) / 1e9:.3f} с от header")
 
     first_sample = next(iter_samples(args.tracking), None)
     if first_sample is not None and "Head" in first_sample:
