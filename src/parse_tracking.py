@@ -2,8 +2,8 @@
 
 Задача 03a: читаем 258 МБ построчно, отдаём header и итератор сэмплов.
 Задача 03b: ``parse_pose()`` — строка "x,y,z,qx,qy,qz,qw" с десятичной запятой → 7 float
-(проверка |q| ≈ 1.0). Дальше: 03c — Head + Hand (5 точек на руку, флаг isActive),
-03d — output/tracking.csv и статистика.
+(проверка |q| ≈ 1.0). Задача 03c: ``extract_sample()`` — плоская запись: 3+4 головы,
+по 5 точек на руку, невалидные точки → NaN. Дальше: 03d — output/tracking.csv и статистика.
 
 Формат файла (21 788 строк = header + 21 787 сэмплов):
   * строка 1 — header: ``timeStampNs`` (int), ``cameraIntrinsics`` и ``cameraExtrinsics``
@@ -33,6 +33,9 @@ Matrix4 = list[list[float]]
 QUAT_NORM_TOL = 1e-6
 
 _WHOLE_TOKEN = re.compile(r"[+-]?\d+")
+
+#: Точки OpenXR, попадающие в плоскую запись: (имя, индекс в HandJointLocations).
+HAND_JOINTS = (("palm", 0), ("wrist", 1), ("thumb", 5), ("index", 10), ("middle", 15))
 
 
 def _next_nonempty_line(fh) -> str:
@@ -183,6 +186,45 @@ def _ctx(where: str | None) -> str:
     return f" ({where})" if where else ""
 
 
+def _joint_xyz(
+    joints: list[dict], index: int, active: bool, where: str | None
+) -> tuple[float, float, float]:
+    """Позиция сустава (x, y, z) или NaN×3, если рука/сустав невалидны."""
+    if not active or index >= len(joints) or joints[index].get("s", 0) == 0:
+        return (math.nan, math.nan, math.nan)
+    pose = parse_pose(joints[index]["p"], where=where)
+    return (pose[0], pose[1], pose[2])
+
+
+def extract_sample(sample: dict, where: str | None = None) -> dict:
+    """Плоская запись сэмпла: поза головы (3+4) + по 5 точек на руку (x, y, z) + isActive.
+
+    Невалидные точки (``isActive == 0`` у руки или ``s == 0`` у сустава) — NaN, а не нули:
+    у неактивной правой руки ``p`` содержит «замороженную» позу с |q| ≈ 1, так что без
+    проверки флагов скелет нарисовался бы где-то в стороне от руки.
+    """
+    head = sample["Head"]
+    head_where = f"{where}, Head.pose" if where else "Head.pose"
+    pose = parse_pose(head["pose"], where=head_where)
+
+    record: dict[str, float | int] = {"timeStampNs": int(sample["timeStampNs"])}
+    for key, value in zip(("x", "y", "z", "qx", "qy", "qz", "qw"), pose):
+        record[f"head_{key}"] = value
+
+    for side, hand_key in (("left", "leftHand"), ("right", "rightHand")):
+        hand = sample["Hand"].get(hand_key, {})
+        active = bool(hand.get("isActive"))
+        joints = hand.get("HandJointLocations", [])
+        record[f"{side}_active"] = 1 if active else 0
+        for name, index in HAND_JOINTS:
+            joint_where = f"{where}, {side} {name}" if where else f"{side} {name}"
+            x, y, z = _joint_xyz(joints, index, active, joint_where)
+            record[f"{side}_{name}_x"] = x
+            record[f"{side}_{name}_y"] = y
+            record[f"{side}_{name}_z"] = z
+    return record
+
+
 def main() -> None:
     """CLI: печатает header и сводку сэмплов."""
     parser = argparse.ArgumentParser(description="Прочитать header и посчитать сэмплы файла трекинга.")
@@ -221,6 +263,16 @@ def main() -> None:
         pose = parse_pose(first_sample["Head"]["pose"], where="первый сэмпл, Head.pose")
         norm = math.sqrt(sum(q * q for q in pose[3:]))
         print(f"  первый Head.pose = {[round(v, 6) for v in pose]}, |q| = {norm:.7f}")
+
+        record = extract_sample(first_sample, where="первый сэмпл")
+        right_nan = sum(
+            math.isnan(record[f"right_{name}_{axis}"]) for name, _ in HAND_JOINTS for axis in "xyz"
+        )
+        print(
+            f"  извлечение: head=({record['head_x']:.3f}, {record['head_y']:.3f}, {record['head_z']:.3f}), "
+            f"left_active={record['left_active']}, right_active={record['right_active']}, "
+            f"right NaN = {right_nan}/{3 * len(HAND_JOINTS)}"
+        )
 
 
 if __name__ == "__main__":
