@@ -177,6 +177,7 @@ vr-tracking-viz/
 ├── data/                    # входные файлы (не коммитятся)
 ├── src/
 │   ├── parse_tracking.py    # txt (JSON Lines) → DataFrame → CSV
+│   ├── video_meta.py        # метаданные видео (video_meta.json) + debug-кадр SBS
 │   ├── camera_model.py      # интринсики, world→camera, проекция 3D→2D
 │   ├── overlay_video.py     # наложение скелета на видео
 │   └── plot_trajectory.py   # Plotly: 3D-траектории и x(t)/y(t)/z(t)
