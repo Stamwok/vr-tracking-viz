@@ -41,20 +41,28 @@
 это та же формула, если ``T_head_cam`` — поза камеры в голове (переводит координаты
 камеры в координаты головы), а для координат камеры берётся обратная композиция.
 
-Задача 05c (``project``) сюда не входит.
+Задача 05c: точка камеры → пиксель (:func:`project`): ``u = fx·X/Z + cx``,
+``v = fy·Y/Z + cy``; ``Z <= 0.01 м`` → ``visible = False`` (и ``u = v = NaN``, чтобы такая
+точка не нарисовалась по ошибке). Координаты — в пикселях одного глаза SBS-пары: левый
+глаз — обрезанная половина (``u ∈ [0, 1080)``), правый — та же картинка плюс ширина глаза
+(``u ∈ [1080, 2160)``), поэтому «правый глаз = +1080 к u» получается само, если взять
+per-eye интринсики правого глаза. Принадлежность кадру проверяет :func:`in_frame`. Здесь
+только геометрия — отрисовка (08a) по этим числам обрезает кадр и рисует на нём.
 
 Запуск:
     python src/camera_model.py data/trackingData_20260505_165740.txt
     python src/camera_model.py data/trackingData_20260505_165740.txt --world-to-camera
+    python src/camera_model.py data/trackingData_20260505_165740.txt --project
 """
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import NamedTuple, Sequence
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -286,6 +294,24 @@ def _vector(values: object, length: int, what: str) -> tuple[float, ...]:
     if len(items) != length:
         raise ValueError(f"{what}: ожидалось {length} чисел, получено {len(items)}")
     return tuple(_number(item, f"{what}[{index}]") for index, item in enumerate(items))
+
+
+def _point3(point: object) -> tuple[float, float, float]:
+    """Три числа из точки камеры; NaN/inf разрешены (это «нет данных», решает вызывающий)."""
+    if isinstance(point, (str, bytes)):
+        raise ValueError(f"p_cam: ожидалась точка (x, y, z), получено {point!r}")
+    try:
+        items = list(point)  # type: ignore[arg-type]
+    except TypeError:
+        raise ValueError(f"p_cam: ожидалась точка (x, y, z), получено {point!r}") from None
+    if len(items) != 3:
+        raise ValueError(f"p_cam: ожидалось 3 числа (x, y, z), получено {len(items)}")
+    numbers = []
+    for index, item in enumerate(items):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise ValueError(f"p_cam[{index}]: ожидалось число, получено {item!r}")
+        numbers.append(float(item))
+    return numbers[0], numbers[1], numbers[2]
 
 
 def _matrix4(matrix: object, what: str) -> Matrix4:
@@ -545,6 +571,157 @@ def world_to_camera(
     return transform_point(matrix, p_world)
 
 
+# --- 05c: проекция точки камеры в пиксели одного глаза ---------------------------------------
+
+#: Минимальная глубина проекции, м: при ``Z <= MIN_DEPTH_M`` точка считается невидимой.
+#: 1 см — заметно меньше любого рабочего расстояния (руки в 0.4 м от головы), но отсекает
+#: точки у самой камеры, где ``1/Z`` уводит пиксель за тысячи.
+MIN_DEPTH_M = 1e-2
+
+#: Относительный допуск проверки «интринсики описывают полный SBS-кадр» (``fx/fy ≈ 2``).
+SBS_FX_TOL = 1e-3
+
+
+class ProjectedPoint(NamedTuple):
+    """Пиксель одного глаза: ``u`` вправо, ``v`` вниз (OpenCV), ``visible`` — можно ли рисовать.
+
+    ``visible = False`` — точка за камерой / ближе :data:`MIN_DEPTH_M`; тогда ``u`` и ``v``
+    равны ``NaN``, а не «мусорным» тысячам пикселей: так рендер (08a) не соединит лишним
+    отрезком кисть с точкой за спиной. Само попадание в кадр — отдельный вопрос
+    (:func:`in_frame`): точка может быть видимой, но выйти за край кадра.
+    """
+
+    u: float
+    v: float
+    visible: bool
+
+
+def _full_sbs_intrinsics(intrinsics: object, what: str = "intrinsics") -> Intrinsics:
+    """Проверить, что это интринсики ПОЛНОГО SBS-кадра (как ``Intrinsics.from_header``).
+
+    :func:`eye_intrinsics` и :func:`in_frame` сами берут половину кадра, поэтому per-eye
+    набор сюда передавать нельзя: у него ``fx == fy`` и ширина 1080, и пересчёт «половины»
+    дал бы вдвое меньший масштаб. Per-eye набор не проходит две проверки полного кадра:
+
+    * центр кадра: ``cx = full_w/2 − 0.5``, ``cy = full_h/2 − 0.5`` (у ``per_eye("right")``
+      ``cx = 1619.5`` при ширине 1080 — это координата полного кадра, а не центра);
+    * SBS-масштаб фокуса: у полного кадра ``fx`` посчитан от полной ширины, поэтому
+      ``fx/fy ≈ full_w/eye_w = 2`` (в данных 1.99990), а у per-eye ``fx == fy``.
+    """
+    if not isinstance(intrinsics, Intrinsics):
+        raise ValueError(
+            f"{what}: ожидались Intrinsics полного SBS-кадра, получено {intrinsics!r}"
+        )
+    expected_cx = intrinsics.full_w / 2.0 - 0.5
+    expected_cy = intrinsics.full_h / 2.0 - 0.5
+    if abs(intrinsics.cx - expected_cx) > SIZE_TOL or abs(intrinsics.cy - expected_cy) > SIZE_TOL:
+        raise ValueError(
+            f"{what}: центр ({intrinsics.cx:g}, {intrinsics.cy:g}) не совпадает с центром "
+            f"полного кадра {intrinsics.full_w}×{intrinsics.full_h} "
+            f"({expected_cx:g}, {expected_cy:g}) — это per-eye набор, а нужен полный SBS-кадр"
+        )
+    expected_ratio = intrinsics.full_w / intrinsics.eye_w
+    ratio = intrinsics.fx / intrinsics.fy
+    if abs(ratio - expected_ratio) > SBS_FX_TOL * expected_ratio:
+        raise ValueError(
+            f"{what}: fx/fy = {ratio:.6f}, а для полного SBS-кадра ожидалось "
+            f"full_w/eye_w = {expected_ratio:g} (per-eye набор берётся внутри project_eye)"
+        )
+    return intrinsics
+
+
+def eye_intrinsics(intrinsics: Intrinsics, side: str = "left") -> Intrinsics:
+    """Per-eye интринсики из полного SBS-кадра: ``side`` — ``"left"`` или ``"right"``.
+
+    Левый глаз: ``fx = fy = 686.868``, ``cx = 539.5`` в координатах обрезанной половины
+    ``0…1080``, ``cy = 404.5``. Правый: ``cx = 1619.5`` — те же 539.5 плюс ширина глаза
+    1080, т.е. координата в полном SBS-кадре («правый глаз = +1080 к u»).
+    """
+    full = _full_sbs_intrinsics(intrinsics)
+    if side not in ("left", "right"):
+        raise ValueError(f"side: ожидалось 'left' или 'right', получено {side!r}")
+    return full.per_eye(side)
+
+
+def project(p_cam: Sequence[float], intrinsics: Intrinsics) -> ProjectedPoint:
+    """Точка камеры → пиксель: ``u = fx·X/Z + cx``, ``v = fy·Y/Z + cy`` (пинхол, без дисторсии).
+
+    ``p_cam`` — ``(X, Y, Z)`` в системе камеры: ``X`` вправо, ``Y`` вниз (OpenCV после флага
+    ``opencv_conventions``), ``Z`` вперёд по взгляду — то, что отдаёт :func:`world_to_camera`.
+    ``intrinsics`` — те интринсики, в чьих пикселях нужен ответ: кадр глаза
+    (:func:`eye_intrinsics`) или полный SBS-кадр (тогда пиксель будет в координатах 2160×810).
+
+    Отсечение по глубине: ``Z <= MIN_DEPTH_M`` (1 см) → ``visible = False`` и ``u = v = NaN``.
+    При ``Z ≈ 0`` проекция не определена (``1/Z`` даёт мусор за тысячи пикселей), а при
+    ``Z < 0`` точка вообще за камерой и её пиксель «переворачивается» на противоположную
+    сторону — поэтому такой результат не отдаётся даже как «число для отладки».
+    Нефинитная координата (``NaN``/``inf``) — это «нет данных» (так помечены неактивные
+    руки в 03c/04b), а не ошибка входа: такая точка тоже даёт ``visible = False``, и рендер
+    может звать ``project`` на всех точках подряд, не проверяя NaN заранее.
+    """
+    if not isinstance(intrinsics, Intrinsics):
+        raise ValueError(f"intrinsics: ожидались Intrinsics, получено {intrinsics!r}")
+    x, y, z = _point3(p_cam)
+    if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+        return ProjectedPoint(math.nan, math.nan, False)
+    if not z > MIN_DEPTH_M:
+        return ProjectedPoint(math.nan, math.nan, False)
+    u = intrinsics.fx * x / z + intrinsics.cx
+    v = intrinsics.fy * y / z + intrinsics.cy
+    if not (math.isfinite(u) and math.isfinite(v)):  # переполнение при крошечном Z
+        return ProjectedPoint(math.nan, math.nan, False)
+    return ProjectedPoint(u, v, True)
+
+
+def project_eye(
+    p_cam: Sequence[float], intrinsics: Intrinsics, side: str = "left"
+) -> ProjectedPoint:
+    """Проекция в пиксели одного глаза SBS-пары (``intrinsics`` — полный кадр 2160×810).
+
+    Левый глаз — координаты обрезанной половины (``u ∈ [0, 1080)``), правый — той же
+    половины плюс 1080 (``u ∈ [1080, 2160)``), т.е. «правый глаз = +1080 к u». Рендер
+    рисует либо на обрезанной половине (``frame[:, :1080]``), либо в полном кадре — оба
+    случая используют одно и то же число ``u``.
+    """
+    return project(p_cam, eye_intrinsics(intrinsics, side))
+
+
+def project_points(
+    points: Sequence[Sequence[float]], intrinsics: Intrinsics, side: str = "left"
+) -> list[ProjectedPoint]:
+    """Проекция набора точек камеры в пиксели одного глаза (по одной на точку, порядок сохранён).
+
+    Удобно для 10 точек кистей кадра: ``project_points(points, intrinsics, "left")``.
+    """
+    if isinstance(points, (str, bytes)):
+        raise ValueError(f"points: ожидалась последовательность точек, получено {points!r}")
+    try:
+        items = list(points)
+    except TypeError:
+        raise ValueError(
+            f"points: ожидалась последовательность точек (x, y, z), получено {points!r}"
+        ) from None
+    eye = eye_intrinsics(intrinsics, side)
+    return [project(point, eye) for point in items]
+
+
+def in_frame(point: ProjectedPoint, intrinsics: Intrinsics, side: str = "left") -> bool:
+    """Лежит ли пиксель внутри кадра глаза (``1080×810`` в этой записи).
+
+    Левый глаз: ``0 <= u < 1080``; правый: ``1080 <= u < 2160`` (координаты полного кадра);
+    ``0 <= v < 810``. Границы полуоткрытые: ``u = 1080`` у левого глаза — уже шов SBS
+    (первый столбец правого глаза), ``v = 810`` — строка за нижним краем.
+    Невидимая точка (``visible = False``, ``u/v = NaN``) — всегда ``False``.
+    """
+    full = _full_sbs_intrinsics(intrinsics)
+    if side not in ("left", "right"):
+        raise ValueError(f"side: ожидалось 'left' или 'right', получено {side!r}")
+    if not point.visible:
+        return False
+    offset = full.eye_w if side == "right" else 0
+    return (offset <= point.u < offset + full.eye_w) and (0.0 <= point.v < full.eye_h)
+
+
 def _sample_pose(sample: dict, where: str | None = None) -> tuple[float, ...]:
     """Поза головы 7 числами из сэмпла файла трекинга (``Head.pose``), для CLI-проверки."""
     return tuple(float(value) for value in parse_pose(sample["Head"]["pose"], where))
@@ -619,10 +796,97 @@ def _head_cam_report(tracking: Path, samples: int) -> int:
     return 0
 
 
+#: Отладочные кадры 02a (те же, что берёт 07a): 5 разных положений кистей в кадре.
+DEBUG_FRAMES = (30, 1800, 3600, 5400, 7200)
+
+
+def _project_report(tracking: Path, meta_path: Path, frames: Sequence[int]) -> int:
+    """Проверка 05c на данных: центр кадра, угловой охват FOV и кисти на отладочных кадрах.
+
+    Что печатается:
+
+    * проекция точки на оси взгляда ``(0, 0, 1)`` — обязана попасть в главную точку
+      ``(539.5, 404.5)`` у левого глаза, а у правого — на 1080 правее;
+    * сетка лучей внутри FOV (0.99 полуугла) — все пиксели обязаны лежать в ``1080×810``
+      (это и есть проверка «центр сцены не выходит за кадр»: сама геометрия, без T_head_cam);
+    * на отладочных кадрах — поза из ``sync.pose_at``, проекция взгляда и точки кистей:
+      сколько точек конечно, сколько видимо (``Z > 1 см``) и сколько попало в кадр, для обеих
+      конвенций кватерниона. «В кадре» у кистей пока 0 — калибровка осей это 07b.
+    """
+    from src.parse_tracking import timestamp_range
+    from src.sync import frame_time, load_poses
+
+    header = read_header(tracking)
+    intrinsics = Intrinsics.from_header(header)
+    header_ns = int(header["timeStampNs"])
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    tracking_end_ns = timestamp_range(tracking)[1]
+    track = load_poses(tracking)
+    eye = intrinsics.per_eye("left")
+    eye_w, eye_h = intrinsics.eye_w, intrinsics.eye_h
+
+    print(tracking)
+    print(f"  интринсики: полный SBS-кадр {intrinsics.full_w}×{intrinsics.full_h}")
+    print(
+        f"  per-eye левый: fx = fy = {eye.fx:.3f}, cx = {eye.cx:g}, cy = {eye.cy:g}; "
+        f"правый cx = {intrinsics.per_eye('right').cx:g} (+{eye_w})"
+    )
+    for side, title in (("left", "левый"), ("right", "правый")):
+        axis = project_eye((0.0, 0.0, 1.0), intrinsics, side)
+        print(
+            f"  {title} глаз: (0, 0, 1) → (u, v) = ({axis.u:.1f}, {axis.v:.1f}), "
+            f"visible = {axis.visible}, в кадре = {in_frame(axis, intrinsics, side)}"
+        )
+
+    fov_h, fov_v, _ = eye.fov_deg()
+    half_h = math.radians(fov_h / 2.0) * 0.99
+    half_v = math.radians(fov_v / 2.0) * 0.99
+    steps = 25
+    total = inside = 0
+    for i in range(steps):
+        angle_h = -half_h + 2.0 * half_h * i / (steps - 1)
+        for j in range(steps):
+            angle_v = -half_v + 2.0 * half_v * j / (steps - 1)
+            point = project_eye((math.tan(angle_h), math.tan(angle_v), 1.0), intrinsics, "left")
+            total += 1
+            inside += in_frame(point, intrinsics, "left")
+    print(
+        f"  центр сцены: {inside}/{total} лучей в пределах {eye_w}×{eye_h} "
+        f"(углы до 0.99·FOV/2 = {fov_h / 2.0:.2f}° × {fov_v / 2.0:.2f}°)"
+    )
+    print(
+        f"  отладочные кадры: {'k':>5}{'t, с':>8}{'конвенция':>19}{'взгляд u, v':>18}"
+        f"{'кисти: finite/видимо/в кадре':>30}"
+    )
+    for k in frames:
+        frame = frame_time(k, meta, header_ns, tracking_end_ns)
+        pose = track.pose_at(frame.ts_ns)
+        for invert in (False, True):
+            matrix = world_to_camera_matrix(pose, invert_quat=invert)
+            gaze_world = transform_point(head_to_world(pose, invert_quat=invert), (0.0, 0.0, 1.0))
+            gaze = project_eye(transform_point(matrix, gaze_world), intrinsics, "left")
+            finite = visible = framed = 0
+            for point_world in pose.hands.values():
+                if any(math.isnan(value) for value in point_world):
+                    continue
+                finite += 1
+                point = project_eye(transform_point(matrix, point_world), intrinsics, "left")
+                visible += point.visible
+                framed += in_frame(point, intrinsics, "left")
+            label = "invert_quat=True" if invert else "invert_quat=False"
+            print(
+                f"  {k:>9}{frame.t_rel_s:>8.2f}{label:>19}"
+                f"{f'({gaze.u:.1f}, {gaze.v:.1f})':>18}{f'{finite}/10, {visible}, {framed}':>30}"
+            )
+    print("  «в кадре 0» у кистей — ожидаемо: T_head_cam пока заглушка из 05b, калибровка — 07b/07c.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
-    """CLI: интринсики SBS-кадра (05a) или перевод мира в координаты камеры (05b)."""
+    """CLI: интринсики SBS-кадра (05a), мира → камеру (05b) или проекция в пиксели (05c)."""
     parser = argparse.ArgumentParser(
-        description="Интринсики из header (05a) и перевод мира в координаты камеры (05b)."
+        description="Интринсики из header (05a), перевод мира в координаты камеры (05b) "
+        "и проекция в пиксели одного глаза (05c)."
     )
     parser.add_argument(
         "tracking", type=Path, help="файл трекинга, например data/trackingData_20260505_165740.txt"
@@ -631,6 +895,22 @@ def main(argv: list[str] | None = None) -> int:
         "--world-to-camera",
         action="store_true",
         help="показать T_head_cam из config.py и проверить перевод на реальных позах (05b)",
+    )
+    parser.add_argument(
+        "--project",
+        action="store_true",
+        help="проверить проекцию в пиксели: центр кадра, охват FOV и кисти на отладочных кадрах (05c)",
+    )
+    parser.add_argument(
+        "--frames",
+        default=",".join(str(k) for k in DEBUG_FRAMES),
+        help=f"кадры для --project через запятую (по умолчанию {','.join(map(str, DEBUG_FRAMES))})",
+    )
+    parser.add_argument(
+        "--meta",
+        type=Path,
+        default=Path("output/video_meta.json"),
+        help="video_meta.json с duration/frame_count — нужен для --project (по умолчанию output/video_meta.json)",
     )
     parser.add_argument(
         "--samples",
@@ -643,6 +923,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.world_to_camera:
         try:
             return _head_cam_report(args.tracking, args.samples)
+        except (OSError, ValueError) as exc:
+            print(f"ошибка: {exc}", file=sys.stderr)
+            return 1
+
+    if args.project:
+        try:
+            frames = [int(item) for item in args.frames.split(",") if item.strip()]
+        except ValueError:
+            print(f"ошибка: --frames ожидает номера кадров через запятую, получено {args.frames!r}",
+                  file=sys.stderr)
+            return 1
+        try:
+            return _project_report(args.tracking, args.meta, frames)
         except (OSError, ValueError) as exc:
             print(f"ошибка: {exc}", file=sys.stderr)
             return 1
