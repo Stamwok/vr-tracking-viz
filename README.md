@@ -12,7 +12,8 @@
 1. Парсит файл трекинга (JSON Lines) в таблицу `output/tracking.csv`.
 2. Синхронизирует кадры видео с сэмплами трекинга (~90 Гц трекинг против 30 fps видео).
 3. Проецирует 3D-точки рук и головы в координаты кадра (камера-обскура, интринсики из записи).
-4. Рендерит `output/overlay.mp4` — видео с наложенным «скелетом»: 3–5 точек на руку, маркер головы, след.
+4. Рендерит `output/overlay_skeleton.mp4` — видео (левый глаз SBS-кадра, 1080×810) с наложенным
+   «скелетом»: 5 точек и 4 линии на каждую руку; след и HUD добавляются в 08b.
 5. Строит `output/trajectory.html` — интерактивные Plotly-графики: 3D-траектории, x(t)/y(t)/z(t), скорости.
 
 ### Пример результата
@@ -201,13 +202,20 @@ pip install -r requirements.txt
 # data/trackingData_20260505_165740.txt
 
 python src/parse_tracking.py data/trackingData_20260505_165740.txt -o output/tracking.csv
-python src/overlay_video.py --video data/CameraRecord_20260505_165740.mp4 \
-                            --tracking output/tracking.csv \
-                            --out output/overlay.mp4
+python src/overlay_video.py data/CameraRecord_20260505_165740.mp4 \
+                            --tracking data/trackingData_20260505_165740.txt \
+                            --out output/overlay_skeleton.mp4
 python src/plot_trajectory.py --tracking output/tracking.csv -o output/trajectory.html
 ```
 
-Результаты: `output/tracking.csv`, `output/overlay.mp4`, `output/trajectory.html`
+Рендер читает **сырой** файл трекинга, а не `tracking.csv`: для синхронизации нужен
+`header.timeStampNs` — метка первого кадра видео, которой в CSV нет (CSV остаётся входом графиков).
+Полный клип — 7279 кадров, 1080×810, H.264 — рендерится за **≈62 с** (≈118 кадр/с) в файл 94.6 МиБ;
+время замерено на этой машине и зависит от CPU/кодека, прогресс печатается каждые 300 кадров.
+PNG-проверка наложения на 5 отладочных кадрах: `python src/overlay_video.py
+data/CameraRecord_*.mp4 --stills output/debug/overlay`.
+
+Результаты: `output/tracking.csv`, `output/overlay_skeleton.mp4`, `output/trajectory.html`
 (открывается в браузере без сервера).
 
 ## Структура репозитория

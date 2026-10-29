@@ -13,10 +13,11 @@
 интерактивные графики траекторий через Plotly. Достаточно одного подхода.
 
 **Текущий статус (на 29.10, сверять с доской):** данные изучены полностью (разделы 3–6), план — 24
-атомарные задачи (раздел 8). Сделаны 01, 02, 02a–05c, 07a, 07b (в `main`); 07c — `in_review` (ветка
-`VTR-07c`: константы зафиксированы в `src/config.py`, обоснование — `docs/projection_notes.md`,
-метрика 39/39 на эталоне 07a); 08a–12 — `todo`. В репозитории есть
-`src/{parse_tracking,sync,camera_model,calib_frames,calib_search,config}.py`, `tests/` и
+атомарные задачи (раздел 8). Сделаны 01, 02, 02a–05c, 07a–07c (в `main`, 07c смержена); 08a —
+`in_review` (ветка `VTR-08a`: `src/overlay_video.py`, рендер 7279 кадров 1080×810 за 61.6 с,
+`output/overlay_skeleton.mp4` 94.6 МиБ H.264, 43 новых теста, запись — `docs/NOTES.md`, 29.10);
+08b, 09, 10a–10c, 11, 12 — `todo`. В репозитории есть
+`src/{parse_tracking,sync,camera_model,calib_frames,calib_search,config,overlay_video}.py`, `tests/` и
 `docs/{intrinsics,projection_notes}.md`. Каждая выполненная задача сопровождается записью в
 `docs/NOTES.md` — см. **раздел 13**.
 
@@ -280,7 +281,7 @@ pose = pose_at(t_frame_k)   # позиция — линейно, кватерн�
 | **07a** urgent | Рабочий набор 5 кадров + ожидаемые области кистей | 02a, 03c | 0.5 ч |
 | **07b** urgent ✅ | Перебор знаков осей + грубый `T_head_cam` | 05c, 02a, 07a | 2 ч |
 | **07c** urgent ✅ | Зафиксировать константы + обоснование | 07b | 1 ч |
-| 08a | Рендер скелета (точки + линии, цвета рук) | 07c | 1.5 ч |
+| 08a ✅ | Рендер скелета (точки + линии, цвета рук) | 07c | 1.5 ч |
 | 08b | Trail + HUD | 08a | 1 ч |
 | 09 | Plotly-графики (минимум — только 3D-траектории) | 03d | 1.5 ч |
 | 10a | README: технические разделы | 08b, 09 | 1.5 ч |
@@ -375,6 +376,15 @@ python -c "import cv2;c=cv2.VideoCapture('data/CameraRecord_20260505_165740.mp4'
   покрытия и минимальной правкой модели, плато чувствительности, PNG `top1..3.png` и JSON
   `output/debug/calib/calibration.json` для 07c. CLI: `python src/calib_search.py
   data/trackingData_*.txt --video data/CameraRecord_*.mp4`.
+- `src/overlay_video.py` — покадровый рендер скелета кистей (08a): `Scene` (meta + `header_ns` +
+  `PoseTrack` + `Intrinsics`), `project_hands` (10 точек через калибровку 07c), `draw_skeleton`
+  (5 точек + 4 линии на руку, левая голубая / правая красная, как в разметке 07a), `render_video`
+  (H.264 `avc1` → fallback `mp4v`, прогресс каждые N кадров, `probe_output` перечитывает файл),
+  `render_stills` (PNG 5 кадров 07a). Выход — левый глаз SBS 1080×810, fps записи =
+  `frame_count/duration` = 29.9966; полный клип 7279 кадров рендерится **61.6 с** (118 кадр/с) в
+  `output/overlay_skeleton.mp4` (94.6 МиБ). CLI: `--start/--end/--scale/--out/--progress-every/
+  --stills/--frames/--fourcc`. Вход — сырой `trackingData_*.txt`, не `tracking.csv`: для
+  синхронизации нужен `header.timeStampNs`, которого в CSV нет.
 
 ## 13. Дневник работы: `docs/NOTES.md` (обязателен)
 
