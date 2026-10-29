@@ -236,7 +236,9 @@ class ImageMetricTest(unittest.TestCase):
         image[v - 15 : v + 15, u - 15 : u + 15] = SKIN_BGR
         distance = diag.skin_distance_map(image)
         error, delta = diag.best_offset_ms(scene, 1, distance)
-        self.assertAlmostEqual(delta, -100.0, places=6)
+        # сетка скана в 08c — шаг 5 мс: квадрат «кожи» 30×30 px на 4 м/с покрывает ±6 мс,
+        # поэтому минимум может оказаться на соседнем узле; важна зона, а не один узел
+        self.assertLessEqual(abs(delta + 100.0), 10.0)
         self.assertEqual(error, 0.0)
 
     def test_offset_scan_has_constant_minimum(self) -> None:
@@ -364,6 +366,172 @@ class CohortTest(unittest.TestCase):
                        "head_rotation_range_deg", "err_px"):
             self.assertIn(column, lines[0])
         self.assertTrue(lines[1].startswith("10,"))
+
+
+class HeadAndHandChannelsTest(unittest.TestCase):
+    """08c: угловая скорость головы и скорость кисти в системе головы."""
+
+    def test_angular_speed_of_uniform_rotation(self) -> None:
+        # 5° за каждые 25 мс → 200 °/с; окно ±25 мс даёт 10° за 50 мс
+        quats = [_quat_yaw(5.0 * index) for index in range(9)]
+        track = make_track([25 * index for index in range(9)], [(0.0, 0.0, -0.4)] * 9,
+                           head_quats=quats)
+        scene = make_scene(track, frame_count=3, duration=0.2)  # кадр k=1 → 100 мс
+        self.assertAlmostEqual(diag.head_angular_speed_deg_s(scene, 1), 200.0, places=6)
+
+    def test_angular_speed_zero_for_static_head(self) -> None:
+        track = make_track([0, 25, 50], [(0.0, 0.0, -0.4)] * 3)
+        scene = make_scene(track, frame_count=3, duration=0.2)
+        self.assertAlmostEqual(diag.head_angular_speed_deg_s(scene, 1), 0.0, places=9)
+
+    def test_hand_attached_to_head_has_zero_speed_in_head(self) -> None:
+        # голова вращается, кисть в системе головы стоит: мир — R(q)·(0, 0, −0.4)
+        quats = [_quat_yaw(5.0 * index) for index in range(9)]
+        positions = []
+        for quat in quats:
+            rotation = camera_model.quat_to_rotation(quat)
+            local = (0.0, 0.0, -0.4)
+            positions.append(tuple(
+                sum(rotation[row][axis] * local[axis] for axis in range(3)) for row in range(3)
+            ))
+        track = make_track([25 * index for index in range(9)], positions, head_quats=quats)
+        in_head = diag.sample_speeds_in_head(track)
+        in_world = diag.sample_speeds(track)
+        self.assertLess(float(np.nanmax(in_head)), 1e-6)   # в кадре рука стоит
+        self.assertGreater(float(np.nanmax(in_world)), 0.01)  # а в мире едет
+
+    def test_static_hand_in_world_moves_in_head(self) -> None:
+        # голова вращается, кисть в мире стоит: в системе головы она едет по кругу
+        quats = [_quat_yaw(5.0 * index) for index in range(9)]
+        track = make_track([25 * index for index in range(9)], [(0.0, 0.0, -0.4)] * 9,
+                           head_quats=quats)
+        in_head = diag.sample_speeds_in_head(track)
+        # голова крутится на 5° за 25 мс (200 °/с = 3.49 рад/с), кисть в 0.4 м от оси:
+        # в системе головы она едет по кругу со скоростью ω·r ≈ 1.40 м/с
+        expected = math.radians(200.0) * 0.4
+        self.assertAlmostEqual(float(np.nanmax(in_head)), expected, places=2)
+
+    def test_invalid_side_raises(self) -> None:
+        track = make_track([0, 100], [(0.0, 0.0, -1.0)] * 2)
+        with self.assertRaises(ValueError):
+            diag.sample_speeds_in_head(track, "middle")
+
+
+class JointBreakdownTest(unittest.TestCase):
+    """08c: ошибка по именам суставов, а не по позиции в списке."""
+
+    def test_names_survive_missing_joint(self) -> None:
+        track = make_track([0], [world_for_pixel(*SKIN_CENTER, depth=1.0)])
+        scene = make_scene(track, frame_count=1, duration=0.1)
+        distance = diag.skin_distance_map(skin_image())
+        pose = track.sample_pose(0)
+        named = diag.joint_errors_named(pose, scene, distance)
+        self.assertEqual(set(named), set(JOINTS))
+        self.assertEqual(named["palm"], 0.0)
+        self.assertEqual(diag.mean_error_named(named, diag.BODY_JOINTS), 0.0)
+        # сустав за камерой → NaN именно у него, остальные имена не «съезжают»
+        broken = ov.project_hands(pose, scene.intrinsics)
+        self.assertTrue(all(point.visible for point in broken["right"].values()))
+
+    def test_nan_joint_keeps_names(self) -> None:
+        track = make_track([0], [(0.0, 0.0, -1.0)])
+        for axis in ("x", "y", "z"):
+            track._values[f"right_thumb_{axis}"] = (math.nan,)
+        scene = make_scene(track, frame_count=1, duration=0.1)
+        distance = diag.skin_distance_map(skin_image())
+        named = diag.joint_errors_named(track.sample_pose(0), scene, distance)
+        self.assertTrue(math.isnan(named["thumb"]))
+        self.assertFalse(math.isnan(named["palm"]))
+        self.assertFalse(math.isnan(named["index"]))
+
+    def test_breakdown_all_versus_complete_hand(self) -> None:
+        track = make_track([0], [world_for_pixel(*SKIN_CENTER, depth=1.0)])
+        scene = make_scene(track, frame_count=1, duration=0.1)
+        distance = diag.skin_distance_map(skin_image())
+        data = diag.error_breakdown(scene, [0], {0: distance}, 0)
+        self.assertEqual(data["frames"], 1.0)
+        self.assertEqual(data["all5_frames"], 1.0)
+        self.assertEqual(data["all"], 0.0)
+        self.assertEqual(data["all5"], 0.0)
+        self.assertEqual(data["palm"], 0.0)
+
+
+class SeparationCohortsTest(unittest.TestCase):
+    """08c: выбор когорт «голова крутится» и «голова стоит, рука быстрая»."""
+
+    def test_cohorts_pick_expected_frames(self) -> None:
+        frames = 6
+        track = make_track([0, 100, 200], [(0.0, 0.0, -1.0)] * 3)
+        scene = make_scene(track, frame_count=frames, duration=0.2)
+        frame_speed = np.array([0.1, 0.2, 1.5, 1.6, 0.3, 1.9])
+        frame_hand_head = np.array([0.9, 0.9, 0.9, 0.9, 0.2, 0.9])
+        frame_omega = np.array([10.0, 12.0, 1.0, 2.0, 30.0, 3.0])
+        cohorts = diag.separation_cohorts(scene, frame_speed, frame_hand_head, frame_omega,
+                                          count=2)
+        # headrot: высокая ω там, где кисть в системе головы почти стоит (кадр 4)
+        self.assertEqual(cohorts["headrot"], [4])
+        # headstill: низкая ω, самые быстрые кисти → кадры 5 и 3
+        self.assertEqual(cohorts["headstill"], [3, 5])
+
+    def test_missing_band_gives_empty_cohort(self) -> None:
+        track = make_track([0], [(0.0, 0.0, -1.0)])
+        scene = make_scene(track, frame_count=2, duration=0.1)
+        cohorts = diag.separation_cohorts(
+            scene, np.array([1.0, 2.0]), np.array([2.0, 2.0]), np.array([1.0, 1.0])
+        )
+        self.assertEqual(cohorts["headrot"], [])  # нет кадров с «рука стоит в голове»
+        self.assertEqual(len(cohorts["headstill"]), 2)
+
+
+@unittest.skipIf(cv2 is None, "нет OpenCV")
+class Scan2DTest(unittest.TestCase):
+    """08c: матрица 2D-скана, минимум и маргинальные кривые."""
+
+    def test_best_value_and_margins(self) -> None:
+        scan = diag.Scan2D(
+            frames=(0, 1),
+            head_grid=(-100.0, -50.0),
+            hand_grid=(-100.0, -50.0),
+            values=((30.0, 10.0), (40.0, 5.0)),
+        )
+        self.assertEqual(scan.best, (-50.0, -50.0, 5.0))
+        self.assertEqual(scan.value(-100.0, -50.0), 10.0)
+        self.assertTrue(math.isnan(scan.value(0.0, 0.0)))
+        self.assertEqual(scan.head_margin(-50.0), [(-100.0, 10.0), (-50.0, 5.0)])
+        self.assertEqual(scan.hand_margin(-50.0), [(-100.0, 40.0), (-50.0, 5.0)])
+        rows = scan.to_csv_rows()
+        self.assertEqual(rows[0], ["head_offset_ms", "-100", "-50"])
+        self.assertEqual(rows[1], ["-100", "30.00", "10.00"])
+        self.assertEqual(rows[2], ["-50", "40.00", "5.00"])
+
+    def test_scan_finds_hand_offset(self) -> None:
+        # кисть едет 4 м/с, голова не вращается: минимум по сдвигу кистей, голова — плато
+        positions = [(0.2 * index, 0.0, -1.0) for index in range(9)]
+        track = make_track([50 * index for index in range(9)], positions)
+        scene = make_scene(track, frame_count=2, duration=0.3)  # кадр k=1 → 150 мс
+        corrected = scene.track.pose_at(
+            int(sync.frame_time(1, scene.meta, scene.header_ns, scene.tracking_end_ns).ts_ns)
+            + int(-100 * MS)
+        )
+        target = ov.project_hands(corrected, scene.intrinsics)["right"]["palm"]
+        image = np.full((810, 1080, 3), TABLE_BGR, np.uint8)
+        u, v = int(round(target.u)), int(round(target.v))
+        image[v - 15 : v + 15, u - 15 : u + 15] = SKIN_BGR
+        distance = diag.skin_distance_map(image)
+        scan = diag.scan_2d(
+            scene, [1], {1: distance}, head_grid=(-150.0, -100.0, -50.0),
+            hand_grid=(-120.0, -100.0, -80.0),
+        )
+        best_head, best_hand, best_value = scan.best
+        self.assertEqual(best_hand, -100.0)
+        self.assertEqual(best_value, 0.0)
+        self.assertEqual(len(scan.head_margin(best_hand)), 3)
+
+    def test_scan_without_distances_is_nan(self) -> None:
+        track = make_track([0], [(0.0, 0.0, -1.0)])
+        scene = make_scene(track, frame_count=1, duration=0.1)
+        scan = diag.scan_2d(scene, [0], {}, head_grid=(-50.0,), hand_grid=(-50.0,))
+        self.assertTrue(math.isnan(scan.best[2]))
 
 
 if __name__ == "__main__":
