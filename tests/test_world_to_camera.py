@@ -5,8 +5,8 @@
 
 Что проверяется (критерии карточки 05b):
 
-* композиция ``T_cam_world = F · T_head_cam⁻¹ · T_head_world⁻¹``: точка на оси взгляда
-  головы ``(0, 0, 1)`` даёт ``x ≈ y ≈ 0``, ``z > 0``;
+* композиция ``T_cam_world = F · T_head_cam⁻¹ · T_head_world⁻¹``: точка перед головой
+  ``(0, 0, −1)`` (в OpenXR вперёд смотрит ``−z``) даёт ``x ≈ y ≈ 0``, ``z > 0``;
 * чистый поворот головы на 90° по yaw: точка в направлении взгляда остаётся на оси,
   точка в стороне уходит за камеру (``z < 0``);
 * ``T_head_cam`` читается из ``src/config.py`` и меняется без правки кода;
@@ -74,9 +74,10 @@ def apply3(matrix, point):
 
 
 class GazeAxisTest(unittest.TestCase):
-    """Критерий 05b: точка на оси взгляда головы → x ≈ y ≈ 0, z > 0."""
+    """Композиция сохраняет ось: у стаба-камеры (``T_head_cam = I``) это ``+z`` головы."""
 
     def test_gaze_axis_identity_pose(self) -> None:
+        # точка вдоль +z системы головы; при стабе-камере (I) это её оптическая ось
         camera = world_to_camera((0.0, 0.0, 1.0), IDENTITY_POSE, t_head_cam=IDENTITY4)
         self.assertAlmostEqual(camera[0], 0.0, places=12)
         self.assertAlmostEqual(camera[1], 0.0, places=12)
@@ -101,13 +102,13 @@ class GazeAxisTest(unittest.TestCase):
                 self.assertAlmostEqual(camera[2], 1.0, places=9)
 
     def test_gaze_offset_comes_from_config_translation(self) -> None:
-        # заглушка 05b: камера в 5 см впереди → точка (0,0,1) даёт z = 0.95
-        camera = world_to_camera((0.0, 0.0, 1.0), IDENTITY_POSE)
+        # камера без поворота, смещение из config.py (патч): точка (0, 0, 1) даёт z = 1 − tz
+        with mock.patch.object(config, "HEAD_CAM_ROTATION_RPY_DEG", (0.0, 0.0, 0.0)), \
+                mock.patch.object(config, "HEAD_CAM_TRANSLATION_M", (0.0, 0.0, 0.05)):
+            camera = world_to_camera((0.0, 0.0, 1.0), IDENTITY_POSE, opencv_conventions=False)
         self.assertAlmostEqual(camera[0], 0.0, places=12)
         self.assertAlmostEqual(camera[1], 0.0, places=12)
-        self.assertGreater(camera[2], 0.0)
-        translation = config.HEAD_CAM_TRANSLATION_M
-        self.assertAlmostEqual(camera[2], 1.0 - translation[2], places=12)
+        self.assertAlmostEqual(camera[2], 0.95, places=12)
 
 
 class YawTest(unittest.TestCase):
@@ -148,7 +149,9 @@ class OpenCvConventionTest(unittest.TestCase):
 
     def test_up_point_lands_above_optical_axis(self) -> None:
         point = (0.0, 1.0, 1.0)
-        opencv = world_to_camera(point, IDENTITY_POSE, t_head_cam=IDENTITY4)
+        opencv = world_to_camera(
+            point, IDENTITY_POSE, t_head_cam=IDENTITY4, opencv_conventions=True
+        )
         unity = world_to_camera(
             point, IDENTITY_POSE, t_head_cam=IDENTITY4, opencv_conventions=False
         )
@@ -159,7 +162,9 @@ class OpenCvConventionTest(unittest.TestCase):
 
     def test_right_and_forward_axes_unchanged(self) -> None:
         point = (1.0, 0.0, 2.0)
-        opencv = world_to_camera(point, IDENTITY_POSE, t_head_cam=IDENTITY4)
+        opencv = world_to_camera(
+            point, IDENTITY_POSE, t_head_cam=IDENTITY4, opencv_conventions=True
+        )
         unity = world_to_camera(
             point, IDENTITY_POSE, t_head_cam=IDENTITY4, opencv_conventions=False
         )
@@ -196,12 +201,15 @@ class ConfigTest(unittest.TestCase):
                 self.assertAlmostEqual(rotation[i][j], expected[i][j], places=12)
 
     def test_translation_change_without_code_edit(self) -> None:
-        with mock.patch.object(config, "HEAD_CAM_TRANSLATION_M", (0.0, 0.0, 0.20)):
-            camera = world_to_camera((0.0, 0.0, 1.0), IDENTITY_POSE)
+        # поворот временно нулевой, чтобы проверять именно смещение из конфига
+        with mock.patch.object(config, "HEAD_CAM_ROTATION_RPY_DEG", (0.0, 0.0, 0.0)), \
+                mock.patch.object(config, "HEAD_CAM_TRANSLATION_M", (0.0, 0.0, 0.20)):
+            camera = world_to_camera((0.0, 0.0, 1.0), IDENTITY_POSE, opencv_conventions=False)
         self.assertAlmostEqual(camera[2], 0.80, places=12)
-        # без патча — снова значение из config.py
-        base = 1.0 - config.HEAD_CAM_TRANSLATION_M[2]
-        self.assertAlmostEqual(world_to_camera((0.0, 0.0, 1.0), IDENTITY_POSE)[2], base, places=12)
+        # без патча — значение из config.py: калибровка 07c, точка перед головой даёт z = 1
+        self.assertAlmostEqual(
+            world_to_camera((0.0, 0.0, -1.0), IDENTITY_POSE)[2], 1.0, places=12
+        )
 
     def test_rotation_change_without_code_edit(self) -> None:
         # pitch камеры на 90°: ось взгляда головы уходит из поля зрения (z = 0)
@@ -257,7 +265,7 @@ class MatrixTest(unittest.TestCase):
 
     def test_opencv_flag_makes_determinant_negative(self) -> None:
         # Unity (y вверх) → OpenCV (y вниз) — отражение: det = −1, это ожидаемо
-        matrix = world_to_camera_matrix(IDENTITY_POSE)
+        matrix = world_to_camera_matrix(IDENTITY_POSE, opencv_conventions=True)
         rotation = tuple(tuple(matrix[i][j] for j in range(3)) for i in range(3))
         det = (
             rotation[0][0] * (rotation[1][1] * rotation[2][2] - rotation[1][2] * rotation[2][1])
@@ -267,9 +275,11 @@ class MatrixTest(unittest.TestCase):
         self.assertAlmostEqual(det, -1.0, places=12)
 
     def test_identity_config_identity_pose(self) -> None:
-        with mock.patch.object(config, "HEAD_CAM_TRANSLATION_M", (0.0, 0.0, 0.0)):
-            matrix = world_to_camera_matrix(IDENTITY_POSE)
-        self.assertEqual(transform_point(matrix, (0.1, 0.2, 0.3)), (0.1, -0.2, 0.3))
+        # конфиг-заглушка (без поворота и смещения) + выключенный переворот y: M = I
+        with mock.patch.object(config, "HEAD_CAM_ROTATION_RPY_DEG", (0.0, 0.0, 0.0)), \
+                mock.patch.object(config, "HEAD_CAM_TRANSLATION_M", (0.0, 0.0, 0.0)):
+            matrix = world_to_camera_matrix(IDENTITY_POSE, opencv_conventions=False)
+        self.assertEqual(transform_point(matrix, (0.1, 0.2, 0.3)), (0.1, 0.2, 0.3))
 
 
 class QuatConventionTest(unittest.TestCase):
@@ -411,10 +421,10 @@ class RealDataTest(unittest.TestCase):
             cls.samples.append((index, pose, sample))
 
     def test_gaze_axis_on_real_poses(self) -> None:
-        # критерий карточки: точка взгляда головы → x ≈ y ≈ 0, z > 0, при любой позе
+        # точка перед головой (0, 0, −1) при калибровке 07c → x ≈ y ≈ 0, z > 0
         for index, pose, _ in self.samples:
             with self.subTest(index=index):
-                gaze_world = transform_point(head_to_world(pose), (0.0, 0.0, 1.0))
+                gaze_world = transform_point(head_to_world(pose), (0.0, 0.0, -1.0))
                 camera = world_to_camera(gaze_world, pose)
                 self.assertAlmostEqual(camera[0], 0.0, places=9)
                 self.assertAlmostEqual(camera[1], 0.0, places=9)
