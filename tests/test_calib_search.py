@@ -561,7 +561,9 @@ class RealDataTest(unittest.TestCase):
             raise unittest.SkipTest(NO_DATA)
         if not META.is_file():
             raise unittest.SkipTest(NO_META)
-        cls.data = load_calib_data(DATA, META)
+        # 07b искался без поправки на задержку видеотракта (она появилась в доработке 08a),
+        # поэтому здесь фиксируется offset_ns=0 — иначе числа 39/39 и плато поедут
+        cls.data = load_calib_data(DATA, META, offset_ns=0)
 
     def test_frame_set_and_point_count(self) -> None:
         self.assertEqual(len(self.data.frames), 5)

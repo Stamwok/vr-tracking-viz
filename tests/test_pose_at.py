@@ -12,21 +12,26 @@ import sys
 import unittest
 from bisect import bisect_right
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src import config  # noqa: E402
 from src.parse_tracking import read_header, timestamp_range  # noqa: E402
 from src.sync import (  # noqa: E402
     POINT_KEYS,
     POSITION_FIELDS,
     QUAT_FIELDS,
+    FrameTime,
     PoseTrack,
     frame_time,
     iter_frame_poses,
     load_poses,
+    pose_at_frame,
     slerp,
+    video_time_offset_ns,
 )
 
 DATA = next(iter(sorted((ROOT / "data").glob("trackingData_*.txt"))), None)
@@ -55,6 +60,55 @@ def make_track(
     if active_right is None:
         active_right = [i >= nan_right_before for i in range(len(ts))]
     return PoseTrack(ts, values, {"left": [True] * len(ts), "right": active_right})
+
+
+class VideoTimeOffsetTest(unittest.TestCase):
+    """Поправка на задержку видеотракта: константа из config и её применение к кадру."""
+
+    def _track(self) -> PoseTrack:
+        # голова едет по x со скоростью 1 м/с: 0.0, 0.1, 0.2 м на 0/100/200 мс
+        return make_track([0, 100, 200], head_x=[0.0, 0.1, 0.2])
+
+    def test_offset_from_config_in_nanoseconds(self) -> None:
+        with mock.patch.object(config, "VIDEO_TIME_OFFSET_MS", -100.0):
+            self.assertEqual(video_time_offset_ns(), -100_000_000)
+        with mock.patch.object(config, "VIDEO_TIME_OFFSET_MS", 33.5):
+            self.assertEqual(video_time_offset_ns(), 33_500_000)
+        with mock.patch.object(config, "VIDEO_TIME_OFFSET_MS", 0):
+            self.assertEqual(video_time_offset_ns(), 0)
+
+    def test_invalid_offset_is_rejected(self) -> None:
+        for bad in (True, "100", None, 1000.1, -1000.5, math.nan, math.inf):
+            with self.subTest(value=bad), mock.patch.object(
+                config, "VIDEO_TIME_OFFSET_MS", bad
+            ), self.assertRaises(ValueError):
+                video_time_offset_ns()
+
+    def test_pose_at_frame_explicit_offset(self) -> None:
+        track = self._track()
+        frame = FrameTime(index=0, ts_ns=100 * MS, t_rel_s=0.1, in_tracking=True)
+        self.assertAlmostEqual(pose_at_frame(track, frame, 0).head_pos[0], 0.1)
+        self.assertAlmostEqual(pose_at_frame(track, frame, -50 * MS).head_pos[0], 0.05)
+        self.assertAlmostEqual(pose_at_frame(track, frame, -100 * MS).head_pos[0], 0.0)
+        # за пределами трека поза замораживается — поправка не выдумывает движение
+        self.assertAlmostEqual(pose_at_frame(track, frame, -400 * MS).head_pos[0], 0.0)
+
+    def test_pose_at_frame_uses_config_offset_by_default(self) -> None:
+        track = self._track()
+        frame = FrameTime(index=0, ts_ns=100 * MS, t_rel_s=0.1, in_tracking=True)
+        with mock.patch.object(config, "VIDEO_TIME_OFFSET_MS", -50.0):
+            self.assertAlmostEqual(pose_at_frame(track, frame).head_pos[0], 0.05)
+        with mock.patch.object(config, "VIDEO_TIME_OFFSET_MS", 0.0):
+            self.assertAlmostEqual(pose_at_frame(track, frame).head_pos[0], 0.1)
+
+    def test_pose_at_frame_rejects_bad_explicit_offset(self) -> None:
+        track = self._track()
+        frame = FrameTime(index=0, ts_ns=0, t_rel_s=0.0, in_tracking=True)
+        for bad in (True, 1.5, "0", None):
+            if bad is None:
+                continue  # None = «взять из конфига», это допустимо
+            with self.subTest(value=bad), self.assertRaises(ValueError):
+                pose_at_frame(track, frame, bad)
 
 
 class PoseAtSyntheticTest(unittest.TestCase):

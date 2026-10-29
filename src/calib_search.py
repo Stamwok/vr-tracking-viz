@@ -512,12 +512,18 @@ def load_calib_data(
     tracking_path: str | Path,
     meta_path: str | Path = "output/video_meta.json",
     frames: Sequence[calib_frames.CalibFrame] = calib_frames.CALIB_FRAMES,
+    offset_ns: int | None = None,
 ) -> CalibData:
     """Прочитать позы 5 кадров эталона и перевести суставы в систему головы.
 
     Время кадра берётся из ``sync.frame_time`` (та же шкала, что у видео), поза — из
-    ``sync.pose_at`` (интерполяция + SLERP). Для каждого сустава считаются обе
-    конвенции кватерниона сразу, чтобы перебор не пересчитывал их 48 раз.
+    ``sync.pose_at_frame`` (интерполяция + SLERP + поправка на задержку видеотракта
+    ``config.VIDEO_TIME_OFFSET_MS``) — ровно так же, как в рендере 08a. Для каждого сустава
+    считаются обе конвенции кватерниона сразу, чтобы перебор не пересчитывал их 48 раз.
+
+    ``offset_ns=None`` — поправка из ``config`` (то, что видит пользователь); явное значение
+    нужно тестам, которые фиксируют числа калибровки 07b: она искалась без поправки
+    (``offset_ns=0``), и её метрика 39/39 к ним и относится.
     """
     meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
     header = read_header(tracking_path)
@@ -529,7 +535,7 @@ def load_calib_data(
     points: list[PointTarget] = []
     for item in frames:
         moment = sync.frame_time(item.index, meta, header_ns, tracking_end_ns)
-        pose = track.pose_at(moment.ts_ns)
+        pose = sync.pose_at_frame(track, moment, offset_ns)
         rotation = camera_model.quat_to_rotation(pose.head_quat)
         inverse = _transpose3(rotation)
         for side in ("left", "right"):
@@ -975,11 +981,13 @@ def save_overlay_sheets(
     candidates: Sequence[Candidate],
     out_dir: str | Path = DEFAULT_OUT,
     meta_path: str | Path = "output/video_meta.json",
+    offset_ns: int | None = None,
 ) -> list[Path]:
     """Сохранить контактный лист (5 кадров) с наложением для top-3 — ``top1..3.png``.
 
     OpenCV и видео нужны только здесь: подбор, метрика и JSON работают без них.
-    Листы — регенерируемый артефакт в ``output/`` (в git не идут).
+    Листы — регенерируемый артефакт в ``output/`` (в git не идут). ``offset_ns`` — поправка
+    времени кадра (``None`` → ``config.VIDEO_TIME_OFFSET_MS``), та же, что в рендере 08a.
     """
     import cv2  # noqa: PLC0415
 
@@ -1002,7 +1010,7 @@ def save_overlay_sheets(
             tiles = []
             for frame in data.frames:
                 moment = sync.frame_time(frame.index, meta, header_ns, tracking_end_ns)
-                pose = track.pose_at(moment.ts_ns)
+                pose = sync.pose_at_frame(track, moment, offset_ns)
                 capture.set(cv2.CAP_PROP_POS_FRAMES, frame.index)
                 ok, image = capture.read()
                 if not ok:
@@ -1041,6 +1049,8 @@ def _verify_config(data: CalibData) -> int:
           f"INVERT_QUAT = {summary['invert_quat']}, Y_DOWN_FLIP = {summary['y_down_flip']}")
     print(f"  HEAD_CAM_ROTATION_RPY_DEG = {summary['head_cam_rotation_rpy_deg']}, "
           f"HEAD_CAM_TRANSLATION_M = {summary['head_cam_translation_m']}")
+    print(f"  поправка времени кадра (config.VIDEO_TIME_OFFSET_MS): "
+          f"{sync.video_time_offset_ns() / 1e6:+.0f} мс")
     print("  проверка конфига: запись осей совпадает с матрицей поворота, det = +1")
     metrics = evaluate_convention(data, convention)
     print(f"  метрика на эталоне: {metrics.good}/{metrics.in_frame} суставов в кадре — в рамках "
