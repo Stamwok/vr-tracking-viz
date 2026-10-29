@@ -12,13 +12,15 @@
 1. Парсит файл трекинга (JSON Lines) в таблицу `output/tracking.csv`.
 2. Синхронизирует кадры видео с сэмплами трекинга (~90 Гц трекинг против 30 fps видео).
 3. Проецирует 3D-точки рук и головы в координаты кадра (камера-обскура, интринсики из записи).
-4. Рендерит `output/overlay_skeleton.mp4` — видео (левый глаз SBS-кадра, 1080×810) с наложенным
-   «скелетом»: 5 точек и 4 линии на каждую руку; след и HUD добавляются в 08b.
+4. Рендерит `output/overlay.mp4` — видео (левый глаз SBS-кадра, 1080×810) с наложенным
+   «скелетом» (5 точек и 4 линии на каждую руку), затухающим следом кистей и HUD (время, номер
+   кадра, состояние рук) — см. [`docs/overlay.md`](docs/overlay.md).
 5. Строит `output/trajectory.html` — интерактивные Plotly-графики: 3D-траектории, x(t)/y(t)/z(t), скорости.
 
 ### Пример результата
 
-*Скриншот кадра из `overlay.mp4` и GIF — появятся после задачи 08; ссылка на `trajectory.html` — после 09.*
+*Кадр `overlay.mp4` (со следом и HUD) и ссылка на `trajectory.html` добавляются при финализации
+README — задача 10c; пример «до/после» наложения уже в [`docs/overlay.md`](docs/overlay.md).*
 Планируемые артефакты: `output/overlay.mp4`, `output/trajectory.html`, `output/tracking.csv`.
 
 ## Входные данные
@@ -93,7 +95,9 @@ def parse_pose(s):
    поза камеры — из позы головы плюс зафиксированная константа `T_head_cam` (`src/config.py`);
    на 5 размеченных кадрах все 40 суставов, попавших в кадр, лежат в рамках своих рук.
 4. **Рендер** (`src/overlay_video.py`): левая половина SBS-кадра, точки `palm / wrist / thumb tip /
-   index tip / middle tip` для каждой руки, соединённые линиями, маркер головы, затухающий след, HUD.
+   index tip / middle tip` для каждой руки, соединённые линиями (левая голубая, правая красная),
+   затухающий след ладони за 0.6 с (выборка по времени, разрыв на «нет данных») и HUD — время,
+   номер кадра, активность рук, окно следа; подробности — [`docs/overlay.md`](docs/overlay.md).
 5. **Графики** (`src/plot_trajectory.py`): Plotly — 3D-траектории головы и рук, x(t)/y(t)/z(t),
    скорость, высота рук относительно головы — всё в один self-contained HTML.
 
@@ -243,18 +247,23 @@ pip install -r requirements.txt
 python src/parse_tracking.py data/trackingData_20260505_165740.txt -o output/tracking.csv
 python src/overlay_video.py data/CameraRecord_20260505_165740.mp4 \
                             --tracking data/trackingData_20260505_165740.txt \
-                            --out output/overlay_skeleton.mp4
+                            --out output/overlay.mp4
 python src/plot_trajectory.py --tracking output/tracking.csv -o output/trajectory.html
 ```
 
 Рендер читает **сырой** файл трекинга, а не `tracking.csv`: для синхронизации нужен
 `header.timeStampNs` — метка первого кадра видео, которой в CSV нет (CSV остаётся входом графиков).
-Полный клип — 7279 кадров, 1080×810, H.264 — рендерится за **≈62 с** (≈118 кадр/с) в файл 93.3 МиБ;
-время замерено на этой машине и зависит от CPU/кодека, прогресс печатается каждые 300 кадров.
+Полный клип — 7279 кадров, 1080×810, H.264 — рендерится за **≈65 с** (≈112 кадр/с) в файл 94.6 МиБ
+(след и HUD добавляют к кадру ≈4 %); время замерено на этой машине и зависит от CPU/кодека,
+прогресс печатается каждые 300 кадров.
 PNG-проверка наложения на 5 отладочных кадрах: `python src/overlay_video.py
 data/CameraRecord_*.mp4 --stills output/debug/overlay`.
+След и HUD отключаются флагами `--no-trail`/`--no-hud` (кадр «как в 08a»), окно следа —
+`--trail-seconds`; кадры «до/после» для сравнения собираются так:
+`python src/overlay_video.py data/CameraRecord_*.mp4 --stills output/debug/overlay_before
+--frames 1800,7200 --no-trail --no-hud`.
 
-Результаты: `output/tracking.csv`, `output/overlay_skeleton.mp4`, `output/trajectory.html`
+Результаты: `output/tracking.csv`, `output/overlay.mp4`, `output/trajectory.html`
 (открывается в браузере без сервера).
 
 ## Структура репозитория
@@ -267,10 +276,10 @@ vr-tracking-viz/
 │   ├── video_meta.py        # метаданные видео (video_meta.json) + debug-кадр SBS
 │   ├── camera_model.py      # интринсики, world→camera, проекция 3D→2D
 │   ├── config.py            # калибровка: оси, флаги, T_head_cam (смещение + yaw/pitch/roll)
-│   ├── overlay_video.py     # наложение скелета на видео
+│   ├── overlay_video.py     # наложение скелета, следа кистей и HUD на видео
 │   └── plot_trajectory.py   # Plotly: 3D-траектории и x(t)/y(t)/z(t)
 ├── output/                  # overlay.mp4, trajectory.html, tracking.csv (не коммитятся)
-├── docs/                    # intrinsics.md, projection_notes.md, NOTES.md
+├── docs/                    # intrinsics.md, projection_notes.md, overlay.md, NOTES.md, images/
 ├── .gitignore               # data/, output/, .venv/, __pycache__/, *.mp4
 ├── requirements.txt
 └── README.md
