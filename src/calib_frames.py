@@ -1,9 +1,17 @@
-"""calib_frames.py — рабочий набор кадров и пиксельный эталон для калибровки (задача 07a).
+"""calib_frames.py — рабочий набор кадров и пиксельный эталон для калибровки (задачи 07a, 08e).
 
 Задача 07b подбирает конвенцию осей и ``T_head_cam``, сравнивая проекцию трекинга с видео.
 Чтобы это сравнение было не «на глаз», нужен эталон, **независимый от проекции**: кадры,
 на которых положение кистей в пикселях известно из самого видео. Он и лежит здесь — пять
 кадров из 02a плюс прямоугольники кистей в координатах **левого глаза** (1080×810).
+
+Задача 08e добавила рядом второй, более тонкий эталон — костную разметку :data:`BONE_FRAMES`:
+7–9 пиксельных точек на руку (запястье, ладонь, пястная кость, фаланги указательного и
+среднего пальцев) и цепочки отрезков между ними. Рамки :data:`CALIB_FRAMES` при этом не
+менялись: метрика 07a остаётся критерием, а кости — дополнение для густого скелета (08f),
+которое считает ``src/calib_bones.py`` (расстояние от проекции отрезков до размеченных
+отрезков + счётчик изломов). Разметка костей сделана по видео с точностью ±30–50 px (кисть
+на кадре занимает 150–370 px), поэтому вердикт костной метрики справочный.
 
 Почему прямоугольник, а не точка: точность ручной разметки по кадру 1080×810 — примерно
 полсотни пикселей (сетка 100 px, см. ``TOLERANCE_PX``). Требовать попадания в точку
@@ -38,7 +46,9 @@
 Запуск:
     python src/calib_frames.py --show                 # таблица эталона
     python src/calib_frames.py --json                 # эталон для 07b
-    python src/calib_frames.py data/CameraRecord_*.mp4  # сохранить PNG + frames.md
+    python src/calib_frames.py --bones                # костная разметка 08e (7–9 точек на руку)
+    python src/calib_frames.py --bones-json           # то же в JSON
+    python src/calib_frames.py data/CameraRecord_*.mp4  # сохранить PNG + frames.md + bones.md
 """
 from __future__ import annotations
 
@@ -53,6 +63,8 @@ from typing import Iterable, Sequence
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from src.parse_tracking import HAND_JOINTS_FULL
+
 #: Размер кадра одного глаза (левая половина SBS 2160×810): система координат разметки.
 EYE_WIDTH = 1080
 EYE_HEIGHT = 810
@@ -65,6 +77,20 @@ HANDS = ("left", "right", "unknown")
 
 #: Допустимые уровни уверенности разметки (см. ``HandBox.confidence``).
 CONFIDENCE = ("high", "medium", "low")
+
+#: Допуск костной разметки (08e), пиксели: та же ручная сетка, что у рамок 07a.
+BONE_TOLERANCE_PX = TOLERANCE_PX
+
+#: Порог «излома» (08e): кость, направление которой ушло от размеченного на столько
+#: градусов, считается изломом — скелет визуально сломан относительно эталона.
+BONE_KINK_ANGLE_DEG = 45.0
+
+#: Сколько точек на руку допускает костная разметка (08e), включительно.
+BONE_POINTS_PER_HAND = (7, 9)
+
+#: Стороны, которые можно размечать костями: для метрики нужна конкретная рука
+#: (в отличие от рамки 07a, где допустимо ``unknown``).
+BONE_HANDS = ("left", "right")
 
 
 @dataclass(frozen=True)
@@ -335,6 +361,419 @@ def in_eye_frame(u: float, v: float) -> bool:
     return 0 <= u < EYE_WIDTH and 0 <= v < EYE_HEIGHT
 
 
+# --------------------------------------------------------------------------------------
+# Костная разметка (задача 08e): 7–9 точек на руку и отрезки между ними.
+# --------------------------------------------------------------------------------------
+
+#: Имена суставов, которые вообще бывают в данных: 26 джойнтов OpenXR на руку (08d).
+#: Костная разметка берёт имена отсюда, поэтому промежуточные фаланги называются так же,
+#: как колонки ``tracking.csv`` (``index_proximal``, ``middle_intermediate`` …).
+JOINT_NAMES: tuple[str, ...] = tuple(name for name, _ in HAND_JOINTS_FULL)
+
+#: Топология эталона 08e — одинаковая для каждой размеченной кисти.
+#:
+#: Соседние имена в цепочке задают «кость» — отрезок эталонного скелета, до которого потом
+#: меряется проекция (``src/calib_bones.py``). 9 точек и 8 отрезков:
+#:
+#: * ``wrist → palm`` — ось запястья (обе точки уже есть в 5-точечном наборе);
+#: * ``palm → index_metacarpal → index_proximal → index_intermediate → index`` — цепочка
+#:   указательного пальца: пястная кость, основная, средняя и ногтевая фаланги;
+#: * ``palm → middle_proximal → middle_intermediate → middle`` — средний палец.
+#:
+#: Почему только указательный и средний: на всех кадрах записи кисть сжата (кулак, обхват
+#: предмета), и именно эти два пальца читаются по видео лучше остальных; безымянный и
+#: мизинец в такой позе перекрыты ладонью. Почему 9, а не 5 точек: короткие отрезки
+#: (средняя фаланга ≈30–40 px) проверяют форму пальца, а не только «точка где-то на кисти».
+BONE_CHAINS: tuple[tuple[str, ...], ...] = (
+    ("wrist", "palm"),
+    ("palm", "index_metacarpal", "index_proximal", "index_intermediate", "index"),
+    ("palm", "middle_proximal", "middle_intermediate", "middle"),
+)
+
+
+@dataclass(frozen=True)
+class JointMark:
+    """Пиксельная разметка одного сустава на кадре (08e), координаты левого глаза.
+
+    ``joint`` — имя из :data:`JOINT_NAMES`; ``point`` — ``(u, v)`` в пикселях кадра
+    1080×810; ``confidence`` — насколько точка читается по видео. ``low`` — не «неверно»,
+    а «плохо видно»: сжатый кулак не разбирается на фаланги, и такая точка годится только
+    как грубая привязка (метрика считает её отдельно — см. ``strict`` в ``calib_bones``).
+    """
+
+    joint: str
+    point: tuple[int, int]
+    confidence: str = "high"
+    note: str = ""
+
+    def __post_init__(self) -> None:
+        if self.joint not in JOINT_NAMES:
+            raise ValueError(
+                f"JointMark.joint: ожидалось имя из HAND_JOINTS_FULL, получено {self.joint!r}"
+            )
+        if self.confidence not in CONFIDENCE:
+            raise ValueError(
+                f"JointMark.confidence: ожидалось одно из {CONFIDENCE}, "
+                f"получено {self.confidence!r}"
+            )
+        point = self.point
+        if not isinstance(point, tuple) or len(point) != 2:
+            raise ValueError(f"JointMark.point: ожидалось (u, v), получено {point!r}")
+        for name, value in zip(("u", "v"), point):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"JointMark.point.{name}: ожидалось целое, получено {value!r}")
+        u, v = point
+        if not in_eye_frame(u, v):
+            raise ValueError(
+                f"JointMark.point: {point!r} выходит за кадр левого глаза {EYE_WIDTH}×{EYE_HEIGHT}"
+            )
+
+
+@dataclass(frozen=True)
+class HandMarks:
+    """Костная разметка одной кисти (08e): 7–9 суставов и цепочки отрезков между ними.
+
+    ``chains`` — цепочки имён суставов; каждая соседняя пара — отрезок эталона. Все имена
+    цепочек обязаны быть размечены (``marks``), и каждая точка должна входить хотя бы в
+    одну цепочку: иначе точка ни на что не влияет и её легко потерять при правках.
+    """
+
+    hand: str
+    chains: tuple[tuple[str, ...], ...]
+    marks: tuple[JointMark, ...]
+    note: str = ""
+
+    def __post_init__(self) -> None:
+        if self.hand not in BONE_HANDS:
+            raise ValueError(
+                f"HandMarks.hand: ожидалось 'left'/'right', получено {self.hand!r} "
+                "(для костей сторона обязательна — рамка 07a может быть 'unknown')"
+            )
+        if not self.marks:
+            raise ValueError(f"HandMarks {self.hand}: нужна хотя бы одна размеченная точка")
+        low, high = BONE_POINTS_PER_HAND
+        if not low <= len(self.marks) <= high:
+            raise ValueError(
+                f"HandMarks {self.hand}: ожидалось {low}–{high} точек, получено {len(self.marks)}"
+            )
+        names = [mark.joint for mark in self.marks]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise ValueError(f"HandMarks {self.hand}: сустав размечен дважды ({duplicates})")
+        if not self.chains:
+            raise ValueError(f"HandMarks {self.hand}: нужна хотя бы одна цепочка")
+        for chain in self.chains:
+            if not isinstance(chain, tuple) or len(chain) < 2:
+                raise ValueError(
+                    f"HandMarks {self.hand}: цепочка {chain!r} должна быть кортежем ≥ 2 имён"
+                )
+            unknown = [name for name in chain if name not in names]
+            if unknown:
+                raise ValueError(
+                    f"HandMarks {self.hand}: в цепочке {chain!r} есть неразмеченные {unknown}"
+                )
+        used = {name for chain in self.chains for name in chain}
+        unused = sorted(set(names) - used)
+        if unused:
+            raise ValueError(
+                f"HandMarks {self.hand}: точки {unused} не входят ни в одну цепочку"
+            )
+
+    @property
+    def bones(self) -> tuple[tuple[str, str], ...]:
+        """Отрезки эталона: соседние пары во всех цепочках."""
+        return tuple(
+            (first, second)
+            for chain in self.chains
+            for first, second in zip(chain, chain[1:])
+        )
+
+    @property
+    def points(self) -> dict[str, tuple[int, int]]:
+        """Пиксели разметки по имени сустава."""
+        return {mark.joint: mark.point for mark in self.marks}
+
+    def mark_for(self, joint: str) -> JointMark:
+        """Разметка конкретного сустава (``KeyError``, если его нет)."""
+        for mark in self.marks:
+            if mark.joint == joint:
+                return mark
+        raise KeyError(f"HandMarks {self.hand}: сустав {joint!r} не размечен")
+
+    def as_dict(self) -> dict:
+        """Плоское представление для JSON."""
+        return {
+            "hand": self.hand,
+            "note": self.note,
+            "chains": [list(chain) for chain in self.chains],
+            "marks": [
+                {
+                    "joint": mark.joint,
+                    "point": list(mark.point),
+                    "confidence": mark.confidence,
+                    "note": mark.note,
+                }
+                for mark in self.marks
+            ],
+        }
+
+
+@dataclass(frozen=True)
+class BoneFrame:
+    """Кадр костной разметки (08e): номер кадра видео и размеченные кисти."""
+
+    index: int
+    hands: tuple[HandMarks, ...]
+    note: str = ""
+
+    def __post_init__(self) -> None:
+        if isinstance(self.index, bool) or not isinstance(self.index, int):
+            raise ValueError(f"BoneFrame.index: ожидалось целое число, получено {self.index!r}")
+        if self.index < 0:
+            raise ValueError(f"BoneFrame.index: ожидалось ≥ 0, получено {self.index}")
+        if not self.hands:
+            raise ValueError(f"BoneFrame {self.index}: нужна хотя бы одна размеченная кисть")
+        sides = [hand.hand for hand in self.hands]
+        if len(set(sides)) != len(sides):
+            raise ValueError(
+                f"BoneFrame {self.index}: сторона встречается дважды ({sides}) — "
+                "на кадре одна кисть каждой стороны"
+            )
+
+    def hand_for(self, hand: str) -> HandMarks | None:
+        """Разметка указанной стороны (``None``, если она не размечена)."""
+        for marks in self.hands:
+            if marks.hand == hand:
+                return marks
+        return None
+
+    @property
+    def bones(self) -> int:
+        """Сколько отрезков размечено на кадре."""
+        return sum(len(marks.bones) for marks in self.hands)
+
+    def as_dict(self) -> dict:
+        """Плоское представление для JSON."""
+        return {
+            "index": self.index,
+            "note": self.note,
+            "hands": [marks.as_dict() for marks in self.hands],
+        }
+
+
+#: Костная разметка (08e): 6 кистей на 5 кадрах, по 9 точек и 8 отрезков на кисть.
+#:
+#: Кадры и руки выбраны по видимости, а не по удобству: на кадре должна читаться кисть
+#: целиком (тыл кисти, пястные кости, указательный и средний пальцы). Поэтому размечены:
+#:
+#: * k = 30 — левая (в 07a рамка ``unknown``; см. ``note`` кадра), уверенность ``low``:
+#:   кисть вплотную к камере и обхватывает край корзины, фаланги читаются только по буграм;
+#: * k = 1800 — правая: пальцы над корзиной видны сверху;
+#: * k = 3600 — правая: кулак, видны тыл кисти и согнутые фаланги;
+#: * k = 5400 — правая: самый ясный кадр, фаланги читаются по отдельности;
+#: * k = 7200 — правая (держит предмет) и левая (на краю корзины).
+#:
+#: Чего здесь нет и почему (честно, а не «забыли»):
+#:
+#: * k = 1800, левая кисть — обрезана левым краем кадра, кончики пальцев за границей
+#:   (это записано и в рамке 07a: ``partial=True``); размечено 0 точек, рамка остаётся;
+#: * k = 3600 и 5400, левая кисть — от неё видна полоска 95–100 px у левого края
+#:   (``confidence="low"`` в 07a): размечать фаланги не по чему;
+#: * безымянный палец и мизинец не размечены нигде: в этой записи кисть всегда сжата, и
+#:   они перекрыты ладонью (та же причина, по которой BONE_CHAINS короче 26 джойнтов).
+BONE_FRAMES: tuple[BoneFrame, ...] = (
+    BoneFrame(
+        index=30,
+        note=(
+            "рамка 07a помечена 'unknown'; 07a установила, что это покоящаяся левая кисть — "
+            "для костей сторона обязательна, поэтому left"
+        ),
+        hands=(
+            HandMarks(
+                hand="left",
+                chains=BONE_CHAINS,
+                marks=(
+                    JointMark("wrist", (210, 700), "high"),
+                    JointMark("palm", (285, 555), "high"),
+                    JointMark("index_metacarpal", (307, 525), "low"),
+                    JointMark("index_proximal", (330, 495), "low"),
+                    JointMark("index_intermediate", (335, 530), "low"),
+                    JointMark("index", (340, 568), "low"),
+                    JointMark("middle_proximal", (355, 512), "low"),
+                    JointMark("middle_intermediate", (362, 555), "low"),
+                    JointMark("middle", (368, 600), "low"),
+                ),
+                note=(
+                    "кисть вплотную к камере, сжата в кулак и обхватывает край корзины: "
+                    "фаланги угадываются по буграм, поэтому low"
+                ),
+            ),
+        ),
+    ),
+    BoneFrame(
+        index=1800,
+        note="правая кисть над корзиной: указательный и средний пальцы видны сверху",
+        hands=(
+            HandMarks(
+                hand="right",
+                chains=BONE_CHAINS,
+                marks=(
+                    JointMark("wrist", (700, 195), "high"),
+                    JointMark("palm", (620, 180), "high"),
+                    JointMark("index_metacarpal", (605, 207), "medium"),
+                    JointMark("index_proximal", (590, 235), "medium"),
+                    JointMark("index_intermediate", (562, 262), "medium"),
+                    JointMark("index", (545, 285), "medium"),
+                    JointMark("middle_proximal", (630, 245), "medium"),
+                    JointMark("middle_intermediate", (600, 270), "medium"),
+                    JointMark("middle", (578, 292), "medium"),
+                ),
+                note="кисть мелкая (≈150 px): точность разметки фаланг здесь хуже всего",
+            ),
+        ),
+    ),
+    BoneFrame(
+        index=3600,
+        note=(
+            "правая кисть сжата в кулак: видны тыл кисти, бугры пястных костей и согнутые "
+            "фаланги"
+        ),
+        hands=(
+            HandMarks(
+                hand="right",
+                chains=BONE_CHAINS,
+                marks=(
+                    JointMark("wrist", (830, 270), "high"),
+                    JointMark("palm", (701, 245), "high"),
+                    JointMark("index_metacarpal", (676, 273), "medium"),
+                    JointMark("index_proximal", (651, 301), "medium"),
+                    JointMark("index_intermediate", (636, 341), "medium"),
+                    JointMark("index", (628, 380), "medium"),
+                    JointMark("middle_proximal", (684, 313), "medium"),
+                    JointMark("middle_intermediate", (679, 346), "medium"),
+                    JointMark("middle", (679, 380), "medium"),
+                ),
+            ),
+        ),
+    ),
+    BoneFrame(
+        index=5400,
+        note="самый ясный кадр: тыл правой кисти, указательный и средний пальцы разведены",
+        hands=(
+            HandMarks(
+                hand="right",
+                chains=BONE_CHAINS,
+                marks=(
+                    JointMark("wrist", (880, 415), "high"),
+                    JointMark("palm", (820, 390), "high"),
+                    JointMark("index_metacarpal", (790, 415), "medium"),
+                    JointMark("index_proximal", (760, 440), "medium"),
+                    JointMark("index_intermediate", (750, 465), "medium"),
+                    JointMark("index", (750, 490), "medium"),
+                    JointMark("middle_proximal", (790, 445), "medium"),
+                    JointMark("middle_intermediate", (780, 470), "medium"),
+                    JointMark("middle", (785, 495), "medium"),
+                ),
+            ),
+        ),
+    ),
+    BoneFrame(
+        index=7200,
+        note="правая кисть держит предмет, левая — на краю корзины: фаланги видны сбоку",
+        hands=(
+            HandMarks(
+                hand="left",
+                chains=BONE_CHAINS,
+                marks=(
+                    JointMark("wrist", (165, 620), "high"),
+                    JointMark("palm", (158, 541), "high"),
+                    JointMark("index_metacarpal", (163, 500), "medium"),
+                    JointMark("index_proximal", (168, 458), "medium"),
+                    JointMark("index_intermediate", (200, 425), "medium"),
+                    JointMark("index", (234, 389), "medium"),
+                    JointMark("middle_proximal", (190, 478), "medium"),
+                    JointMark("middle_intermediate", (224, 454), "medium"),
+                    JointMark("middle", (254, 422), "medium"),
+                ),
+                note="кисть боком, пальцы прижаты к краю корзины: видны бугры фаланг",
+            ),
+            HandMarks(
+                hand="right",
+                chains=BONE_CHAINS,
+                marks=(
+                    JointMark("wrist", (610, 310), "high"),
+                    JointMark("palm", (550, 286), "high"),
+                    JointMark("index_metacarpal", (525, 310), "medium"),
+                    JointMark("index_proximal", (500, 335), "medium"),
+                    JointMark("index_intermediate", (490, 360), "medium"),
+                    JointMark("index", (485, 385), "medium"),
+                    JointMark("middle_proximal", (525, 345), "medium"),
+                    JointMark("middle_intermediate", (515, 370), "medium"),
+                    JointMark("middle", (512, 395), "medium"),
+                ),
+            ),
+        ),
+    ),
+)
+
+
+def validate_bone_frames(
+    frames: Sequence[BoneFrame] = BONE_FRAMES,
+    calib: Sequence[CalibFrame] = CALIB_FRAMES,
+) -> None:
+    """Проверка костной разметки целиком и её согласованности с рамками 07a.
+
+    Две разметки живут раздельно (рамки не трогаются), поэтому проверяется их стык:
+    каждый кадр костей есть в 07a, на нём действительно видна эта рука (не в ``ignore``),
+    для неё есть прямоугольник, а кадры 07a покрыты костями все — иначе «эталон на 5
+    кадрах» тихо превратился бы в эталон на трёх.
+    """
+    if not frames:
+        raise ValueError("костная разметка: пусто")
+    by_index = {frame.index: frame for frame in calib}
+    for previous, current in zip(frames, frames[1:]):
+        if current.index <= previous.index:
+            raise ValueError(
+                f"костная разметка: номера кадров должны возрастать "
+                f"({previous.index} → {current.index})"
+            )
+    for frame in frames:
+        reference = by_index.get(frame.index)
+        if reference is None:
+            raise ValueError(f"костная разметка: кадра k={frame.index} нет в CALIB_FRAMES (07a)")
+        for marks in frame.hands:
+            if marks.hand in reference.ignore:
+                raise ValueError(
+                    f"костная разметка k={frame.index}: рука {marks.hand!r} помечена в 07a как "
+                    "невидимая (ignore) — размечать её кости нельзя"
+                )
+            if reference.box_for(marks.hand) is None and reference.box_for("unknown") is None:
+                raise ValueError(
+                    f"костная разметка k={frame.index}: для руки {marks.hand!r} нет рамки в 07a"
+                )
+    missing = [frame.index for frame in calib if frame.index not in {f.index for f in frames}]
+    if missing:
+        raise ValueError(f"костная разметка: кадры 07a без костей — {missing}")
+    if not any(mark.confidence == "high" for frame in frames for hand in frame.hands
+               for mark in hand.marks):
+        raise ValueError("костная разметка: нет ни одной точки с уверенностью high")
+
+
+def bones_as_json(frames: Sequence[BoneFrame] = BONE_FRAMES) -> str:
+    """Костная разметка в JSON: точки, цепочки, допуск и порог излома."""
+    return json.dumps(
+        {
+            "eye_size": [EYE_WIDTH, EYE_HEIGHT],
+            "tolerance_px": BONE_TOLERANCE_PX,
+            "kink_angle_deg": BONE_KINK_ANGLE_DEG,
+            "points_per_hand": list(BONE_POINTS_PER_HAND),
+            "frames": [frame.as_dict() for frame in frames],
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
 def as_json(frames: Sequence[CalibFrame] = CALIB_FRAMES) -> str:
     """Эталон в JSON (для 07b и внешних скриптов): кадры, рамки, допуск разметки."""
     return json.dumps(
@@ -378,12 +817,56 @@ def _describe(frames: Sequence[CalibFrame]) -> str:
     return "\n".join(lines)
 
 
-def _save_frames(video: Path, out_dir: Path, frames: Sequence[CalibFrame], overlay: bool) -> int:
+def _describe_bones(frames: Sequence[BoneFrame] = BONE_FRAMES) -> str:
+    """Человекочитаемая таблица костной разметки (пишется в ``bones.md``)."""
+    low, high = BONE_POINTS_PER_HAND
+    lines = [
+        "# Костная разметка: 7–9 точек на руку (задача 08e)",
+        "",
+        f"Координаты — левый глаз SBS-кадра {EYE_WIDTH}×{EYE_HEIGHT}; допуск "
+        f"±{BONE_TOLERANCE_PX} px, порог излома {BONE_KINK_ANGLE_DEG:g}°.",
+        f"На кисть {low}–{high} точек; цепочки отрезков — `BONE_CHAINS`:",
+        "",
+        "```",
+        *("  " + " → ".join(chain) for chain in BONE_CHAINS),
+        "```",
+        "",
+        "| k | сторона | сустав | u | v | уверенность | в цепочках |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for frame in frames:
+        for hand in frame.hands:
+            for mark in hand.marks:
+                groups = [
+                    f"#{i}" for i, chain in enumerate(hand.chains) if mark.joint in chain
+                ]
+                lines.append(
+                    f"| {frame.index} | {hand.hand} | {mark.joint} | {mark.point[0]} | "
+                    f"{mark.point[1]} | {mark.confidence} | {', '.join(groups)} |"
+                )
+    lines.append("")
+    lines.append(
+        "Не размечены: k = 1800 (левая), k = 3600 и k = 5400 (левая) — кисть обрезана краем "
+        "кадра, кончиков пальцев в кадре нет."
+    )
+    return "\n".join(lines)
+
+
+def _save_frames(
+    video: Path,
+    out_dir: Path,
+    frames: Sequence[CalibFrame],
+    overlay: bool,
+    bones: Sequence[BoneFrame] = BONE_FRAMES,
+) -> int:
     """Сохраняет кадры набора (и, при ``overlay``, разметку) в ``out_dir``.
 
     Возвращает число записанных кадров. ``cv2`` импортируется локально: модуль эталона
     нужен 07b и тестам без OpenCV. Размер кадра проверяется до записи: если видео не
     SBS 2160×810, разметка в координатах левого глаза недействительна.
+
+    При ``overlay`` на кадр левого глаза рисуются и рамки 07a, и костная разметка 08e
+    (точки + цепочки): это артефакт для глаз, метрика его не использует.
     """
     import cv2  # noqa: PLC0415 — локальный импорт: без OpenCV эталон тоже нужен
 
@@ -393,6 +876,7 @@ def _save_frames(video: Path, out_dir: Path, frames: Sequence[CalibFrame], overl
     if not cap.isOpened():
         raise SystemExit(f"не открывается видео: {video}")
     full_size = (2 * EYE_WIDTH, EYE_HEIGHT)
+    bones_by_index = {frame.index: frame for frame in bones}
     written = 0
     try:
         for frame in frames:
@@ -426,6 +910,9 @@ def _save_frames(video: Path, out_dir: Path, frames: Sequence[CalibFrame], overl
                         2,
                         cv2.LINE_AA,
                     )
+                bone_frame = bones_by_index.get(frame.index)
+                if bone_frame is not None:
+                    _draw_bone_marks(cv2, marked, bone_frame)
                 annotated = out_dir / "annotated"
                 annotated.mkdir(exist_ok=True)
                 cv2.imwrite(str(annotated / f"frame_{frame.index:05d}_left.png"), marked)
@@ -434,10 +921,48 @@ def _save_frames(video: Path, out_dir: Path, frames: Sequence[CalibFrame], overl
     return written
 
 
+def _draw_bone_marks(cv2, image, frame: BoneFrame) -> None:
+    """Нарисовать костную разметку кадра: отрезки цепочек и точки с подписями."""
+    colors = {"left": (255, 128, 0), "right": (0, 128, 255)}
+    for hand in frame.hands:
+        color = colors.get(hand.hand, (0, 200, 0))
+        points = hand.points
+        for chain in hand.chains:
+            for first, second in zip(chain, chain[1:]):
+                cv2.line(image, points[first], points[second], color, 2, cv2.LINE_AA)
+        for mark in hand.marks:
+            u, v = mark.point
+            radius = 3 if mark.confidence == "high" else 2
+            cv2.circle(image, (u, v), radius, color, -1, cv2.LINE_AA)
+            cv2.putText(
+                image,
+                mark.joint,
+                (u + 5, v - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.35,
+                (0, 0, 0),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                image,
+                mark.joint,
+                (u + 5, v - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.35,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+
+
 def main(argv: Iterable[str] | None = None) -> int:
-    """CLI: таблица эталона, JSON для 07b или сохранение PNG + ``frames.md``."""
+    """CLI: таблица эталона, JSON для 07b, костная разметка 08e или сохранение PNG."""
     parser = argparse.ArgumentParser(
-        description="Рабочий набор кадров и пиксельный эталон кистей для калибровки (07a)."
+        description=(
+            "Рабочий набор кадров и пиксельный эталон кистей для калибровки (07a) "
+            "с костной разметкой 08e."
+        )
     )
     parser.add_argument("video", nargs="?", type=Path, help="data/CameraRecord_*.mp4 (для сохранения PNG)")
     parser.add_argument(
@@ -449,14 +974,31 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--show", action="store_true", help="напечатать таблицу эталона")
     parser.add_argument("--json", action="store_true", help="напечатать эталон в JSON")
     parser.add_argument(
+        "--bones",
+        action="store_true",
+        help="напечатать костную разметку 08e (7–9 точек на руку) вместо таблицы рамок",
+    )
+    parser.add_argument(
+        "--bones-json",
+        action="store_true",
+        help="напечатать костную разметку 08e в JSON",
+    )
+    parser.add_argument(
         "--overlay",
         action="store_true",
-        help="вместе с кадрами сохранить разметку (annotated/frame_*_left.png)",
+        help="вместе с кадрами сохранить разметку: рамки 07a + кости 08e",
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     frames = CALIB_FRAMES
     validate_frames(frames)
+    validate_bone_frames()
+    if args.bones_json:
+        print(bones_as_json())
+        return 0
+    if args.bones:
+        print(_describe_bones())
+        return 0
     if args.json:
         print(as_json(frames))
         return 0
@@ -470,8 +1012,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         raise SystemExit(f"нет файла: {args.video}")
     written = _save_frames(args.video, args.out, frames, args.overlay)
     (args.out / "frames.md").write_text(_describe(frames) + "\n", encoding="utf-8")
+    (args.out / "bones.md").write_text(_describe_bones() + "\n", encoding="utf-8")
     print(f"\nсохранено кадров: {written} → {args.out}")
     print(f"разметка: {args.out / 'frames.md'}")
+    print(f"кости: {args.out / 'bones.md'}")
     if args.overlay:
         print(f"с разметкой: {args.out / 'annotated'}")
     return 0
