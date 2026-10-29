@@ -14,7 +14,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.parse_tracking import HAND_JOINTS, extract_sample, iter_samples, parse_pose  # noqa: E402
+from src.parse_tracking import (  # noqa: E402
+    HAND_JOINTS,
+    HAND_JOINTS_FULL,
+    extract_sample,
+    iter_samples,
+    parse_pose,
+)
 
 DATA = next(iter(sorted((ROOT / "data").glob("trackingData_*.txt"))), None)
 NO_DATA = "нет data/trackingData_*.txt — файл данных не коммитится (см. README)"
@@ -44,26 +50,43 @@ class FirstSampleTest(unittest.TestCase):
         for axis, value in zip(("x", "y", "z", "qx", "qy", "qz", "qw"), expected):
             self.assertEqual(self.record[f"head_{axis}"], value)
 
-    def test_five_points_per_hand(self) -> None:
+    def test_all_26_joints_per_hand(self) -> None:
+        names = [name for name, _ in HAND_JOINTS_FULL]
+        self.assertEqual(len(names), 26)
+        self.assertEqual(len(set(names)), 26, "имена джойнтов должны быть уникальны")
+        self.assertEqual(sorted(index for _, index in HAND_JOINTS_FULL), list(range(26)))
         for side in ("left", "right"):
-            for name, _ in HAND_JOINTS:
+            for name, _ in HAND_JOINTS_FULL:
                 for axis in "xyz":
                     self.assertIn(f"{side}_{name}_{axis}", self.record)
-        self.assertEqual(sum(1 for key in self.record if key.startswith("left_") and key[5:].count("_") == 1), 15)
+            coordinate_keys = [
+                key
+                for key in self.record
+                if key.startswith(f"{side}_") and key.rsplit("_", 1)[-1] in ("x", "y", "z")
+            ]
+            self.assertEqual(len(coordinate_keys), 26 * 3)
+
+    def test_render_subset_keeps_its_names_and_indices(self) -> None:
+        # 08a/07a читают HAND_JOINTS, поэтому 5-точечный набор не должен «поехать»:
+        # короткие имена кончиков пальцев остаются на индексах 5/10/15.
+        self.assertEqual(HAND_JOINTS, (("palm", 0), ("wrist", 1), ("thumb", 5), ("index", 10), ("middle", 15)))
+        full = dict(HAND_JOINTS_FULL)
+        for name, index in HAND_JOINTS:
+            self.assertEqual(full[name], index)
 
     def test_first_sample_right_hand_is_nan(self) -> None:
         self.assertEqual(self.record["right_active"], 0)
-        for name, _ in HAND_JOINTS:
+        for name, _ in HAND_JOINTS_FULL:
             for axis in "xyz":
                 value = self.record[f"right_{name}_{axis}"]
                 self.assertTrue(math.isnan(value), f"right_{name}_{axis} = {value!r}, ожидался NaN")
 
     def test_left_hand_is_valid(self) -> None:
         self.assertEqual(self.record["left_active"], 1)
-        for name, _ in HAND_JOINTS:
-            self.assertTrue(math.isfinite(self.record[f"left_{name}_x"]))
-            self.assertTrue(math.isfinite(self.record[f"left_{name}_y"]))
-            self.assertTrue(math.isfinite(self.record[f"left_{name}_z"]))
+        for name, _ in HAND_JOINTS_FULL:
+            for axis in "xyz":
+                value = self.record[f"left_{name}_{axis}"]
+                self.assertTrue(math.isfinite(value), f"left_{name}_{axis} = {value!r}, ожидался finite")
 
     def test_inactive_positions_are_not_zeros_but_nan(self) -> None:
         # В файле у неактивной руки p — не нули, а «замороженная» поза: проверяем, что
@@ -91,19 +114,50 @@ class ActivityTest(unittest.TestCase):
 
 
 class SyntheticTest(unittest.TestCase):
+    def test_each_joint_reads_its_own_index(self) -> None:
+        # Каждый джойнт получает свою x = index/100: так видно, что имя ↔ индекс не
+        # перепутаны, а не просто «все точки конечные».
+        def pose_with_x(x: float) -> str:
+            return ",".join(f"{value:.6f}".replace(".", ",") for value in (x, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0))
+
+        sample = {
+            "timeStampNs": 1,
+            "Head": {"pose": HEAD_POSE, "status": 3},
+            "Hand": {
+                "leftHand": {"isActive": 1, "HandJointLocations": _joints()},
+                "rightHand": {
+                    "isActive": 1,
+                    "HandJointLocations": [
+                        {"p": pose_with_x(index / 100.0), "s": 15.0, "r": 0.0} for index in range(26)
+                    ],
+                },
+            },
+        }
+        record = extract_sample(sample)
+        for name, index in HAND_JOINTS_FULL:
+            self.assertAlmostEqual(
+                record[f"right_{name}_x"], index / 100.0, places=9, msg=f"right_{name} должен быть индексом {index}"
+            )
+
     def test_s_zero_makes_point_nan_even_if_hand_active(self) -> None:
         sample = {
             "timeStampNs": 1,
             "Head": {"pose": HEAD_POSE, "status": 3},
             "Hand": {
                 "leftHand": {"isActive": 1, "HandJointLocations": _joints()},
-                "rightHand": {"isActive": 1, "HandJointLocations": _joints(zero_index=0)},
+                "rightHand": {"isActive": 1, "HandJointLocations": _joints(zero_index=8)},
             },
         }
         record = extract_sample(sample)
         self.assertEqual(record["right_active"], 1)
-        self.assertTrue(math.isnan(record["right_palm_x"]), "s = 0 должен давать NaN")
-        self.assertTrue(math.isfinite(record["right_wrist_x"]), "s = 15 должен давать координату")
+        self.assertTrue(math.isnan(record["right_index_intermediate_x"]), "s = 0 должен давать NaN")
+        self.assertTrue(math.isfinite(record["right_index_proximal_x"]), "s = 15 должен давать координату")
+        self.assertTrue(math.isfinite(record["right_index_x"]), "кончик пальца валиден")
+        # NaN ровно у одного джойнта: 3 координаты из 78.
+        right_nan = sum(
+            math.isnan(record[f"right_{name}_{axis}"]) for name, _ in HAND_JOINTS_FULL for axis in "xyz"
+        )
+        self.assertEqual(right_nan, 3)
 
     def test_inactive_hand_gives_all_nan(self) -> None:
         sample = {
@@ -117,7 +171,7 @@ class SyntheticTest(unittest.TestCase):
         record = extract_sample(sample)
         for side in ("left", "right"):
             self.assertEqual(record[f"{side}_active"], 0)
-            for name, _ in HAND_JOINTS:
+            for name, _ in HAND_JOINTS_FULL:
                 for axis in "xyz":
                     self.assertTrue(math.isnan(record[f"{side}_{name}_{axis}"]))
 

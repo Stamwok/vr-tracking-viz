@@ -240,12 +240,25 @@ class PoseAtSyntheticTest(unittest.TestCase):
                 track.pose_at(bad)  # type: ignore[arg-type]
                 track.nearest_index(bad)  # type: ignore[arg-type]
 
-    def test_to_flat_matches_csv_columns(self) -> None:
-        from src.parse_tracking import CSV_COLUMNS
+    def test_to_flat_is_render_subset_of_csv_columns(self) -> None:
+        # 08d расширил CSV до 26 джойнтов на руку, а PoseTrack/to_flat остаётся рендер-набором
+        # из 5 точек: его колонки должны быть строгим подмножеством CSV (08f расширит sync).
+        from src.parse_tracking import CSV_COLUMNS, HAND_JOINTS
 
         track = make_track(self.TS, head_x=[t / 1000.0 for t in self.TS], nan_right_before=1)
         flat = track.pose_at(5 * MS).to_flat()
-        self.assertEqual(set(flat), set(CSV_COLUMNS) - {"t_ns", "t_rel_s"})
+        csv_fields = set(CSV_COLUMNS) - {"t_ns", "t_rel_s"}
+        self.assertEqual(set(flat), set(flat) & csv_fields)
+        expected = {"head_x", "head_y", "head_z", "head_qx", "head_qy", "head_qz", "head_qw"}
+        expected |= {
+            f"{side}_{name}_{axis}"
+            for side in ("left", "right")
+            for name, _ in HAND_JOINTS
+            for axis in ("x", "y", "z")
+        }
+        expected |= {"left_active", "right_active"}
+        self.assertEqual(set(flat), expected)
+        self.assertLess(len(flat), len(csv_fields))  # CSV шире: 156 колонок вместо 30
         self.assertEqual(flat["left_active"], 1)
         self.assertEqual(flat["right_active"], 0)
         self.assertTrue(math.isnan(flat["right_index_x"]))
