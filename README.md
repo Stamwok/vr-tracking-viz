@@ -15,7 +15,8 @@
 4. Рендерит `output/overlay.mp4` — видео (левый глаз SBS-кадра, 1080×810) с наложенным
    «скелетом» (5 точек и 4 линии на каждую руку), затухающим следом кистей и HUD (время, номер
    кадра, состояние рук) — см. [`docs/overlay.md`](docs/overlay.md).
-5. Строит `output/trajectory.html` — интерактивные Plotly-графики: 3D-траектории, x(t)/y(t)/z(t), скорости.
+5. Строит `output/trajectory.html` — интерактивные Plotly-графики: 3D-траектории с метками
+   «старт»/«финиш», x(t)/y(t)/z(t), скорости и высота кистей относительно головы.
 
 ### Пример результата
 
@@ -263,6 +264,12 @@ data/CameraRecord_*.mp4 --stills output/debug/overlay`.
 `python src/overlay_video.py data/CameraRecord_*.mp4 --stills output/debug/overlay_before
 --frames 1800,7200 --no-trail --no-hud`.
 
+Графики собираются за **≈1 с** в один файл `output/trajectory.html` размером **6.6 МиБ**: plotly.js
+(4.8 МиБ) встроен внутрь, внешних CDN нет, поэтому файл открывается двойным щелчком — без сервера
+и без интернета. Для показа данные прорежены равномерным шагом до 5000 точек на серию
+(`--max-points`, `0` — без прореживания), а блок «Сводка» и все числа считаются по полным
+21 787 строкам CSV.
+
 Результаты: `output/tracking.csv`, `output/overlay.mp4`, `output/trajectory.html`
 (открывается в браузере без сервера).
 
@@ -277,7 +284,7 @@ vr-tracking-viz/
 │   ├── camera_model.py      # интринсики, world→camera, проекция 3D→2D
 │   ├── config.py            # калибровка: оси, флаги, T_head_cam (смещение + yaw/pitch/roll)
 │   ├── overlay_video.py     # наложение скелета, следа кистей и HUD на видео
-│   └── plot_trajectory.py   # Plotly: 3D-траектории и x(t)/y(t)/z(t)
+│   └── plot_trajectory.py   # Plotly: 3D-траектории, x/y/z(t), скорость, высота кистей
 ├── output/                  # overlay.mp4, trajectory.html, tracking.csv (не коммитятся)
 ├── docs/                    # intrinsics.md, projection_notes.md, overlay.md, NOTES.md, images/
 ├── .gitignore               # data/, output/, .venv/, __pycache__/, *.mp4
