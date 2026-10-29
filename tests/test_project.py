@@ -420,10 +420,14 @@ class RealDataTest(unittest.TestCase):
             cls.frames.append((k, track.pose_at(frame.ts_ns)))
 
     def test_gaze_projects_to_principal_point(self) -> None:
+        # точка перед головой — (0, 0, −1): в OpenXR вперёд смотрит −z, камера при
+        # калибровке 07c переводит её в (0, 0, +1) — то есть в главную точку кадра
         for k, pose in self.frames:
             for invert in (False, True):
                 matrix = world_to_camera_matrix(pose, invert_quat=invert)
-                gaze_world = transform_point(head_to_world(pose, invert_quat=invert), (0.0, 0.0, 1.0))
+                gaze_world = transform_point(
+                    head_to_world(pose, invert_quat=invert), (0.0, 0.0, -1.0)
+                )
                 point = project_eye(transform_point(matrix, gaze_world), self.intrinsics)
                 with self.subTest(k=k, invert=invert):
                     self.assertTrue(point.visible)
@@ -449,25 +453,48 @@ class RealDataTest(unittest.TestCase):
                         self.assertTrue(point.visible)
                         self.assertTrue(in_frame(point, self.intrinsics))
 
-    def test_hands_behind_camera_are_invisible(self) -> None:
-        # замер 05b: при invert_quat=False все 10 точек кистей оказываются за камерой,
-        # поэтому проекция обязана вернуть visible=False, а не пиксели «наоборот»
+    def test_hands_are_in_front_with_calibration(self) -> None:
+        # калибровка 07c: кисти перед камерой (z ≈ 0.27…0.53 м), проекция даёт пиксели
         for k, pose in self.frames:
-            matrix = world_to_camera_matrix(pose, invert_quat=False)
+            matrix = world_to_camera_matrix(pose)
             finite = visible = 0
             for point_world in pose.hands.values():
                 if any(math.isnan(value) for value in point_world):
                     continue
                 finite += 1
-                point = project_eye(transform_point(matrix, point_world), self.intrinsics)
+                camera = transform_point(matrix, point_world)
+                self.assertGreater(camera[2], 0.0)
+                point = project_eye(camera, self.intrinsics)
                 if point.visible:
                     visible += 1
                     self.assertTrue(math.isfinite(point.u) and math.isfinite(point.v))
+            with self.subTest(k=k):
+                self.assertEqual(finite, 10)
+                self.assertEqual(visible, 10)
+
+    def test_stub_from_05b_puts_hands_behind_camera(self) -> None:
+        # историческая заглушка 05b (T_head_cam = [I | 5 см], F переворачивает только y)
+        # оставляла z головы (назад) «вперёд» камеры: все кисти за камерой. Это и была
+        # причина калибровки 07b, поэтому регрессия проверяется явно.
+        stub = (
+            (1.0, 0.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0, 0.0),
+            (0.0, 0.0, 1.0, 0.05),
+            (0.0, 0.0, 0.0, 1.0),
+        )
+        for k, pose in self.frames:
+            matrix = world_to_camera_matrix(pose, t_head_cam=stub, opencv_conventions=True)
+            visible = 0
+            for point_world in pose.hands.values():
+                if any(math.isnan(value) for value in point_world):
+                    continue
+                point = project_eye(transform_point(matrix, point_world), self.intrinsics)
+                if point.visible:
+                    visible += 1
                 else:
                     self.assertTrue(math.isnan(point.u) and math.isnan(point.v))
                     self.assertFalse(in_frame(point, self.intrinsics))
             with self.subTest(k=k):
-                self.assertEqual(finite, 10)
                 self.assertEqual(visible, 0)
 
     def test_world_to_camera_then_project_matches_project_eye(self) -> None:
