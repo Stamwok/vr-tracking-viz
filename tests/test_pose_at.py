@@ -30,6 +30,7 @@ from src.sync import (  # noqa: E402
     iter_frame_poses,
     load_poses,
     pose_at_frame,
+    pose_at_frame_split,
     slerp,
     video_time_offset_ns,
 )
@@ -249,6 +250,65 @@ class PoseAtSyntheticTest(unittest.TestCase):
         self.assertEqual(flat["right_active"], 0)
         self.assertTrue(math.isnan(flat["right_index_x"]))
         self.assertAlmostEqual(flat["head_x"], 0.005, places=12)
+
+
+class PoseAtFrameSplitTest(unittest.TestCase):
+    """08c: раздельные сдвиги времени для головы и кистей (инструмент проверки каналов)."""
+
+    def _track(self) -> PoseTrack:
+        # голова: 0, 0.1, 0.2 м по x (1 м/с); правая ладонь: 0, −0.2, −0.4 м (−2 м/с)
+        ts = [0, 100 * MS, 200 * MS]
+        values = {name: [0.0, 0.0, 0.0] for name in (*POSITION_FIELDS, *QUAT_FIELDS)}
+        values["head_x"] = [0.0, 0.1, 0.2]
+        values["head_qw"] = [1.0, 1.0, 1.0]
+        for key in POINT_KEYS:
+            values[f"{key}_x"] = [0.0, -0.2, -0.4] if key == "right_palm" else [0.0, 0.0, 0.0]
+        return PoseTrack(ts, values, {"left": [True] * 3, "right": [True] * 3})
+
+    def _frame(self) -> FrameTime:
+        return FrameTime(index=0, ts_ns=100 * MS, t_rel_s=0.1, in_tracking=True)
+
+    def test_equal_offsets_match_single_offset(self) -> None:
+        track = self._track()
+        frame = self._frame()
+        for offset in (0, -50 * MS, 100 * MS, -400 * MS):
+            with self.subTest(offset=offset):
+                split = pose_at_frame_split(track, frame, offset, offset)
+                plain = pose_at_frame(track, frame, offset)
+                self.assertEqual(split.head_pos, plain.head_pos)
+                self.assertEqual(split.head_quat, plain.head_quat)
+                self.assertEqual(split.hands, plain.hands)
+                self.assertEqual(split.active, plain.active)
+
+    def test_channels_take_their_own_time(self) -> None:
+        track = self._track()
+        frame = self._frame()
+        pose = pose_at_frame_split(track, frame, 0, 0)
+        self.assertAlmostEqual(pose.head_pos[0], 0.1)  # ровно t = 100 мс
+        self.assertAlmostEqual(pose.hands["right_palm"][0], -0.2)
+        mixed = pose_at_frame_split(track, frame, -100 * MS, 0)
+        self.assertAlmostEqual(mixed.head_pos[0], 0.0)
+        self.assertAlmostEqual(mixed.hands["right_palm"][0], -0.2)
+        self.assertEqual(mixed.ts_ns, frame.ts_ns)  # поза отнесена ко времени кадра
+        swapped = pose_at_frame_split(track, frame, 0, -100 * MS)
+        self.assertAlmostEqual(swapped.head_pos[0], 0.1)
+        self.assertAlmostEqual(swapped.hands["right_palm"][0], 0.0)
+
+    def test_split_interpolates_each_channel(self) -> None:
+        track = self._track()
+        frame = FrameTime(index=1, ts_ns=150 * MS, t_rel_s=0.15, in_tracking=True)
+        pose = pose_at_frame_split(track, frame, -75 * MS, -25 * MS)
+        self.assertAlmostEqual(pose.head_pos[0], 0.075)  # 0.1 м + 0.1 м/с · (−25 мс)
+        self.assertAlmostEqual(pose.hands["right_palm"][0], -0.25)  # −0.2 м + (−2 м/с)·25 мс
+
+    def test_invalid_offsets_raise(self) -> None:
+        track = self._track()
+        frame = self._frame()
+        for bad in (True, 1.5, "0", None):
+            with self.subTest(value=bad), self.assertRaises(ValueError):
+                pose_at_frame_split(track, frame, bad, 0)
+            with self.subTest(value=bad), self.assertRaises(ValueError):
+                pose_at_frame_split(track, frame, 0, bad)
 
 
 @unittest.skipIf(DATA is None or not META_PATH.is_file(), NO_DATA)

@@ -31,6 +31,11 @@
 :func:`video_time_offset_ns` и :func:`pose_at_frame`. Рендер и проверка калибровки зовут именно
 ``pose_at_frame``, чтобы жить в одной шкале времени.
 
+Доработка 08c: :func:`pose_at_frame_split` берёт голову и кисти со своими сдвигами времени —
+это инструмент проверки гипотезы «каналы запаздывают по-разному». По итогам проверки гипотеза
+не подтвердилась (разница оценок меньше точности одиночной константы), поэтому рендер по-прежнему
+зовёт ``pose_at_frame`` с одной поправкой.
+
 Запуск:
     python src/sync.py output/video_meta.json data/trackingData_20260505_165740.txt
     python src/sync.py output/video_meta.json data/trackingData_20260505_165740.txt --poses
@@ -197,6 +202,42 @@ def pose_at_frame(track: PoseTrack, frame: FrameTime, offset_ns: int | None = No
     if isinstance(offset_ns, bool) or not isinstance(offset_ns, int):
         raise ValueError(f"offset_ns: ожидалось целое число, получено {offset_ns!r}")
     return track.pose_at(int(frame.ts_ns) + offset_ns)
+
+
+def pose_at_frame_split(
+    track: PoseTrack, frame: FrameTime, head_offset_ns: int, hand_offset_ns: int
+) -> Pose:
+    """Поза кадра, где **голова и кисти** взяты со своими сдвигами времени (08c, диагностика).
+
+    Смысл: если каналы head и hand запаздывают по-разному, единая поправка времени не может
+    посадить на кисть одновременно позу камеры и точки кистей. Функция собирает такую позу
+    из двух запросов: поза головы (она же поза камеры) — из ``t + head_offset_ns``, кисти —
+    из ``t + hand_offset_ns``. ``Pose.ts_ns`` при этом равен времени кадра: поза относится
+    к моменту видео, а не к одному из двух сдвинутых моментов.
+
+    Зачем в ``sync``, а не в диагностике: это та же операция «время → поза», что и
+    :func:`pose_at_frame`; раздельные сдвиги каналов — гипотеза о синхронизации, а не о
+    картинке. В рендере функция **не используется**: 08c показала, что данные не разделяют
+    каналы (разница оценок меньше точности одиночной константы), поэтому у рендера осталась
+    одна поправка ``config.VIDEO_TIME_OFFSET_MS`` — см. ``docs/NOTES.md``, 2026-10-29.
+
+    При равных сдвигах возвращается ровно та же поза, что у
+    :func:`pose_at_frame` (проверяется тестом), поэтому сравнение «одна константа против
+    двух» не вносит расхождения в интерполяцию.
+    """
+    head_offset_ns = _int_ns(head_offset_ns, "head_offset_ns")
+    hand_offset_ns = _int_ns(hand_offset_ns, "hand_offset_ns")
+    if head_offset_ns == hand_offset_ns:
+        return track.pose_at(int(frame.ts_ns) + head_offset_ns)
+    head_pose = track.pose_at(int(frame.ts_ns) + head_offset_ns)
+    hand_pose = track.pose_at(int(frame.ts_ns) + hand_offset_ns)
+    return Pose(
+        ts_ns=int(frame.ts_ns),
+        head_pos=head_pose.head_pos,
+        head_quat=head_pose.head_quat,
+        hands=hand_pose.hands,
+        active=hand_pose.active,
+    )
 
 
 def _normalized(q: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
