@@ -21,7 +21,7 @@ if str(ROOT) not in sys.path:
 
 import numpy as np  # noqa: E402
 
-from src import camera_model, config, overlay_video as ov, sync  # noqa: E402
+from src import calib_frames, camera_model, config, overlay_video as ov, sync  # noqa: E402
 
 try:  # pragma: no cover — проверка окружения, а не логики
     import cv2
@@ -147,6 +147,223 @@ def _points(visible: bool = True) -> dict:
         }
         for side in ("left", "right")
     }
+
+
+# --- 08b: след и HUD ---------------------------------------------------------------------
+
+#: Синтетический трек: левая ладонь идёт по заданным точкам, правая — «нет данных».
+TRAIL_STEP_NS = 100_000_000
+
+
+def _track_with_left_palm(positions, step_ns: int = TRAIL_STEP_NS) -> sync.PoseTrack:
+    """PoseTrack с заданным движением левой ладони (остальные точки — в нуле, правая — NaN)."""
+    from src.sync import POINT_KEYS, POSITION_FIELDS, QUAT_FIELDS
+
+    count = len(positions)
+    values = {name: [0.0] * count for name in (*POSITION_FIELDS, *QUAT_FIELDS)}
+    values["head_qw"] = [1.0] * count
+    for key in POINT_KEYS:
+        if key == "left_palm":
+            continue
+        for axis in "xyz":
+            values[f"{key}_{axis}"] = [math.nan if key.startswith("right_") else 0.0] * count
+    for index, position in enumerate(positions):
+        for axis, value in zip("xyz", position):
+            values[f"left_palm_{axis}"][index] = value
+    return sync.PoseTrack(
+        [index * step_ns for index in range(count)],
+        values,
+        {"left": [True] * count, "right": [False] * count},
+    )
+
+
+def _frame_time(index: int = 0, t_rel_s: float = 0.0, in_tracking: bool = True) -> sync.FrameTime:
+    return sync.FrameTime(index=index, ts_ns=BASE_NS, t_rel_s=t_rel_s, in_tracking=in_tracking)
+
+
+class TrailSamplingTest(unittest.TestCase):
+    """Выборка следа: по времени, а не по номерам кадров."""
+
+    def test_times_are_ascending_and_time_based(self) -> None:
+        times = ov.trail_times(10_000_000_000, seconds=0.2, step_s=0.05)
+        self.assertEqual(len(times), 5)  # 0.2/0.05 + текущий момент
+        self.assertEqual(times, tuple(sorted(times)))
+        self.assertEqual(times[-1], 10_000_000_000)
+        self.assertEqual([b - a for a, b in zip(times, times[1:])], [50_000_000] * 4)
+        # окно задано временем: удвоение шага вдвое уменьшает число выборок, а не окно
+        self.assertEqual(len(ov.trail_times(0, seconds=0.2, step_s=0.1)), 3)
+
+    def test_window_validation(self) -> None:
+        for seconds, step_s in ((0.0, 0.1), (-0.1, 0.1), (0.1, 0.0), (0.1, 0.2), (math.nan, 0.1)):
+            with self.subTest(seconds=seconds, step_s=step_s), self.assertRaises(ValueError):
+                ov.trail_times(0, seconds=seconds, step_s=step_s)
+        for bad in (True, "1", None):
+            with self.subTest(ts=bad), self.assertRaises(ValueError):
+                ov.trail_times(bad)  # type: ignore[arg-type]
+        with self.subTest(step_bigger_than_window=True), self.assertRaises(ValueError):
+            ov.trail_times(0, seconds=0.2, step_s=0.5)
+
+    def test_points_are_clipped_to_tracking_range(self) -> None:
+        track = _track_with_left_palm([(0.0, 0.0, -1.0)] * 3)  # 0, 0.1, 0.2 с
+        # след от t = 0.05 с: момент «−0.15 с» уже до первого сэмпла — его быть не должно
+        points = ov.trail_points(track, 50_000_000, seconds=0.2, step_s=0.05)
+        self.assertLessEqual(len(points["left"]), 3)
+        for position in points["left"]:
+            self.assertEqual(position, (0.0, 0.0, -1.0))
+        # за концом трекинга ничего не добавляется: линия не «прилипает» к последнему кадру
+        tail = ov.trail_points(track, 250_000_000, seconds=0.2, step_s=0.05)
+        self.assertEqual(len(tail["left"]), 4)  # 50, 100, 150 и 200 мс; 250 мс уже нет
+        self.assertEqual(ov.trail_points(track, 5_000_000_000)["left"], [])
+
+    def test_nan_hand_keeps_nan_in_points(self) -> None:
+        track = _track_with_left_palm([(0.0, 0.0, -1.0), (0.1, 0.0, -1.0)])
+        points = ov.trail_points(track, 100_000_000, seconds=0.1, step_s=0.1)
+        self.assertEqual(len(points["right"]), 2)
+        for position in points["right"]:
+            self.assertTrue(all(math.isnan(value) for value in position))
+
+    def test_unknown_joint_is_rejected(self) -> None:
+        track = _track_with_left_palm([(0.0, 0.0, -1.0)])
+        with self.assertRaises(ValueError):
+            ov.trail_points(track, 0, joint="elbow")
+        with self.assertRaises(ValueError):
+            ov.trail_points(object(), 0)  # type: ignore[arg-type]
+
+
+@unittest.skipIf(cv2 is None, NO_CV2)
+class DrawTrailTest(unittest.TestCase):
+    """Отрисовка следа: видимые отрезки, разрывы на «нет данных», затухание."""
+
+    #: Ладонь едет по x: u = 686.868·x + 539.5 при глубине 1 м (поза головы единичная).
+    POSITIONS = ((-0.2, 0.0, -1.0), (-0.1, 0.0, -1.0), (0.0, 0.0, -1.0))
+
+    def _image(self) -> np.ndarray:
+        return np.zeros((810, 1080, 3), np.uint8)
+
+    def _draw(self, positions=None, **kwargs) -> tuple[int, np.ndarray]:
+        track = _track_with_left_palm(list(positions or self.POSITIONS))
+        image = self._image()
+        pose = track.pose_at(track.ts[-1])
+        drawn = ov.draw_trail(image, pose, track, EYE, ov.style_for(1080), seconds=0.2, step_s=0.1, **kwargs)
+        return drawn, image
+
+    def test_draws_one_segment_per_step(self) -> None:
+        drawn, image = self._draw()
+        self.assertEqual(drawn, 2)  # 3 выборки → 2 отрезка; правая рука — NaN, отрезков нет
+        self.assertGreater(int(image[..., 0].sum()), 0)  # цвет левой руки (BGR: B)
+
+    def test_nan_breaks_the_line(self) -> None:
+        # 4 выборки → 3 отрезка; «нет данных» во второй выборке рвёт два отрезка из трёх
+        nan = (math.nan, math.nan, math.nan)
+        track = _track_with_left_palm(
+            [(-0.2, 0.0, -1.0), nan, (0.0, 0.0, -1.0), (0.1, 0.0, -1.0)]
+        )
+        image = self._image()
+        pose = track.pose_at(track.ts[-1])
+        drawn = ov.draw_trail(image, pose, track, EYE, ov.style_for(1080), seconds=0.3, step_s=0.1)
+        self.assertEqual(drawn, 1, "линия через NaN не проводится, но остальные отрезки рисуются")
+
+    def test_invisible_end_breaks_the_line(self) -> None:
+        # средняя точка за камерой (z > 0 в мире при повороте камеры на 180° вокруг x)
+        drawn, _image = self._draw([(0.0, 0.0, -1.0), (0.0, 0.0, 1.0), (0.1, 0.0, -1.0)])
+        self.assertEqual(drawn, 0)
+
+    def test_newest_segment_is_more_opaque(self) -> None:
+        drawn, image = self._draw()
+        self.assertEqual(drawn, 2)
+        # отрезки: старый (u ≈ 402→471) и новый (u ≈ 471→539); B-канал = 255·alpha
+        old = int(image[404, 436, 0])
+        new = int(image[404, 505, 0])
+        self.assertGreater(new, old + 40)
+        self.assertAlmostEqual(new / 255.0, ov.TRAIL_ALPHA_NEW, delta=0.06)
+
+    def test_bad_arguments_raise(self) -> None:
+        track = _track_with_left_palm([(0.0, 0.0, -1.0)])
+        pose = track.pose_at(0)
+        with self.assertRaises(ValueError):
+            ov.draw_trail(self._image(), pose, track, EYE, ov.style_for(1080), alpha_old=0.9, alpha_new=0.1)
+        with self.assertRaises(ValueError):
+            ov.draw_trail(self._image(), pose, track, EYE, ov.style_for(1080), alpha_new=0.0)
+        with self.assertRaises(ValueError):
+            ov.draw_trail(None, pose, track, EYE, ov.style_for(1080))
+        with self.assertRaises(ValueError):
+            ov.draw_trail(self._image(), pose, track, EYE, style=None)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            ov._blend_line(self._image(), (0, 0), (10, 10), (0, 0, 255), 2, 0.0)  # noqa: SLF001
+
+
+class HudTest(unittest.TestCase):
+    """HUD: фиксированная панель, состояние рук, вписывание текста."""
+
+    def test_rect_is_fixed_and_scales(self) -> None:
+        self.assertEqual(ov.hud_rect((1080, 810)), (12, 12, 342, 148))
+        self.assertEqual(ov.hud_rect((540, 405)), (6, 6, 171, 74))
+        self.assertEqual(ov.hud_rect((2160, 1620)), (24, 24, 684, 296))
+
+    def test_rect_validation(self) -> None:
+        for bad in ((0, 810), (1080, 0), (1080,), "1080x810", (1080.0, 810)):
+            with self.subTest(size=bad), self.assertRaises(ValueError):
+                ov.hud_rect(bad)  # type: ignore[arg-type]
+
+    def test_rows_report_hands_and_trail(self) -> None:
+        pose = _pose()
+        rows = ov.hud_items(_frame_time(3, 1.5), pose, 100)
+        texts = [text for text, _color in rows]
+        self.assertEqual(texts[0], "t =    1.500 s")
+        self.assertEqual(texts[1], "frame 3 / 99")
+        self.assertEqual(texts[2], "left: OK")
+        self.assertEqual(texts[3], "right: OK")
+        self.assertEqual(texts[4], "trail 0.6 s")
+        self.assertEqual(rows[2][1], ov.HUD_TEXT_COLOR)
+
+    def test_no_data_row_is_warning_coloured(self) -> None:
+        inactive = _pose()
+        inactive.active["right"] = False
+        rows = ov.hud_items(_frame_time(), inactive, 100)
+        self.assertIn(("right: NO DATA", ov.HUD_WARNING_COLOR), rows)
+        self.assertIn(("left: OK", ov.HUD_TEXT_COLOR), rows)
+
+    def test_frozen_pose_and_trail_off_are_reported(self) -> None:
+        rows = ov.hud_items(_frame_time(in_tracking=False), _pose(), 10, trail_seconds=None)
+        self.assertEqual(rows[-1][0], "trail off | pose frozen")
+
+    def test_items_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            ov.hud_items("moment", _pose(), 10)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            ov.hud_items(_frame_time(), _pose(), 0)
+        with self.assertRaises(ValueError):
+            ov.hud_items(_frame_time(index=10), _pose(), 10)
+        with self.assertRaises(ValueError):
+            ov.hud_items(_frame_time(), _pose(), 10, trail_seconds=0.0)
+
+    @unittest.skipIf(cv2 is None, NO_CV2)
+    def test_draw_paints_only_panel(self) -> None:
+        pose = _pose()
+        pose.active["right"] = False
+        image = np.full((810, 1080, 3), 255, np.uint8)
+        before = image.copy()
+        rect = ov.draw_hud(image, _frame_time(3, 1.5), pose, 100)
+        self.assertEqual(rect, ov.hud_rect((1080, 810)))
+        x0, y0, x1, y1 = rect
+        outside = np.ones(image.shape[:2], bool)
+        outside[y0:y1, x0:x1] = False
+        self.assertTrue(np.array_equal(image[outside], before[outside]), "HUD не должен задевать кадр вне панели")
+        self.assertLess(int(image[y0 + 3, x0 + 3].mean()), 250)
+        blue, green, red = (image[..., i].astype(int) for i in range(3))
+        warning = (red > 170) & (green > 120) & (blue < 90)
+        self.assertGreater(int(warning[y0:y1, x0:x1].sum()), 0, "нет предупреждения «нет данных»")
+
+    @unittest.skipIf(cv2 is None, NO_CV2)
+    def test_text_fits_panel(self) -> None:
+        image = np.zeros((810, 1080, 3), np.uint8)
+        # длинные строки (кадр 7000+, оба состояния, заморозка) — все должны вписываться
+        pose = _pose()
+        for inactive in (False, True):
+            pose.active["right"] = not inactive
+            for in_tracking in (True, False):
+                with self.subTest(inactive=inactive, in_tracking=in_tracking):
+                    ov.draw_hud(image, _frame_time(7200, 240.027, in_tracking), pose, 7279)
 
 
 class StyleTest(unittest.TestCase):
@@ -474,6 +691,57 @@ class SyntheticRenderTest(unittest.TestCase):
             ov.render_video(self.video, self.out, scene, progress_every=0, log=lambda _: None)
         self.assertFalse(self.out.exists())
 
+    def test_render_reports_trail_and_hud(self) -> None:
+        stats = ov.render_video(
+            self.video, self.out, self._scene(), progress_every=0, log=lambda _: None
+        )
+        self.assertGreater(stats.trail_segments, 0, "след не нарисован ни на одном кадре")
+        self.assertEqual(stats.trail_seconds, ov.TRAIL_SECONDS)
+        self.assertTrue(stats.hud)
+
+    def test_no_trail_no_hud_renders_plain_frame(self) -> None:
+        scene = self._scene()
+        on = ov.render_stills(self.video, scene, self.dir / "on", frames=(5,), log=lambda _: None)
+        off = ov.render_stills(
+            self.video, scene, self.dir / "off", frames=(5,), trail=False, hud=False, log=lambda _: None
+        )
+        image_on = cv2.imread(str(on[0]))
+        image_off = cv2.imread(str(off[0]))
+        self.assertFalse(np.array_equal(image_on, image_off))
+        x0, y0, x1, y1 = ov.hud_rect((1080, 810))
+        # фон синтетического видео — серый 40 (после кодека ±5); панель HUD его затемняет,
+        # а текст панели ярче фона — обе проверки возможны только с включённым HUD
+        corner = (slice(y0, y1), slice(x0, x1))
+        self.assertLess(
+            int(image_on[corner].mean()), int(image_off[corner].mean()), "панель HUD не затемнила кадр"
+        )
+        bright_on = int((image_on[corner].min(axis=2) > 150).sum())
+        bright_off = int((image_off[corner].min(axis=2) > 150).sum())
+        self.assertGreater(bright_on, bright_off)
+
+    def test_cli_flags_disable_trail_and_hud(self) -> None:
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = ov.main(
+                [
+                    str(self.video),
+                    "--stills",
+                    str(self.dir / "cli"),
+                    "--frames",
+                    "5",
+                    "--tracking",
+                    str(self.tracking),
+                    "--meta",
+                    str(self.meta_path),
+                    "--no-trail",
+                    "--no-hud",
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.assertTrue((self.dir / "cli" / "frame_00005.png").is_file())
+
     def test_render_stills_saves_left_eye_png(self) -> None:
         out_dir = self.dir / "stills"
         paths = ov.render_stills(
@@ -589,6 +857,59 @@ class RealDataTest(unittest.TestCase):
                         1 for joint in ov.JOINTS if camera_model.in_frame(pixels[side][joint], self.scene.intrinsics)
                     )
                     self.assertEqual(got, want)
+
+    def test_hud_does_not_cover_labeled_hands(self) -> None:
+        x0, y0, x1, y1 = ov.hud_rect(self.scene.eye_size)
+        for item in calib_frames.CALIB_FRAMES:
+            for box in item.hands:
+                bx0, by0, bx1, by1 = box.bbox
+                overlap = x0 < bx1 and bx0 < x1 and y0 < by1 and by0 < y1
+                self.assertFalse(
+                    overlap, f"HUD пересекает рамку руки {box.hand} на кадре {item.index}"
+                )
+
+    def test_no_projected_joint_inside_hud(self) -> None:
+        x0, y0, x1, y1 = ov.hud_rect(self.scene.eye_size)
+        for k in ov.DEBUG_FRAMES:
+            with self.subTest(frame=k):
+                moment = sync.frame_time(
+                    k, self.scene.meta, self.scene.header_ns, self.scene.tracking_end_ns
+                )
+                pose = sync.pose_at_frame(self.scene.track, moment, self.scene.time_offset_ns)
+                pixels = ov.project_hands(pose, self.scene.intrinsics)
+                for side in ("left", "right"):
+                    for joint in ov.JOINTS:
+                        point = pixels[side][joint]
+                        if not point.visible:
+                            continue
+                        self.assertFalse(
+                            x0 <= point.u < x1 and y0 <= point.v < y1,
+                            f"сустав {side} {joint} попал в HUD на кадре {k}",
+                        )
+
+    def test_hud_reports_inactive_right_hand(self) -> None:
+        moment = sync.frame_time(
+            5, self.scene.meta, self.scene.header_ns, self.scene.tracking_end_ns
+        )
+        pose = sync.pose_at_frame(self.scene.track, moment, self.scene.time_offset_ns)
+        rows = ov.hud_items(moment, pose, self.scene.frame_count)
+        self.assertIn(("right: NO DATA", ov.HUD_WARNING_COLOR), rows)
+        self.assertIn(("left: OK", ov.HUD_TEXT_COLOR), rows)
+
+    @unittest.skipIf(cv2 is None, NO_CV2)
+    def test_trail_is_drawn_on_debug_frames(self) -> None:
+        style = ov.style_for(self.scene.eye_size[0])
+        for k in ov.DEBUG_FRAMES:
+            with self.subTest(frame=k):
+                moment = sync.frame_time(
+                    k, self.scene.meta, self.scene.header_ns, self.scene.tracking_end_ns
+                )
+                pose = sync.pose_at_frame(self.scene.track, moment, self.scene.time_offset_ns)
+                image = np.zeros((810, 1080, 3), np.uint8)
+                drawn = ov.draw_trail(
+                    image, pose, self.scene.track, self.scene.intrinsics, style
+                )
+                self.assertGreater(drawn, 0, f"след не нарисован на кадре {k}")
 
     @unittest.skipIf(cv2 is None or VIDEO is None, f"{NO_CV2} или {NO_VIDEO}")
     def test_still_is_drawn_on_real_frame(self) -> None:
