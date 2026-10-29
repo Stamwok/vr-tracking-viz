@@ -80,6 +80,11 @@ class FrozenConfigTest(unittest.TestCase):
         self.assertIs(config.INVERT_QUAT, False)
         self.assertIs(config.Y_DOWN_FLIP, False)
 
+    def test_video_time_offset_is_frozen(self) -> None:
+        # диагностика 29.10 (src/drift_diag.py): минимум ошибки наложения на −140 мс,
+        # визуальная сверка −80…−140; зафиксировано −100 с точностью ±40 мс
+        self.assertEqual(config.VIDEO_TIME_OFFSET_MS, -100.0)
+
     def test_head_cam_matrix_is_winner(self) -> None:
         matrix = head_cam_matrix()
         for i in range(3):
@@ -245,9 +250,11 @@ class CalibratedMetricTest(unittest.TestCase):
         self.assertEqual(self.convention.camera_offset, (0.0, 0.0, 0.0))
 
     def test_metric_reproduces_07b(self) -> None:
+        # с поправкой времени кадра (``config.VIDEO_TIME_OFFSET_MS``, доработка 08a) в кадр
+        # попадает 40 суставов вместо 39 — на k=30 ещё один; все 40 — в рамках своих рук
         metrics = calib_search.evaluate_convention(self.data, self.convention)
-        self.assertEqual(metrics.good, 39)
-        self.assertEqual(metrics.in_frame, 39)
+        self.assertEqual(metrics.good, 40)
+        self.assertEqual(metrics.in_frame, 40)
         self.assertEqual(metrics.wrong, 0)
         self.assertEqual(metrics.miss, 0)
         self.assertEqual(metrics.mean_error_px, 0.0)

@@ -11,7 +11,9 @@ import math
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -19,7 +21,7 @@ if str(ROOT) not in sys.path:
 
 import numpy as np  # noqa: E402
 
-from src import camera_model, overlay_video as ov, sync  # noqa: E402
+from src import camera_model, config, overlay_video as ov, sync  # noqa: E402
 
 try:  # pragma: no cover — проверка окружения, а не логики
     import cv2
@@ -87,15 +89,21 @@ def _hand(points: dict) -> dict:
     return {"isActive": 1, "count": 26, "scale": 1.0, "HandJointLocations": joints}
 
 
-def _write_tracking(path: Path, times_ns, head_pos=(0.0, 0.0, 0.0)) -> None:
-    """Файл формата 03a: header + по одному JSON на сэмпл."""
+def _write_tracking(
+    path: Path, times_ns, head_pos=(0.0, 0.0, 0.0), left_series=None
+) -> None:
+    """Файл формата 03a: header + по одному JSON на сэмпл.
+
+    ``left_series`` — по одному набору точек левой руки на сэмпл (для кадров с движением).
+    """
     lines = [json.dumps(HEADER)]
-    for ts_ns in times_ns:
+    for index, ts_ns in enumerate(times_ns):
+        left = LEFT_POINTS if left_series is None else left_series[index]
         sample = {
             "timeStampNs": int(ts_ns),
             "predictTime": 0.0,
             "Head": {"pose": _pose_string([*head_pos, 0.0, 0.0, 0.0, 1.0]), "status": 3},
-            "Hand": {"leftHand": _hand(LEFT_POINTS), "rightHand": _hand(RIGHT_POINTS)},
+            "Hand": {"leftHand": _hand(left), "rightHand": _hand(RIGHT_POINTS)},
         }
         lines.append(json.dumps(sample))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -330,7 +338,13 @@ class SyntheticRenderTest(unittest.TestCase):
         self.out = self.dir / "overlay.mp4"
         self._write_video(self.FRAMES, self.FRAMES)
 
-    def _write_video(self, frames: int, meta_frames: int, tracking_samples: int | None = None) -> None:
+    def _write_video(
+        self,
+        frames: int,
+        meta_frames: int,
+        tracking_samples: int | None = None,
+        left_series=None,
+    ) -> None:
         writer = cv2.VideoWriter(
             str(self.video), cv2.VideoWriter_fourcc(*"mp4v"), self.FPS, (2160, 810)
         )
@@ -354,11 +368,46 @@ class SyntheticRenderTest(unittest.TestCase):
         step_ns = duration / meta_frames
         samples = frames if tracking_samples is None else tracking_samples
         _write_tracking(
-            self.tracking, [BASE_NS + int(round(k * step_ns * 1e9)) for k in range(samples)]
+            self.tracking,
+            [BASE_NS + int(round(k * step_ns * 1e9)) for k in range(samples)],
+            left_series=left_series,
         )
 
     def _scene(self) -> ov.Scene:
         return ov.load_scene(self.meta_path, self.tracking)
+
+    def test_scene_reads_time_offset_from_config(self) -> None:
+        with mock.patch.object(config, "VIDEO_TIME_OFFSET_MS", -40.0):
+            scene = ov.load_scene(self.meta_path, self.tracking)
+        self.assertEqual(scene.time_offset_ns, -40_000_000)
+
+    def test_time_offset_moves_moving_hand(self) -> None:
+        # левая кисть едет вправо на 0.05 м за сэмпл (сэмплы идут по кадрам, 33.3 мс)
+        left_series = [
+            {joint: (x + 0.05 * index, y, z) for joint, (x, y, z) in LEFT_POINTS.items()}
+            for index in range(self.FRAMES)
+        ]
+        self._write_video(self.FRAMES, self.FRAMES, left_series=left_series)
+        scene = self._scene()
+        columns = {}
+        for label, offset in (("zero", 0), ("shift", -100 * 10**6)):
+            paths = ov.render_stills(
+                self.video,
+                replace(scene, time_offset_ns=offset),
+                self.dir / label,
+                frames=(5,),
+                log=lambda _: None,
+            )
+            image = cv2.imread(str(paths[0]))
+            blue = (
+                (image[..., 0] > 235)
+                & (np.abs(image[..., 1].astype(int) - 140) < 12)
+                & (image[..., 2] < 20)
+            )
+            self.assertGreater(int(blue.sum()), 0)
+            columns[label] = float(np.argwhere(blue)[:, 1].mean())
+        # сдвиг на 100 мс = 3 сэмпла × 0.05 м = 0.15 м; на глубине 1 м это 0.15·fx ≈ 103 px
+        self.assertAlmostEqual(columns["zero"] - columns["shift"], 0.15 * EYE.fy, delta=10)
 
     def test_scene_fps_follows_frame_count_over_duration(self) -> None:
         scene = self._scene()
@@ -510,9 +559,9 @@ class SceneLoadTest(unittest.TestCase):
 class RealDataTest(unittest.TestCase):
     """На реальной записи: синхронизация, метрика 07a через код рендера и PNG."""
 
-    #: Суставы в кадре левого глаза (левая, правая) на 5 кадрах 07a. Ровно 39 из 45 —
-    #: как в метрике 07b/07c; расхождение с 39 только за счёт кадров, где рука вне FOV.
-    IN_FRAME = {30: (5, 3), 1800: (4, 5), 3600: (2, 5), 5400: (3, 5), 7200: (5, 5)}
+    #: Суставы в кадре левого глаза (левая, правая) на 5 кадрах 07a — с поправкой времени
+    #: кадра (``config.VIDEO_TIME_OFFSET_MS``). 43 из 45; в метрике 07c по рамкам 40 из 45.
+    IN_FRAME = {30: (5, 3), 1800: (4, 5), 3600: (3, 5), 5400: (3, 5), 7200: (5, 5)}
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -524,12 +573,14 @@ class RealDataTest(unittest.TestCase):
         self.assertEqual(self.scene.eye_size, (1080, 810))
         self.assertAlmostEqual(self.scene.fps, 29.9966, places=3)
         self.assertAlmostEqual(self.scene.duration_s, 242.661, places=3)
+        self.assertEqual(self.scene.time_offset_ns, sync.video_time_offset_ns())
 
     def test_calibrated_projection_on_debug_frames(self) -> None:
         for k, expected in self.IN_FRAME.items():
             with self.subTest(frame=k):
                 moment = sync.frame_time(k, self.scene.meta, self.scene.header_ns, self.scene.tracking_end_ns)
-                pixels = ov.project_hands(self.scene.track.pose_at(moment.ts_ns), self.scene.intrinsics)
+                pose = sync.pose_at_frame(self.scene.track, moment, self.scene.time_offset_ns)
+                pixels = ov.project_hands(pose, self.scene.intrinsics)
                 for side, want in zip(("left", "right"), expected):
                     self.assertEqual(
                         sum(1 for joint in ov.JOINTS if pixels[side][joint].visible), 5
@@ -551,7 +602,8 @@ class RealDataTest(unittest.TestCase):
             moment = sync.frame_time(
                 1800, self.scene.meta, self.scene.header_ns, self.scene.tracking_end_ns
             )
-            pixels = ov.project_hands(self.scene.track.pose_at(moment.ts_ns), self.scene.intrinsics)
+            pose = sync.pose_at_frame(self.scene.track, moment, self.scene.time_offset_ns)
+            pixels = ov.project_hands(pose, self.scene.intrinsics)
             checked = 0
             for side in ("left", "right"):
                 for joint in ov.JOINTS:

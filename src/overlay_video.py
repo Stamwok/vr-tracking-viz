@@ -18,6 +18,13 @@
 CSV остаётся входом графиков (09), а рендер читает ``data/trackingData_*.txt`` потоково
 (:func:`sync.load_poses`, ≈6 МБ в памяти, ≈3 с на 21 787 сэмплов).
 
+Задержка видеотракта. Поза кадра берётся не в ``frame_time(k)``, а со сдвигом
+``config.VIDEO_TIME_OFFSET_MS`` (:func:`sync.pose_at_frame`): кадр показывает сцену раньше
+своей метки, и без поправки скелет уезжает с кисти на быстрых движениях (диагностика —
+``src/drift_diag.py``, 29.10). Сдвиг применяется и в проверке калибровки (``calib_search``),
+поэтому метрика 07a описывает именно то, что рисует рендер. ``--time-offset-ms`` перекрывает
+константу для сравнений.
+
 Кодеки. Пишем H.264 (``avc1``), при недоступности — MPEG-4 part 2 (``mp4v``): в сборке
 OpenCV без OpenH264 первый вариант просто не откроется. Фактический файл после рендера
 проверяется :func:`probe_output` (открывается заново, число кадров и размер сверяются).
@@ -37,7 +44,7 @@ import json
 import math
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -178,6 +185,9 @@ class Scene:
     tracking_end_ns: int
     track: sync.PoseTrack
     intrinsics: camera_model.Intrinsics
+    #: Поправка времени кадра (нс): поза берётся из ``frame_time(k).ts_ns + time_offset_ns``.
+    #: Значение — :func:`sync.video_time_offset_ns` (``config.VIDEO_TIME_OFFSET_MS``).
+    time_offset_ns: int
 
     @property
     def frame_count(self) -> int:
@@ -244,6 +254,7 @@ def load_scene(
         tracking_end_ns=int(timestamp_range(tracking)[1]),
         track=sync.load_poses(tracking),
         intrinsics=intrinsics,
+        time_offset_ns=sync.video_time_offset_ns(),
     )
 
 
@@ -434,6 +445,7 @@ class RenderStats:
     bytes: int
     joints_drawn: int
     frames_after_tracking: int
+    time_offset_ms: float = 0.0
 
     @property
     def frames(self) -> int:
@@ -525,7 +537,7 @@ def render_video(
                     raise ValueError(f"видео кончилось на кадре {k} (ожидались по {last})")
                 view = _eye_view(image, scene)
                 moment = sync.frame_time(k, scene.meta, scene.header_ns, scene.tracking_end_ns)
-                pose = scene.track.pose_at(moment.ts_ns)
+                pose = sync.pose_at_frame(scene.track, moment, scene.time_offset_ns)
                 joints += _draw_pose(view, pose, scene, style)
                 if not moment.in_tracking:
                     after_tracking += 1
@@ -563,6 +575,7 @@ def render_video(
         bytes=out.stat().st_size,
         joints_drawn=joints,
         frames_after_tracking=after_tracking,
+        time_offset_ms=scene.time_offset_ns / 1e6,
     )
 
 
@@ -604,7 +617,7 @@ def render_stills(
                 raise ValueError(f"не читается кадр {k}")
             view = _eye_view(image, scene)
             moment = sync.frame_time(k, scene.meta, scene.header_ns, scene.tracking_end_ns)
-            pose = scene.track.pose_at(moment.ts_ns)
+            pose = sync.pose_at_frame(scene.track, moment, scene.time_offset_ns)
             drawn = _draw_pose(view, pose, scene, style)
             if not moment.in_tracking:
                 log(f"  кадр {k:5d}: трекинга уже нет — поза заморожена (по 04a)")
@@ -625,7 +638,8 @@ def _format_stats(stats: RenderStats) -> str:
         f"записано: {stats.out}",
         f"  кадры: {stats.first_frame}…{stats.last_frame} ({stats.frames}), "
         f"{stats.size[0]}×{stats.size[1]}, {stats.fps:.4f} fps → {stats.duration_s:.3f} с",
-        f"  кодек: {stats.codec}; файл {megabytes:.1f} МиБ",
+        f"  кодек: {stats.codec}; файл {megabytes:.1f} МиБ; "
+        f"поправка времени {stats.time_offset_ms:+.0f} мс",
         f"  рендер: {stats.elapsed_s:.1f} с, {stats.frames_per_s:.1f} кадр/с "
         f"(видимых суставов {stats.joints_drawn})",
         f"  кадров вне трекинга (поза заморожена): {stats.frames_after_tracking}",
@@ -661,6 +675,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help=f"кодеки через запятую (по умолчанию {','.join(FOURCC_CANDIDATES)})")
     parser.add_argument("--progress-every", type=int, default=300,
                         help="строка прогресса каждые N кадров (0 — не печатать)")
+    parser.add_argument("--time-offset-ms", type=float, default=None,
+                        help="сдвиг времени позы (по умолчанию — config.VIDEO_TIME_OFFSET_MS)")
     parser.add_argument("--stills", type=Path, default=None,
                         help="режим PNG: сохранить кадры --frames в этот каталог и выйти")
     parser.add_argument("--frames", default=",".join(str(k) for k in DEBUG_FRAMES),
@@ -669,6 +685,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         scene = load_scene(args.meta, args.tracking)
+        if args.time_offset_ms is not None:
+            scene = replace(
+                scene,
+                time_offset_ns=int(round(args.time_offset_ms * 1e6)),
+            )
         print(
             f"видео: {scene.frame_count} кадров, {scene.duration_s:.3f} с, "
             f"{scene.fps:.4f} fps; SBS {scene.intrinsics.full_w}×{scene.intrinsics.full_h} "
@@ -676,7 +697,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print(
             f"трекинг: {len(scene.track)} сэмплов; конец трекинга "
-            f"+{(scene.tracking_end_ns - scene.header_ns) / 1e9:.3f} с от header"
+            f"+{(scene.tracking_end_ns - scene.header_ns) / 1e9:.3f} с от header; "
+            f"поправка времени {scene.time_offset_ns / 1e6:+.0f} мс"
         )
         if args.stills is not None:
             paths = render_stills(

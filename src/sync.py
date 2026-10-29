@@ -26,6 +26,11 @@
 кратчайшая дуга, при малом угле — нормализованный lerp). За пределами диапазона сэмплов
 поза замораживается, NaN (нет данных) через дырку не интерполируется.
 
+Задержка видеотракта (доработка 08a): кадр показывает сцену раньше своей метки, поэтому поза
+берётся не в ``frame.ts_ns``, а в ``frame.ts_ns + VIDEO_TIME_OFFSET_MS`` — см.
+:func:`video_time_offset_ns` и :func:`pose_at_frame`. Рендер и проверка калибровки зовут именно
+``pose_at_frame``, чтобы жить в одной шкале времени.
+
 Запуск:
     python src/sync.py output/video_meta.json data/trackingData_20260505_165740.txt
     python src/sync.py output/video_meta.json data/trackingData_20260505_165740.txt --poses
@@ -152,6 +157,46 @@ def iter_frames(meta: dict, header_ns: int, tracking_end_ns: int) -> Iterator[Fr
     frame_count = _positive_int(meta.get("frame_count"), "video_meta.frame_count")
     for k in range(frame_count):
         yield frame_time(k, meta, header_ns, tracking_end_ns)
+
+
+#: Допустимый модуль поправки времени кадра, мс. Больше — почти наверняка опечатка в конфиге,
+#: а не измеренная задержка: 1 с сдвигал бы позу на 30 кадров.
+MAX_VIDEO_TIME_OFFSET_MS = 1000.0
+
+
+def video_time_offset_ns() -> int:
+    """Поправка времени кадра из ``src/config.py``, наносекунды (может быть отрицательной).
+
+    Отрицательная поправка значит «поза из прошлого»: кадр снят раньше своей метки. Значение
+    проверяется: конечное число, ``|value| ≤ MAX_VIDEO_TIME_OFFSET_MS``, не ``bool``. Модуль
+    ``config`` импортируется внутри функции, чтобы ``sync`` оставался импортируемым без конфига
+    (так же поступает ``camera_model``: числа читаются на каждом вызове, подмена в тестах работает).
+    """
+    from src import config  # noqa: PLC0415 — локальный импорт, чтобы не тянуть конфиг при импорте
+
+    value = getattr(config, "VIDEO_TIME_OFFSET_MS", 0.0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"config.VIDEO_TIME_OFFSET_MS: ожидалось число мс, получено {value!r}")
+    if not math.isfinite(value) or abs(value) > MAX_VIDEO_TIME_OFFSET_MS:
+        raise ValueError(
+            f"config.VIDEO_TIME_OFFSET_MS: ожидалось |value| ≤ {MAX_VIDEO_TIME_OFFSET_MS:g} мс, "
+            f"получено {value!r}"
+        )
+    return int(round(float(value) * 1e6))
+
+
+def pose_at_frame(track: PoseTrack, frame: FrameTime, offset_ns: int | None = None) -> Pose:
+    """Поза на кадр с поправкой на задержку видеотракта: ``t = frame.ts_ns + offset_ns``.
+
+    ``offset_ns=None`` — :func:`video_time_offset_ns` (константа ``src/config.py``); явное
+    значение нужно диагностике (скан сдвига) и тестам. Сама ``frame_time`` остаётся «чистой»
+    шкалой видео: поправка — отдельное решение, которое видно в одном месте.
+    """
+    if offset_ns is None:
+        offset_ns = video_time_offset_ns()
+    if isinstance(offset_ns, bool) or not isinstance(offset_ns, int):
+        raise ValueError(f"offset_ns: ожидалось целое число, получено {offset_ns!r}")
+    return track.pose_at(int(frame.ts_ns) + offset_ns)
 
 
 def _normalized(q: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
