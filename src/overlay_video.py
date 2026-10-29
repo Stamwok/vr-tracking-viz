@@ -1,4 +1,4 @@
-"""overlay_video.py — покадровый рендер скелета кистей поверх видео камеры шлема (задача 08a).
+"""overlay_video.py — покадровый рендер скелета кистей поверх видео камеры шлема (08a, 08b).
 
 Что делает кадр: берёт левую половину SBS-кадра (левый глаз, 1080×810), для номера кадра
 ``k`` считает время (:func:`sync.frame_time`, 04a) и позу на этот момент
@@ -8,9 +8,22 @@
 интринсикам, 05a–05c), затем рисует по 5 точек на руку и линии «ладонь → запястье /
 большой / указательный / средний». Левая и правая руки — разные цвета.
 
-Границы задачи: след (trail), HUD и маркер головы — задача 08b. Поза головы = поза камеры
-(камера в голове, ``T_head_cam`` из ``config.py``), поэтому «маркер головы» имеет смысл
-только как элемент HUD, а не как точка сцены.
+Задача 08b добавляет след кистей и HUD (оба включаются флагами ``--no-trail``/``--no-hud``):
+
+* **След** — мировой путь ладони за последние :data:`TRAIL_SECONDS` секунд, спроецированный
+  матрицей **текущего** кадра: шлейф показывает, где кисть была, с точки зрения нынешней
+  камеры. Выборка идёт **по времени** (шаг :data:`TRAIL_STEP_S`), а не по номерам кадров,
+  поэтому окно следа не зависит от fps рендера. Прозрачность растёт к текущему моменту;
+  если данных нет (``isActive = 0``, NaN сустава, точка за камерой), линия **рвётся**, а не
+  соединяет «до» и «после» — иначе след залипал бы на переходах и на старте записи.
+* **HUD** — неподвижная полупрозрачная панель в левом верхнем углу: время, номер кадра,
+  состояние каждой руки («нет данных» при ``isActive = 0``) и окно следа. Панель не
+  сдвигается от кадра к кадру, поэтому её положение проверяемо: на 5 кадрах эталона 07a она
+  не перекрывает ни одной размеченной кисти (:func:`hud_rect`). Подписи латиницей, потому
+  что ``cv2.putText`` с Hershey-шрифтами кириллицу не рисует.
+
+Поза головы = поза камеры (камера в голове, ``T_head_cam`` из ``config.py``), поэтому
+отдельного маркера головы в кадре нет — о ней говорит HUD (время и номер кадра).
 
 Почему на входе сырой файл трекинга (JSON Lines), а не ``tracking.csv``: для синхронизации
 нужен ``header.timeStampNs`` — метка первого кадра видео (04a). В ``tracking.csv`` её нет
@@ -31,11 +44,14 @@ OpenCV без OpenH264 первый вариант просто не откро�
 
 Запуск (весь клип, 7279 кадров, ≈242.66 с):
     python src/overlay_video.py data/CameraRecord_20260505_165740.mp4 \\
-        --tracking data/trackingData_20260505_165740.txt --out output/overlay_skeleton.mp4
+        --tracking data/trackingData_20260505_165740.txt --out output/overlay.mp4
 
-Короткий фрагмент и PNG-проверка на 5 отладочных кадрах 07a:
+Короткий фрагмент, PNG-проверка на 5 отладочных кадрах 07a и рендер «как было в 08a»
+(без следа и HUD — этот кадр идёт в сравнение «до/после»):
     python src/overlay_video.py data/CameraRecord_*.mp4 --start 1790 --end 1810 --scale 1.5
     python src/overlay_video.py data/CameraRecord_*.mp4 --stills output/debug/overlay
+    python src/overlay_video.py data/CameraRecord_*.mp4 --stills output/debug/overlay_before \\
+        --frames 1800 --no-trail --no-hud
 """
 from __future__ import annotations
 
@@ -91,6 +107,38 @@ COORD_LIMIT = 1_000_000
 
 #: Кадры 07a по умолчанию для режима ``--stills`` (совпадают с ``camera_model.DEBUG_FRAMES``).
 DEBUG_FRAMES = (30, 1800, 3600, 5400, 7200)
+
+# --- 08b: след (trail) и HUD -------------------------------------------------------------
+
+#: Окно следа в секундах: видно движение кисти за последние столько секунд до кадра.
+#: Именно время, а не число кадров: окно одинаково при любом fps и не «плывёт» на паузах.
+TRAIL_SECONDS = 0.6
+
+#: Шаг выборки следа, секунды (1/30 — плотность кадров записи: шлейф гладкий, но не гуще,
+#: 19 выборок на окно 0.6 с). Шаг по времени, поэтому след не зависит от ``--start/--end``.
+TRAIL_STEP_S = 1.0 / 30.0
+
+#: Прозрачность следа: у текущего момента и у самого старого конца окна.
+TRAIL_ALPHA_NEW = 0.80
+TRAIL_ALPHA_OLD = 0.12
+
+#: HUD — фиксированная панель в левом верхнем углу (размеры для кадра 1080×810, дальше
+#: масштабируются шириной кадра). Постоянный размер — чтобы положение панели можно было
+#: проверить на эталоне 07a: ``(12, 12, 12+330, 12+136)`` не пересекает размеченных кистей.
+HUD_MARGIN_PX = 12
+HUD_WIDTH_PX = 330
+HUD_HEIGHT_PX = 136
+HUD_PADDING_PX = 10
+HUD_LINE_STEP_PX = 22
+HUD_BASELINE_OFFSET_PX = 5
+HUD_FONT_SCALE = 0.5
+#: ``cv2.FONT_HERSHEY_SIMPLEX`` = 0: константа без импорта OpenCV (модуль импортируем без него).
+HUD_FONT_FACE = 0
+HUD_PANEL_COLOR = (28, 28, 28)
+HUD_ALPHA = 0.6
+HUD_TEXT_COLOR = (238, 238, 238)
+#: Цвет предупреждения «нет данных» (BGR: оранжево-жёлтый, заметен на панели и на видео).
+HUD_WARNING_COLOR = (0, 200, 255)
 
 
 @dataclass(frozen=True)
@@ -356,6 +404,309 @@ def draw_skeleton(
     return drawn
 
 
+def _trail_window(seconds: float, step_s: float) -> int:
+    """Число выборок следа: ``round(seconds/step_s) + 1`` (старейшая … текущий момент).
+
+    Проверки здесь, а не у вызывающих: одно место для ``seconds``/``step_s`` — иначе при
+    неположительном шаге след молча рисовал бы одну точку.
+    """
+    for name, value in (("seconds", seconds), ("step_s", step_s)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"trail {name}: ожидалось число, получено {value!r}")
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"trail {name}: должно быть конечным и > 0, получено {value!r}")
+    if step_s > seconds:
+        raise ValueError(
+            f"trail: шаг {step_s:g} с больше окна {seconds:g} с — линию не построить"
+        )
+    return int(round(seconds / step_s)) + 1
+
+
+def trail_times(
+    ts_ns: int, *, seconds: float = TRAIL_SECONDS, step_s: float = TRAIL_STEP_S
+) -> tuple[int, ...]:
+    """Моменты выборки следа: по возрастанию, от ``ts_ns − окно`` до ``ts_ns``.
+
+    Шаг и окно — в секундах и переводятся в наносекунды здесь, поэтому след не зависит от
+    того, с какой частотой рендерятся кадры (в отличие от «следа по номеру кадра»).
+    """
+    if isinstance(ts_ns, bool) or not isinstance(ts_ns, int):
+        raise ValueError(f"ts_ns: ожидалось целое число, получено {ts_ns!r}")
+    count = _trail_window(seconds, step_s)
+    step_ns = int(round(step_s * 1e9))
+    return tuple(ts_ns - index * step_ns for index in range(count - 1, -1, -1))
+
+
+def trail_points(
+    track: sync.PoseTrack,
+    ts_ns: int,
+    *,
+    seconds: float = TRAIL_SECONDS,
+    step_s: float = TRAIL_STEP_S,
+    joint: str = "palm",
+) -> dict[str, list[tuple[float, float, float]]]:
+    """Мировые позиции сустава каждой руки на моментах следа (старые → новые).
+
+    Выборки вне диапазона трекинга **не добавляются**: до первого сэмпла следа ещё нет
+    (иначе «замороженная» поза растянула бы точку в линию), а после последнего добавить
+    нечего. ``NaN`` («нет данных» руки) остаётся в списке как есть — рвать линию на нём
+    должен рендер (:func:`draw_trail`), а не источник данных.
+    """
+    if not hasattr(track, "pose_at") or not hasattr(track, "ts"):
+        raise ValueError(f"track: ожидался sync.PoseTrack, получено {type(track).__name__}")
+    if joint not in JOINTS:
+        raise ValueError(f"joint: ожидался один из {JOINTS}, получено {joint!r}")
+    times = trail_times(ts_ns, seconds=seconds, step_s=step_s)
+    if len(track.ts) == 0:
+        raise ValueError("track: пустой трек — след не построить")
+    first, last = int(track.ts[0]), int(track.ts[-1])
+    points: dict[str, list[tuple[float, float, float]]] = {"left": [], "right": []}
+    for moment_ns in times:
+        if not first <= moment_ns <= last:
+            continue
+        pose = track.pose_at(moment_ns)
+        for side in points:
+            points[side].append(pose.hands[f"{side}_{joint}"])
+    return points
+
+
+def _blend_line(
+    image: Any,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    color: tuple[int, int, int],
+    thickness: int,
+    alpha: float,
+) -> bool:
+    """Отрезок с прозрачностью ``alpha``, только по своей маске (возврат — нарисован ли).
+
+    OpenCV не рисует с alpha, поэтому отрезок кладётся в маску размером с его ограничивающий
+    прямоугольник, а пиксели кадра смешиваются с цветом лишь там, где маска ненулевая:
+    иначе на кадр лёг бы полупрозрачный **тёмный прямоугольник** вокруг линии.
+    """
+    import cv2  # noqa: PLC0415
+    import numpy as np  # noqa: PLC0415
+
+    if isinstance(start, bool) or not isinstance(start, tuple) or len(start) != 2:
+        raise ValueError(f"start: ожидалась пара (x, y), получено {start!r}")
+    if isinstance(end, bool) or not isinstance(end, tuple) or len(end) != 2:
+        raise ValueError(f"end: ожидалась пара (x, y), получено {end!r}")
+    if isinstance(thickness, bool) or not isinstance(thickness, int) or thickness < 1:
+        raise ValueError(f"thickness: ожидалось целое ≥ 1, получено {thickness!r}")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise ValueError(f"alpha: ожидалось число, получено {alpha!r}")
+    if not 0.0 < alpha <= 1.0:
+        raise ValueError(f"alpha: должно быть в (0, 1], получено {alpha!r}")
+
+    height, width = image.shape[:2]
+    pad = thickness + 2
+    left = max(0, min(start[0], end[0]) - pad)
+    top = max(0, min(start[1], end[1]) - pad)
+    right = min(width, max(start[0], end[0]) + pad)
+    bottom = min(height, max(start[1], end[1]) + pad)
+    if right <= left or bottom <= top:
+        return False  # отрезок целиком вне кадра (cv2 обрезал бы его в пустоту)
+
+    mask = np.zeros((bottom - top, right - left), np.uint8)
+    cv2.line(
+        mask,
+        (start[0] - left, start[1] - top),
+        (end[0] - left, end[1] - top),
+        255,
+        thickness,
+        cv2.LINE_AA,
+    )
+    if not mask.any():
+        return False
+    weight = (mask.astype(np.float32) * (alpha / 255.0))[..., None]
+    roi = image[top:bottom, left:right]
+    blended = roi.astype(np.float32) * (1.0 - weight) + np.asarray(color, np.float32) * weight
+    roi[:] = np.rint(blended).astype(np.uint8)
+    return True
+
+
+def draw_trail(
+    image: Any,
+    pose: sync.Pose,
+    track: sync.PoseTrack,
+    intrinsics: camera_model.Intrinsics,
+    style: Style,
+    *,
+    seconds: float = TRAIL_SECONDS,
+    step_s: float = TRAIL_STEP_S,
+    joint: str = "palm",
+    colors: Mapping[str, tuple[int, int, int]] = COLORS,
+    alpha_new: float = TRAIL_ALPHA_NEW,
+    alpha_old: float = TRAIL_ALPHA_OLD,
+) -> int:
+    """Нарисовать след обеих кистей (in place) и вернуть число нарисованных отрезков.
+
+    Мировые точки прошлых моментов проецируются матрицей **текущего** кадра, иначе след
+    «отставал» бы от собственной камеры. Сегмент рисуется, только если оба его конца видимы:
+    разрыв на ``NaN``/невидимой точке — это и есть обрыв следа на невалидных данных и на
+    старте записи, где правая рука ещё не трекается.
+    """
+    if not isinstance(style, Style):
+        raise ValueError(f"style: ожидался Style, получено {style!r}")
+    if image is None or getattr(image, "ndim", 0) != 3:
+        raise ValueError("image: ожидался BGR-кадр (H×W×3)")
+    if not 0.0 < alpha_old <= alpha_new <= 1.0:
+        raise ValueError(
+            f"alpha: ожидалось 0 < alpha_old ≤ alpha_new ≤ 1, "
+            f"получено alpha_old={alpha_old!r}, alpha_new={alpha_new!r}"
+        )
+    matrix = camera_model.world_to_camera_matrix(pose)
+    eye = camera_model.eye_intrinsics(intrinsics, "left")
+    by_side = trail_points(track, pose.ts_ns, seconds=seconds, step_s=step_s, joint=joint)
+    thickness = max(1, style.line_thickness)
+    drawn = 0
+    for side in ("left", "right"):
+        pixels: list[camera_model.ProjectedPoint | None] = []
+        for world in by_side[side]:
+            if not all(math.isfinite(value) for value in world):
+                pixels.append(None)  # нет данных: линия здесь рвётся
+                continue
+            point = camera_model.project(camera_model.transform_point(matrix, world), eye)
+            pixels.append(point if point.visible else None)
+        last = len(pixels) - 1
+        for index in range(1, len(pixels)):
+            first, second = pixels[index - 1], pixels[index]
+            if first is None or second is None:
+                continue
+            age = (last - index) / last if last else 0.0  # 0 — текущий момент, 1 — старый конец
+            alpha = alpha_new + (alpha_old - alpha_new) * age
+            if _blend_line(
+                image,
+                (_coord(first.u), _coord(first.v)),
+                (_coord(second.u), _coord(second.v)),
+                colors[side],
+                thickness,
+                alpha,
+            ):
+                drawn += 1
+    return drawn
+
+
+def hud_rect(size: tuple[int, int]) -> tuple[int, int, int, int]:
+    """Прямоугольник HUD-панели ``(x0, y0, x1, y1)`` для кадра ``size`` (левый глаз).
+
+    Размер фиксирован (``HUD_*`` для 1080×810, масштабируется шириной), поэтому панель
+    занимает одно и то же место на всех кадрах — это позволяет проверить, что она не лежит
+    на кистях (``tests/test_overlay_video.py`` сверяет с рамками эталона 07a).
+    """
+    if (
+        not isinstance(size, tuple)
+        or len(size) != 2
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in size)
+    ):
+        raise ValueError(f"size: ожидалась пара целых (width, height), получено {size!r}")
+    width, height = size
+    if width <= 0 or height <= 0:
+        raise ValueError(f"size: должно быть > 0, получено {size!r}")
+    factor = width / REFERENCE_WIDTH
+    margin = int(round(HUD_MARGIN_PX * factor))
+    panel_w = int(round(HUD_WIDTH_PX * factor))
+    panel_h = int(round(HUD_HEIGHT_PX * factor))
+    if panel_w < 1 or panel_h < 1 or margin + panel_w > width or margin + panel_h > height:
+        raise ValueError(f"HUD не помещается в кадр {width}×{height}")
+    return margin, margin, margin + panel_w, margin + panel_h
+
+
+def hud_items(
+    moment: sync.FrameTime,
+    pose: sync.Pose,
+    frame_count: int,
+    *,
+    trail_seconds: float | None = TRAIL_SECONDS,
+) -> list[tuple[str, tuple[int, int, int]]]:
+    """Строки HUD: время, кадр, состояние рук, след. Подписи латиницей (см. модуль)."""
+    if not isinstance(moment, sync.FrameTime):
+        raise ValueError(f"moment: ожидался sync.FrameTime, получено {type(moment).__name__}")
+    if not isinstance(pose, sync.Pose):
+        raise ValueError(f"pose: ожидался sync.Pose, получено {type(pose).__name__}")
+    if isinstance(frame_count, bool) or not isinstance(frame_count, int) or frame_count <= 0:
+        raise ValueError(f"frame_count: ожидалось целое > 0, получено {frame_count!r}")
+    if not 0 <= moment.index < frame_count:
+        raise ValueError(f"кадр {moment.index} вне 0…{frame_count - 1}")
+
+    def hand_row(side: str) -> tuple[str, tuple[int, int, int]]:
+        active = pose.active.get(side)
+        text = f"{side}: {'OK' if active else 'NO DATA'}"
+        return text, HUD_TEXT_COLOR if active else HUD_WARNING_COLOR
+
+    rows = [
+        (f"t = {moment.t_rel_s:8.3f} s", HUD_TEXT_COLOR),
+        (f"frame {moment.index} / {frame_count - 1}", HUD_TEXT_COLOR),
+        hand_row("left"),
+        hand_row("right"),
+    ]
+    if trail_seconds is None:
+        trail_text = "trail off"
+    else:
+        _trail_window(trail_seconds, TRAIL_STEP_S)  # валидация окна — здесь же, что и у рендера
+        trail_text = f"trail {trail_seconds:.1f} s"
+    if not moment.in_tracking:
+        trail_text += " | pose frozen"
+    rows.append((trail_text, HUD_TEXT_COLOR))
+    return rows
+
+
+def draw_hud(
+    image: Any,
+    moment: sync.FrameTime,
+    pose: sync.Pose,
+    frame_count: int,
+    *,
+    trail_seconds: float | None = TRAIL_SECONDS,
+) -> tuple[int, int, int, int]:
+    """Нарисовать HUD (in place) и вернуть его прямоугольник.
+
+    Панель полупрозрачная и стоит в левом верхнем углу; текст проверяется на вписывание в
+    панель до отрисовки, чтобы длинная строка не вылезала за её край.
+    """
+    import cv2  # noqa: PLC0415
+    import numpy as np  # noqa: PLC0415
+
+    if image is None or getattr(image, "ndim", 0) != 3:
+        raise ValueError("image: ожидался BGR-кадр (H×W×3)")
+    height, width = image.shape[:2]
+    x0, y0, x1, y1 = hud_rect((width, height))
+    factor = width / REFERENCE_WIDTH
+    scale = HUD_FONT_SCALE * factor
+    thickness = max(1, int(round(factor)))
+    step = int(round(HUD_LINE_STEP_PX * factor))
+    pad = int(round(HUD_PADDING_PX * factor))
+    rows = hud_items(moment, pose, frame_count, trail_seconds=trail_seconds)
+
+    if pad * 2 + len(rows) * step > y1 - y0:
+        raise ValueError(f"HUD: {len(rows)} строк не влезают в панель {x1 - x0}×{y1 - y0}")
+    for text, _color in rows:
+        (text_w, _text_h), _baseline = cv2.getTextSize(text, HUD_FONT_FACE, scale, thickness)
+        if pad + text_w > x1 - x0 - pad:
+            raise ValueError(f"HUD: строка {text!r} шире панели {x1 - x0} px")
+
+    roi = image[y0:y1, x0:x1]
+    blended = roi.astype(np.float32) * (1.0 - HUD_ALPHA) + np.asarray(
+        HUD_PANEL_COLOR, np.float32
+    ) * HUD_ALPHA
+    roi[:] = np.rint(blended).astype(np.uint8)
+
+    offset = int(round(HUD_BASELINE_OFFSET_PX * factor))
+    for row, (text, color) in enumerate(rows):
+        baseline = y0 + pad + (row + 1) * step - offset
+        cv2.putText(
+            image,
+            text,
+            (x0 + pad, baseline),
+            HUD_FONT_FACE,
+            scale,
+            color,
+            thickness,
+            cv2.LINE_AA,
+        )
+    return x0, y0, x1, y1
+
+
 def _eye_view(image: Any, scene: Scene) -> Any:
     """Левая половина SBS-кадра (левый глаз) — копия под рисование.
 
@@ -446,6 +797,11 @@ class RenderStats:
     joints_drawn: int
     frames_after_tracking: int
     time_offset_ms: float = 0.0
+    #: 08b: окно следа (0 — след выключен), сколько отрезков следа нарисовано за прогон.
+    trail_seconds: float = 0.0
+    trail_segments: int = 0
+    #: 08b: рисовался ли HUD.
+    hud: bool = True
 
     @property
     def frames(self) -> int:
@@ -493,6 +849,9 @@ def render_video(
     scale: float = 1.0,
     fourcc_candidates: Sequence[str] = FOURCC_CANDIDATES,
     progress_every: int = 300,
+    trail: bool = True,
+    hud: bool = True,
+    trail_seconds: float = TRAIL_SECONDS,
     log: Callable[[str], None] = print,
 ) -> RenderStats:
     """Отрендерить диапазон кадров ``start…end`` в ``out`` и вернуть :class:`RenderStats`.
@@ -500,6 +859,10 @@ def render_video(
     Пишется только левый глаз (1080×810). ``progress_every`` — как часто печатать строку
     прогресса (0 — молча); итоговая строка печатается всегда. Скорость рендера в статистике
     — фактическое время (от открытия видео до закрытия файла), а не оценка.
+
+    ``trail``/``hud`` — элементы 08b (след и панель состояния); ``trail_seconds`` — окно
+    следа в секундах (выборка по времени, не по кадрам). Порядок отрисовки: след под
+    скелетом, HUD поверх всего — так подписи остаются читаемыми.
     """
     import cv2  # noqa: PLC0415
 
@@ -507,6 +870,11 @@ def render_video(
         raise ValueError(f"progress_every: ожидалось целое число, получено {progress_every!r}")
     if progress_every < 0:
         raise ValueError(f"progress_every: должно быть ≥ 0, получено {progress_every!r}")
+    for name, value in (("trail", trail), ("hud", hud)):
+        if not isinstance(value, bool):
+            raise ValueError(f"{name}: ожидалось bool, получено {value!r}")
+    if trail:
+        _trail_window(trail_seconds, TRAIL_STEP_S)  # проверка окна до открытия файлов
     video = Path(video)
     if not video.is_file():
         raise FileNotFoundError(f"нет видео: {video}")
@@ -528,6 +896,7 @@ def render_video(
         total = last - first + 1
         started = time.perf_counter()
         joints = 0
+        trail_segments = 0
         after_tracking = 0
         completed = False
         try:
@@ -538,7 +907,19 @@ def render_video(
                 view = _eye_view(image, scene)
                 moment = sync.frame_time(k, scene.meta, scene.header_ns, scene.tracking_end_ns)
                 pose = sync.pose_at_frame(scene.track, moment, scene.time_offset_ns)
+                if trail:
+                    trail_segments += draw_trail(
+                        view, pose, scene.track, scene.intrinsics, style, seconds=trail_seconds
+                    )
                 joints += _draw_pose(view, pose, scene, style)
+                if hud:
+                    draw_hud(
+                        view,
+                        moment,
+                        pose,
+                        scene.frame_count,
+                        trail_seconds=trail_seconds if trail else None,
+                    )
                 if not moment.in_tracking:
                     after_tracking += 1
                 writer.write(view)
@@ -576,6 +957,9 @@ def render_video(
         joints_drawn=joints,
         frames_after_tracking=after_tracking,
         time_offset_ms=scene.time_offset_ns / 1e6,
+        trail_seconds=float(trail_seconds) if trail else 0.0,
+        trail_segments=trail_segments,
+        hud=hud,
     )
 
 
@@ -586,6 +970,9 @@ def render_stills(
     *,
     frames: Iterable[int] = DEBUG_FRAMES,
     scale: float = 1.0,
+    trail: bool = True,
+    hud: bool = True,
+    trail_seconds: float = TRAIL_SECONDS,
     log: Callable[[str], None] = print,
 ) -> list[Path]:
     """Сохранить PNG-кадры с наложением (по умолчанию 5 отладочных кадров 07a).
@@ -593,6 +980,9 @@ def render_stills(
     Это визуальная проверка наложения перед полным рендером: PNG 1080×810, по одному на
     кадр, ``frame_{k:05d}.png`` в ``out_dir``. Артефакт регенерируемый (``output/`` в
     ``.gitignore``), поэтому коммитится не он, а выводы о проверке.
+
+    ``trail``/``hud`` — как у :func:`render_video`: ``--no-trail --no-hud`` даёт кадр «как в
+    08a», он идёт в сравнение «до/после» (``docs/overlay.md``).
     """
     import cv2  # noqa: PLC0415
 
@@ -601,6 +991,8 @@ def render_stills(
         raise FileNotFoundError(f"нет видео: {video}")
     indices = sorted(set(frames))
     style = style_for(scene.eye_size[0], scale)
+    if trail:
+        _trail_window(trail_seconds, TRAIL_STEP_S)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     capture = cv2.VideoCapture(str(video))
@@ -618,14 +1010,30 @@ def render_stills(
             view = _eye_view(image, scene)
             moment = sync.frame_time(k, scene.meta, scene.header_ns, scene.tracking_end_ns)
             pose = sync.pose_at_frame(scene.track, moment, scene.time_offset_ns)
+            segments = 0
+            if trail:
+                segments = draw_trail(
+                    view, pose, scene.track, scene.intrinsics, style, seconds=trail_seconds
+                )
             drawn = _draw_pose(view, pose, scene, style)
+            if hud:
+                draw_hud(
+                    view,
+                    moment,
+                    pose,
+                    scene.frame_count,
+                    trail_seconds=trail_seconds if trail else None,
+                )
             if not moment.in_tracking:
                 log(f"  кадр {k:5d}: трекинга уже нет — поза заморожена (по 04a)")
             path = out / f"frame_{k:05d}.png"
             if not cv2.imwrite(str(path), view):
                 raise ValueError(f"не удалось записать {path}")
             written.append(path)
-            log(f"  кадр {k:5d} (t = {moment.t_rel_s:9.3f} с): точек {drawn}/10 → {path}")
+            trail_note = f", сегментов следа {segments}" if trail else ""
+            log(
+                f"  кадр {k:5d} (t = {moment.t_rel_s:9.3f} с): точек {drawn}/10{trail_note} → {path}"
+            )
     finally:
         capture.release()
     return written
@@ -634,6 +1042,12 @@ def render_stills(
 def _format_stats(stats: RenderStats) -> str:
     """Итог рендера одной таблицей — эти числа идут в README/заметки."""
     megabytes = stats.bytes / (1024 * 1024)
+    trail = (
+        f"след {stats.trail_seconds:g} с, сегментов {stats.trail_segments}; "
+        f"HUD: {'да' if stats.hud else 'нет'}"
+        if stats.trail_seconds > 0
+        else f"след выключен; HUD: {'да' if stats.hud else 'нет'}"
+    )
     lines = [
         f"записано: {stats.out}",
         f"  кадры: {stats.first_frame}…{stats.last_frame} ({stats.frames}), "
@@ -642,6 +1056,7 @@ def _format_stats(stats: RenderStats) -> str:
         f"поправка времени {stats.time_offset_ms:+.0f} мс",
         f"  рендер: {stats.elapsed_s:.1f} с, {stats.frames_per_s:.1f} кадр/с "
         f"(видимых суставов {stats.joints_drawn})",
+        f"  {trail}",
         f"  кадров вне трекинга (поза заморожена): {stats.frames_after_tracking}",
     ]
     return "\n".join(lines)
@@ -650,7 +1065,7 @@ def _format_stats(stats: RenderStats) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI: полный рендер, фрагмент (``--start/--end``) или PNG-проверка (``--stills``)."""
     parser = argparse.ArgumentParser(
-        description="Рендер видео с наложением скелета кистей (задача 08a)."
+        description="Рендер видео с наложением скелета кистей, следа и HUD (задачи 08a/08b)."
     )
     parser.add_argument("video", type=Path, help="data/CameraRecord_*.mp4 (полный SBS-кадр)")
     parser.add_argument(
@@ -665,8 +1080,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=Path("output/video_meta.json"),
         help="video_meta.json (по умолчанию output/video_meta.json)",
     )
-    parser.add_argument("--out", type=Path, default=Path("output/overlay_skeleton.mp4"),
-                        help="куда писать видео (по умолчанию output/overlay_skeleton.mp4)")
+    parser.add_argument("--out", type=Path, default=Path("output/overlay.mp4"),
+                        help="куда писать видео (по умолчанию output/overlay.mp4)")
     parser.add_argument("--start", type=int, default=0, help="первый кадр (0-based, по умолчанию 0)")
     parser.add_argument("--end", type=int, default=None, help="последний кадр включительно")
     parser.add_argument("--scale", type=float, default=1.0,
@@ -681,6 +1096,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="режим PNG: сохранить кадры --frames в этот каталог и выйти")
     parser.add_argument("--frames", default=",".join(str(k) for k in DEBUG_FRAMES),
                         help="кадры для --stills (по умолчанию 5 кадров 07a)")
+    parser.add_argument("--no-trail", action="store_true",
+                        help="не рисовать след кистей (кадр «как в 08a»)")
+    parser.add_argument("--no-hud", action="store_true",
+                        help="не рисовать HUD (панель времени/кадра/состояния рук)")
+    parser.add_argument("--trail-seconds", type=float, default=TRAIL_SECONDS,
+                        help=f"окно следа в секундах (по умолчанию {TRAIL_SECONDS:g})")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     try:
@@ -700,9 +1121,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"+{(scene.tracking_end_ns - scene.header_ns) / 1e9:.3f} с от header; "
             f"поправка времени {scene.time_offset_ns / 1e6:+.0f} мс"
         )
+        trail = not args.no_trail
+        hud = not args.no_hud
         if args.stills is not None:
             paths = render_stills(
-                args.video, scene, args.stills, frames=parse_frames(args.frames), scale=args.scale
+                args.video,
+                scene,
+                args.stills,
+                frames=parse_frames(args.frames),
+                scale=args.scale,
+                trail=trail,
+                hud=hud,
+                trail_seconds=args.trail_seconds,
             )
             print(f"PNG с наложением: {len(paths)} файлов в {args.stills}")
             return 0
@@ -716,6 +1146,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             scale=args.scale,
             fourcc_candidates=fourcc,
             progress_every=args.progress_every,
+            trail=trail,
+            hud=hud,
+            trail_seconds=args.trail_seconds,
         )
     except (OSError, ValueError) as exc:
         print(f"ошибка: {exc}", file=sys.stderr)
