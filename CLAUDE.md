@@ -15,9 +15,12 @@
 **Текущий статус (на 29.10, сверять с доской):** данные изучены полностью (разделы 3–6), план — 24
 атомарные задачи (раздел 8). Сделаны 01, 02, 02a–05c, 07a–07c (в `main`, 07c смержена); 08a —
 `in_review` (ветка `VTR-08a`: `src/overlay_video.py`, рендер 7279 кадров 1080×810 за 61.6 с,
-`output/overlay_skeleton.mp4` 94.6 МиБ H.264, 43 новых теста, запись — `docs/NOTES.md`, 29.10);
+`output/overlay_skeleton.mp4` 93.3 МиБ H.264) + доработка по ревью «скелет слетает на быстрых
+кадрах»: диагностика `src/drift_diag.py`, поправка `config.VIDEO_TIME_OFFSET_MS = −100 мс`, ошибка
+наложения на 50 быстрых кадрах 73 → 35 px; тесты 350/350; записи — `docs/NOTES.md`, 29.10;
 08b, 09, 10a–10c, 11, 12 — `todo`. В репозитории есть
-`src/{parse_tracking,sync,camera_model,calib_frames,calib_search,config,overlay_video}.py`, `tests/` и
+`src/{parse_tracking,sync,camera_model,calib_frames,calib_search,config,overlay_video,drift_diag}.py`,
+`tests/` и
 `docs/{intrinsics,projection_notes}.md`. Каждая выполненная задача сопровождается записью в
 `docs/NOTES.md` — см. **раздел 13**.
 
@@ -226,6 +229,14 @@ pose = pose_at(t_frame_k)   # позиция — линейно, кватерн�
   Конец трекинга — `parse_tracking.timestamp_range()` (последний сэмпл, +242.5607 с от header),
   а не `tracking_duration_s` (это span first→last, 242.542 с). Граница «нет данных» — k = 7276,
   зазор 0.31 мс; кадры 7276–7278 — хвост без сэмплов.
+- **Задержка видеотракта (доработка 08a, 29.10):** кадр показывает сцену раньше своей метки,
+  поэтому поза берётся в `frame_time(k).ts_ns + VIDEO_TIME_OFFSET_MS`, где
+  `config.VIDEO_TIME_OFFSET_MS = −100 мс` (±40 мс) — `sync.pose_at_frame()`. Без поправки на 50
+  самых быстрых кадрах скелет уезжает с кисти на 73 px (по ладони/запястью 52), с поправкой — 35
+  (19); на медленных кадрах ошибка без поправки 4 px, т.е. это не калибровка. Скан сдвига даёт
+  −100…−140 мс во всех третях записи. Диагностика — `src/drift_diag.py` (таблица + PNG +
+  `summary.md`), метрика — расстояние проекций до кожи руки (HSV-маска). `calib_search` берёт время
+  из того же места, поэтому `--verify-config` теперь даёт 40/40 (было 39/39).
 
 ## 7. Принятые решения (не менять)
 
@@ -235,7 +246,7 @@ pose = pose_at(t_frame_k)   # позиция — линейно, кватерн�
 4. Работаем с левой половиной SBS-кадра (моно); правая — опционально для проверки стерео.
 5. Один подход, маленькое законченное решение; «приблизительность» наложения допустима и объясняется.
 6. Структура: `data/`, `src/{parse_tracking,video_meta,sync,camera_model,calib_frames,calib_search,
-   config,overlay_video,plot_trajectory}.py`, `output/`, `docs/`, `requirements.txt`, `README.md`,
+   config,overlay_video,drift_diag,plot_trajectory}.py`, `output/`, `docs/`, `requirements.txt`, `README.md`,
    `.gitignore`. `src/calib_frames.py` — эталон калибровки (07a), `src/calib_search.py` — подбор
    конвенции осей и `T_head_cam` по этому эталону (07b, см. раздел 12).
    `src/config.py` — единственный источник калибровочных констант (07c): `AXIS_CONVENTION`
@@ -364,8 +375,10 @@ python -c "import cv2;c=cv2.VideoCapture('data/CameraRecord_20260505_165740.mp4'
   «вперёд — это `−z` головы».
 - `src/config.py` — калибровка «камера относительно головы» (07c): `AXIS_CONVENTION`,
   `INVERT_QUAT`, `Y_DOWN_FLIP`, `HEAD_CAM_ROTATION_RPY_DEG = (0, 180, 0)`,
-  `HEAD_CAM_TRANSLATION_M = (0, 0, 0)`. Менять только здесь; проверка —
-  `camera_model.check_config()` и `python src/calib_search.py … --verify-config`.
+  `HEAD_CAM_TRANSLATION_M = (0, 0, 0)`, плюс поправка времени кадра (доработка 08a)
+  `VIDEO_TIME_OFFSET_MS = −100.0` (±40 мс). Менять только здесь; проверка —
+  `camera_model.check_config()`, `sync.video_time_offset_ns()` и
+  `python src/calib_search.py … --verify-config`.
 - `src/calib_frames.py` — эталон калибровки (07a): `CALIB_FRAMES` (5 кадров 02a + рамки кистей в
   координатах левого глаза 1080×810, ±50 px, `ignore` для рук вне FOV), `validate_frames()`,
   `as_json()` для 07b. PNG и `frames.md` — регенерируемый артефакт в `output/debug/calib/`
@@ -380,11 +393,20 @@ python -c "import cv2;c=cv2.VideoCapture('data/CameraRecord_20260505_165740.mp4'
   `PoseTrack` + `Intrinsics`), `project_hands` (10 точек через калибровку 07c), `draw_skeleton`
   (5 точек + 4 линии на руку, левая голубая / правая красная, как в разметке 07a), `render_video`
   (H.264 `avc1` → fallback `mp4v`, прогресс каждые N кадров, `probe_output` перечитывает файл),
-  `render_stills` (PNG 5 кадров 07a). Выход — левый глаз SBS 1080×810, fps записи =
+  `render_stills` (PNG 5 кадров 07a). Поза кадра — `sync.pose_at_frame` (с поправкой
+  `VIDEO_TIME_OFFSET_MS`). Выход — левый глаз SBS 1080×810, fps записи =
   `frame_count/duration` = 29.9966; полный клип 7279 кадров рендерится **61.6 с** (118 кадр/с) в
-  `output/overlay_skeleton.mp4` (94.6 МиБ). CLI: `--start/--end/--scale/--out/--progress-every/
-  --stills/--frames/--fourcc`. Вход — сырой `trackingData_*.txt`, не `tracking.csv`: для
-  синхронизации нужен `header.timeStampNs`, которого в CSV нет.
+  `output/overlay_skeleton.mp4` (**93.3 МиБ**). CLI: `--start/--end/--scale/--out/
+  --progress-every/--stills/--frames/--fourcc/--time-offset-ms`. Вход — сырой
+  `trackingData_*.txt`, не `tracking.csv`: для синхронизации нужен `header.timeStampNs`,
+  которого в CSV нет.
+- `src/drift_diag.py` — диагностика слёта скелета (доработка 08a): 50 самых быстрых кадров правой
+  руки, ошибка наложения как расстояние проекций до кожи (HSV-маска + distance transform, без
+  CV-моделей), корреляции Спирмена/Пирсона с `dt_to_nearest_ms` / `speed_mps` / `depth_z_m` /
+  `head_yaw_deg` / `head_rotation_range_deg`, скан сдвига времени по третям записи и контроль на
+  медленных кадрах. Выход: `table.csv`, `diag_*.png`, `summary.md` в `output/debug/drift/…`; CLI:
+  `python src/drift_diag.py data/CameraRecord_*.mp4 [--time-offset-ms 0]`; эталонные прогоны —
+  `output/debug/drift/pre_fix` (73.3 px без поправки) и `post_fix` (34.6 px с ней).
 
 ## 13. Дневник работы: `docs/NOTES.md` (обязателен)
 
