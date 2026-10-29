@@ -39,12 +39,16 @@
 
 Параметры победителя сохраняются в JSON (``output/debug/calib/calibration.json``) —
 это вход задачи 07c, которая переносит их в ``src/config.py``. Числа в ``config.py``
-здесь не меняются: подбор только печатает/сохраняет результат.
+здесь не меняются: подбор только печатает/сохраняет результат. Обратная проверка —
+режим ``--verify-config`` (07c): он собирает конвенцию из ``src/config.py``
+(:func:`convention_from_config`), прогоняет её по эталону 07a и сверяет метрику с 07b —
+то есть отвечает на вопрос «рендер по текущему конфигу воспроизводится?».
 
 Запуск:
     python src/calib_search.py data/trackingData_*.txt
     python src/calib_search.py data/trackingData_*.txt --video data/CameraRecord_*.mp4
     python src/calib_search.py data/trackingData_*.txt --json > output/debug/calib/calibration.json
+    python src/calib_search.py data/trackingData_*.txt --verify-config
 """
 from __future__ import annotations
 
@@ -642,6 +646,29 @@ def evaluate_convention(data: CalibData, convention: Convention) -> Metrics:
     )
 
 
+def convention_from_config() -> Convention:
+    """Конвенция, собранная из ``src/config.py`` (07c), — проверка калибровки без перебора.
+
+    Обратная операция к :meth:`Convention.head_cam`: ``rotation`` — это ``A = Rᵀ``
+    поворота ``T_head_cam`` (``cam → head``), ``camera_offset`` — сдвиг из конфига,
+    ``invert_quat`` — флаг оттуда же. Значения берутся через
+    :func:`camera_model.check_config`, поэтому противоречивый конфиг (запись осей не
+    совпадает с матрицей, ``det ≠ +1``, флаг не ``bool``) падает здесь, а не в метрике.
+    :func:`evaluate_convention` на этой конвенции обязан воспроизвести метрику 07b:
+    39 из 39 суставов в рамках своих рук, 0 чужих, 0 промахов, 0.0 px.
+    """
+    summary = camera_model.check_config()
+    matrix = summary["head_cam_matrix"]
+    rotation: Matrix3 = tuple(  # type: ignore[assignment]
+        tuple(matrix[i][j] for j in range(3)) for i in range(3)
+    )
+    return Convention(
+        rotation=_transpose3(rotation),
+        invert_quat=summary["invert_quat"],
+        camera_offset=summary["head_cam_translation_m"],  # type: ignore[arg-type]
+    )
+
+
 def search_discrete(
     data: CalibData,
     offsets: Iterable[tuple[float, float, float]] = offset_grid(),
@@ -996,8 +1023,42 @@ def save_overlay_sheets(
     return written
 
 
+def _verify_config(data: CalibData) -> int:
+    """Режим ``--verify-config`` (07c): метрика конвенции из ``src/config.py`` на эталоне 07a.
+
+    Никакого перебора: параметры берутся из конфига, поэтому код проверки — ровно тот
+    путь, которым пойдёт рендер (08a). Ненулевая ошибка или чужие руки означают, что
+    конфиг «расползся» относительно калибровки 07b, и это возвращает код 1.
+    """
+    try:
+        summary = camera_model.check_config()
+        convention = convention_from_config()
+    except (ValueError, TypeError) as exc:
+        print(f"ошибка конфига: {exc}", file=sys.stderr)
+        return 1
+    print("\nкалибровка из src/config.py (07c):")
+    print(f"  AXIS_CONVENTION = {summary['axis_convention']}, "
+          f"INVERT_QUAT = {summary['invert_quat']}, Y_DOWN_FLIP = {summary['y_down_flip']}")
+    print(f"  HEAD_CAM_ROTATION_RPY_DEG = {summary['head_cam_rotation_rpy_deg']}, "
+          f"HEAD_CAM_TRANSLATION_M = {summary['head_cam_translation_m']}")
+    print("  проверка конфига: запись осей совпадает с матрицей поворота, det = +1")
+    metrics = evaluate_convention(data, convention)
+    print(f"  метрика на эталоне: {metrics.good}/{metrics.in_frame} суставов в кадре — в рамках "
+          f"своих рук; чужих {metrics.wrong}, мимо {metrics.miss}, "
+          f"средняя ошибка {metrics.mean_error_px:.1f} px "
+          f"(всего {metrics.total}, {metrics.total - metrics.in_frame} законно вне кадра)")
+    criterion = metrics.mean_error_px <= MAX_MEAN_ERROR_PX and metrics.violations == 0
+    print(f"  критерий 07b (≤ {MAX_MEAN_ERROR_PX:g} px и без чужих рук): "
+          f"{'выполнен' if criterion else 'НЕ выполнен'}")
+    return 0 if criterion else 1
+
+
 def main(argv: Iterable[str] | None = None) -> int:
-    """CLI: перебор 48 конвенций, уточнение top-3, метрика, PNG и JSON для 07c."""
+    """CLI: перебор 48 конвенций, уточнение top-3, метрика, PNG и JSON для 07c.
+
+    ``--verify-config`` вместо перебора проверяет уже зафиксированную в ``src/config.py``
+    калибровку (07c) на эталоне 07a: именно этот путь пойдёт рендер.
+    """
     parser = argparse.ArgumentParser(
         description="Подбор конвенции осей и грубого T_head_cam по 5 кадрам с разметкой (07b)."
     )
@@ -1017,6 +1078,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument(
         "--no-refine", action="store_true", help="пропустить уточнение top-3 (быстрее)"
     )
+    parser.add_argument(
+        "--verify-config", action="store_true",
+        help="не искать, а проверить калибровку src/config.py на эталоне 07a (07c)",
+    )
     parser.add_argument("--json", action="store_true", help="напечатать JSON победителя в stdout")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -1029,6 +1094,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     print(f"эталон 07a: {len(data.frames)} кадров, {data.total} суставов "
           f"(левый глаз {calib_frames.EYE_WIDTH}×{calib_frames.EYE_HEIGHT}, "
           f"допуск разметки ±{TOLERANCE_PX} px)")
+
+    if args.verify_config:
+        return _verify_config(data)
     print("перебор: 24 собственные ротации осей × 2 конвенции кватерниона × "
           f"{len(offset_grid())} положений камеры")
     candidates = search_discrete(data)

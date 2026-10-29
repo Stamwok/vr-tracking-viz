@@ -24,18 +24,30 @@
 * ``T_head_world`` — поза головы (:func:`head_to_world`: поворот из кватерниона, сдвиг —
   позиция головы); ``⁻¹`` переводит точку из мира в систему головы.
 * ``T_head_cam`` — поза камеры в системе головы (:func:`head_cam_matrix`, константа из
-  ``src/config.py``; заглушка 05b — без поворота, 5 см вперёд, финал — 07c).
-* ``F = diag(1, −1, 1)`` — переход Unity (``y`` вверх) → OpenCV (``y`` вниз) по флагу
-  ``opencv_conventions``: камера смотрит по ``+z``, ``x`` вправо, ``y`` вниз, как ждут
-  интринсики из 05a и ``cv2.projectPoints``. Нужен отдельным флагом, потому что это
-  конвенция осей экрана, а не свойство «камера в голове».
+  ``src/config.py``). Калибровка 07b/07c: поворот на 180° вокруг ``x`` головы
+  (``HEAD_CAM_ROTATION_RPY_DEG = (0, 180, 0)``) и нулевое смещение — камера смотрит
+  по ``+z``, ``x`` вправо, ``y`` вниз.
+* ``F = diag(1, −1, 1)`` — необязательный добавочный переворот ``y`` (флаг
+  ``opencv_conventions``, в ``config.py`` — ``Y_DOWN_FLIP``). Калибровка его **выключает**:
+  «``y`` вниз» уже даёт поворот камеры на 180° вокруг ``x``, а отдельный переворот сделал
+  бы ориентацию отражением (``det = −1``) и вернул бы ``z`` головы (назад) «вперёд» —
+  ровно ошибка 05b, при которой ни одна кисть не была перед камерой.
 
-Конвенция кватерниона — отдельный флаг ``invert_quat`` (``False`` по умолчанию — поза
-понимается как поворот головы в мире, как в спецификации формата). Замер на данных:
-при ``invert_quat=False`` **0 %** из 8 690 точек кистей оказываются перед головой, при
-``True`` — **92.7 %**; значит в записи кватернион ведёт себя как обратный поворот
-(Unity-подобная левосторонняя система). Окончательный выбор — за 07b, где вариант
-подбирается по наложению на кадры, а не по этой грубой статистике.
+Конвенция кватерниона — флаг ``invert_quat`` (в ``config.py`` — ``INVERT_QUAT = False``,
+т.е. поза понимается как поворот головы в мире, как в спецификации формата). Замер 05b
+показывал: при ``invert_quat=False`` **0 %** из 8 690 точек кистей оказываются перед
+головой, при ``True`` — **92.7 %**. 07b показал, что дело было не в кватернионе, а в
+ориентации камеры (поворот ``diag(1, −1, −1)``): при нём обе руки оказываются там, где
+нужно, без инверсии кватерниона. Флаг остался входом перебора (07b) и подменяется из
+``config.py``; по умолчанию — значение из конфига.
+
+Задача 07c: все параметры калибровки — ``AXIS_CONVENTION``, ``INVERT_QUAT``,
+``Y_DOWN_FLIP``, ``HEAD_CAM_ROTATION_RPY_DEG`` и ``HEAD_CAM_TRANSLATION_M`` — живут в
+``src/config.py``; ``world_to_camera``/``world_to_camera_matrix`` при ``None`` читают их
+оттуда, поэтому смена констант в конфиге полностью определяет проекцию и рендер, а код
+камеры не правится. Согласованность конфига (запись осей ↔ матрица поворота, ``det = +1``,
+булевы флаги) проверяет :func:`check_config`; строка осей вычисляется
+:func:`axis_convention`. Обоснование и отклонённые варианты — ``docs/projection_notes.md``.
 
 В карточке 05b композиция записана как ``T_cam_world(t) = T_head_world(t) @ T_head_cam``:
 это та же формула, если ``T_head_cam`` — поза камеры в голове (переводит координаты
@@ -258,8 +270,10 @@ IDENTITY4: Matrix4 = (
 )
 
 #: Переход Unity → OpenCV по осям: ``x`` вправо и ``z`` вперёд совпадают, ``y`` меняет знак.
-#: Применяется к координатам камеры, когда ``opencv_conventions=True`` (по умолчанию):
-#: в Unity (и в позе головы из данных) ``y`` смотрит вверх, в OpenCV-изображении — вниз.
+#: Применяется к координатам камеры, когда ``opencv_conventions=True`` (по умолчанию —
+#: значение ``config.Y_DOWN_FLIP``; калибровка 07b этот переворот выключает, потому что
+#: «``y`` вниз» уже даёт поворот камеры на 180° вокруг ``x``). В Unity (и в позе головы из
+#: данных) ``y`` смотрит вверх, в OpenCV-изображении — вниз; это отражение, ``det = −1``.
 OPENCV_FLIP_Y: Matrix4 = (
     (1.0, 0.0, 0.0, 0.0),
     (0.0, -1.0, 0.0, 0.0),
@@ -486,9 +500,10 @@ def head_to_world(head_pose: object, *, invert_quat: bool = False) -> Matrix4:
     Это дискретный вариант конвенции, который перебирается в 07b: в данных поза приходит
     из Unity (левосторонняя система), и замер на 8 690 точках кистей показывает, что при
     ``invert_quat=False`` **0 %** точек оказываются перед головой (``z < 0``), а при
-    ``invert_quat=True`` — **92.7 %**. Остаточная ориентация осей всё равно не сходится с
-    кадром (07b), поэтому по умолчанию оставлена «спецификационная» конвенция, а флаг —
-    вход для калибровки, а не скрытая подгонка.
+    ``invert_quat=True`` — **92.7 %**. 07b показал, что причина — ориентация камеры, а не
+    кватернион: при калиброванном ``T_head_cam`` (поворот на 180° вокруг ``x``) нужные оси
+    получаются без инверсии, поэтому в ``config.py`` стоит ``INVERT_QUAT = False``, а
+    ``world_to_camera`` берёт флаг оттуда. Здесь аргумент остаётся явным входом перебора.
     """
     position, quaternion = head_pose_parts(head_pose)
     rotation = quat_to_rotation(quaternion)
@@ -503,6 +518,8 @@ def head_cam_matrix() -> Matrix4:
     Читает ``config.HEAD_CAM_ROTATION_RPY_DEG`` и ``config.HEAD_CAM_TRANSLATION_M`` при
     каждом вызове, поэтому калибровка (07b/07c) меняет только ``config.py``. Значения
     проверяются: ровно три конечных числа в каждом кортеже, иначе ``ValueError``.
+    Калибровка 07c: ``(0, 180, 0)`` и ``(0, 0, 0)`` — поворот на 180° вокруг ``x``, камера
+    в начале координат головы.
     """
     yaw, pitch, roll = _vector(
         config.HEAD_CAM_ROTATION_RPY_DEG, 3, "config.HEAD_CAM_ROTATION_RPY_DEG"
@@ -511,12 +528,101 @@ def head_cam_matrix() -> Matrix4:
     return _homogeneous(rotation_rpy(yaw, pitch, roll), translation)
 
 
+def _flag(value: object, what: str) -> bool:
+    """Строгий ``bool`` из конфига: строка/число вместо флага — ``ValueError``."""
+    if not isinstance(value, bool):
+        raise ValueError(f"{what}: ожидалось True/False, получено {value!r}")
+    return value
+
+
+def _signed_axes(rotation: Matrix3) -> str:
+    """Запись собственной ротации как ``"+x −y −z"``; ``"custom"`` для прочих поворотов."""
+    letters = "xyz"
+    parts = []
+    for row in rotation:
+        index = max(range(3), key=lambda i: abs(row[i]))
+        if abs(abs(row[index]) - 1.0) > 1e-9 or any(
+            abs(row[other]) > 1e-9 for other in range(3) if other != index
+        ):
+            return "custom"
+        parts.append(("+" if row[index] > 0 else "−") + letters[index])
+    return " ".join(parts)
+
+
+def axis_convention(t_head_cam: Matrix4 | Sequence[Sequence[float]] | None = None) -> str:
+    """Оси камеры в осях головы строкой: ``"+x −y −z"`` (``"custom"``, если не перестановка).
+
+    ``A`` — поворот из системы головы в систему камеры, т.е. транспонирование поворота
+    ``T_head_cam`` (``cam → head``). Это тот же смысл, что у ``AXIS_CONVENTION`` в
+    ``src/config.py`` и у ``Convention.axes`` в ``src/calib_search.py`` (07b). При
+    ``t_head_cam=None`` берётся константа из конфига — так проверяется, что запись осей в
+    ``config.py`` не расходится с матрицей поворота.
+    """
+    head_cam = head_cam_matrix() if t_head_cam is None else _matrix4(t_head_cam, "t_head_cam")
+    rotation: Matrix3 = tuple(  # type: ignore[assignment]
+        tuple(head_cam[i][j] for j in range(3)) for i in range(3)
+    )
+    return _signed_axes(_transpose3(rotation))
+
+
+def check_config() -> dict:
+    """Проверить согласованность ``src/config.py`` (07c) и вернуть сводку.
+
+    Проверяется:
+
+    * ``AXIS_CONVENTION`` — строка и она совпадает с осями, которые
+      :func:`axis_convention` выводит из ``HEAD_CAM_ROTATION_RPY_DEG``; иначе запись осей
+      врёт о матрице поворота, и конфиг противоречив;
+    * поворот ``T_head_cam`` — собственная ротация (``det = +1``): отражение в калибровку
+      попасть не должно, переворот ``y`` живёт в отдельном флаге ``Y_DOWN_FLIP``;
+    * ``Y_DOWN_FLIP`` и ``INVERT_QUAT`` — настоящие ``bool``, а не «истинные» строки.
+
+    Возвращает словарь с константами и матрицей: его печатает CLI, используют тесты и
+    ``python src/calib_search.py … --verify-config``. ``ValueError`` — конфиг противоречив
+    (лучше упасть, чем молча рисовать по нему).
+    """
+    axes = axis_convention()
+    declared = config.AXIS_CONVENTION
+    if not isinstance(declared, str):
+        raise ValueError(f"config.AXIS_CONVENTION: ожидалась строка, получено {declared!r}")
+    declared = declared.strip()
+    if declared != axes:
+        raise ValueError(
+            f"config.AXIS_CONVENTION = {declared!r}, а из HEAD_CAM_ROTATION_RPY_DEG "
+            f"получаются оси {axes!r} — конфиг противоречив"
+        )
+    y_down_flip = _flag(config.Y_DOWN_FLIP, "config.Y_DOWN_FLIP")
+    invert_quat = _flag(config.INVERT_QUAT, "config.INVERT_QUAT")
+    matrix = head_cam_matrix()
+    rotation: Matrix3 = tuple(  # type: ignore[assignment]
+        tuple(matrix[i][j] for j in range(3)) for i in range(3)
+    )
+    determinant = _det3(rotation)
+    if abs(determinant - 1.0) > 1e-9:
+        raise ValueError(
+            f"T_head_cam: det = {determinant:g}, ожидалась собственная ротация (det = +1); "
+            "добавочный переворот y задаётся флагом config.Y_DOWN_FLIP"
+        )
+    return {
+        "axis_convention": axes,
+        "invert_quat": invert_quat,
+        "y_down_flip": y_down_flip,
+        "head_cam_rotation_rpy_deg": tuple(
+            _vector(config.HEAD_CAM_ROTATION_RPY_DEG, 3, "config.HEAD_CAM_ROTATION_RPY_DEG")
+        ),
+        "head_cam_translation_m": tuple(
+            _vector(config.HEAD_CAM_TRANSLATION_M, 3, "config.HEAD_CAM_TRANSLATION_M")
+        ),
+        "head_cam_matrix": matrix,
+    }
+
+
 def world_to_camera_matrix(
     head_pose: object,
     t_head_cam: Matrix4 | Sequence[Sequence[float]] | None = None,
     *,
-    opencv_conventions: bool = True,
-    invert_quat: bool = False,
+    opencv_conventions: bool | None = None,
+    invert_quat: bool | None = None,
 ) -> Matrix4:
     """``T_cam_world`` для кадра: 4×4, переводящая точку мира в координаты камеры.
 
@@ -526,10 +632,17 @@ def world_to_camera_matrix(
     ``head``), принимается и вложенная 4×4, и плоский список 16 чисел. ``M`` считается
     один раз на кадр, дальше 10 точек кистей переводятся :func:`transform_point`.
 
-    ``opencv_conventions=False`` — оставить оси как в Unity (``y`` вверх), без
-    переворота ``y``: этим флагом проверяется сама конвенция осей камеры.
-    ``invert_quat`` — дискретный вариант конвенции кватерниона (см. :func:`head_to_world`).
+    ``opencv_conventions=None`` (по умолчанию) — флаг ``config.Y_DOWN_FLIP``; в
+    калибровке 07b он **выключен**, потому что «``y`` вниз» уже даёт поворот камеры на
+    180° вокруг ``x``, а отдельный переворот ``y`` делает ориентацию отражением
+    (``det = −1``). ``invert_quat=None`` — флаг ``config.INVERT_QUAT`` (калибровка: ``False``,
+    поза головы трактуется как поворот в мире). Оба флага можно задать явно: так 07b
+    перебирает варианты, а тесты проверяют сами флаги.
     """
+    if invert_quat is None:
+        invert_quat = _flag(config.INVERT_QUAT, "config.INVERT_QUAT")
+    if opencv_conventions is None:
+        opencv_conventions = _flag(config.Y_DOWN_FLIP, "config.Y_DOWN_FLIP")
     head_cam = head_cam_matrix() if t_head_cam is None else _matrix4(t_head_cam, "t_head_cam")
     cam_head = _inverse4(head_cam, "t_head_cam")
     head_world = head_to_world(head_pose, invert_quat=invert_quat)
@@ -552,18 +665,20 @@ def world_to_camera(
     head_pose: object,
     t_head_cam: Matrix4 | Sequence[Sequence[float]] | None = None,
     *,
-    opencv_conventions: bool = True,
-    invert_quat: bool = False,
+    opencv_conventions: bool | None = None,
+    invert_quat: bool | None = None,
 ) -> tuple[float, float, float]:
     """Точка мира → координаты камеры кадра: ``(x, y, z)``, ``z`` — глубина вдоль взгляда.
 
     ``p_world`` — метры в мировой системе (как в ``tracking.csv``), ``head_pose`` — поза
     головы на кадр (7 чисел или ``sync.Pose``), ``t_head_cam`` — поза камеры в голове
-    (``None`` → константа из ``src/config.py``). При ``opencv_conventions=True`` (по
-    умолчанию) ``x`` вправо, ``y`` вниз, ``z`` вперёд — как ждут интринсики 05a.
+    (``None`` → константа из ``src/config.py``). ``opencv_conventions`` и ``invert_quat``
+    при ``None`` берутся из ``src/config.py`` (калибровка 07b/07c: ``False``/``False``),
+    поэтому проекция целиком определяется константами конфига.
 
-    Точка на оси взгляда головы ``(0, 0, 1)`` при заглушке ``config.py`` даёт
-    ``(0, 0, 0.95)``: ``x ≈ y ≈ 0``, ``z > 0`` (камера в 5 см впереди центра головы).
+    С калибровкой 07c точка перед головой ``(0, 0, −1)`` (в OpenXR вперёд смотрит ``−z``)
+    даёт ``(0, 0, 1)``: камера совпадает с началом координат головы и смотрит вперёд.
+    Обратное направление ``(0, 0, +1)`` — «за затылком» — даёт ``z = −1`` (за камерой).
     """
     matrix = world_to_camera_matrix(
         head_pose, t_head_cam, opencv_conventions=opencv_conventions, invert_quat=invert_quat
@@ -733,13 +848,15 @@ def _display(value: float) -> float:
 
 
 def _head_cam_report(tracking: Path, samples: int) -> int:
-    """Печать ``T_head_cam`` из config.py и проверка перевода мира в камеру (задача 05b).
+    """Печать ``T_head_cam`` из config.py и проверка перевода мира в камеру (05b → 07c).
 
     На равномерно выбранных сэмплах печатает позу головы, точку взгляда в координатах
     камеры (обязана дать ``x ≈ y ≈ 0``, ``z > 0`` при любой позе) и сколько точек кистей
     оказалось впереди камеры (``z > 0``). Колонка «кисти впереди» показана для обеих
-    конвенций кватерниона (``invert_quat`` False/True): расхождение — это ровно тот
-    открытый вопрос, который закрывает 07b, и данные для него видны сразу.
+    конвенций кватерниона (``invert_quat`` False/True): до калибровки это был открытый
+    вопрос, теперь False — значение из ``config.py`` (07c), True — отклонённый вариант
+    перебора 07b. Перед таблицей печатается сводка :func:`check_config`: если запись осей
+    в конфиге расходится с матрицей поворота, CLI падает, а не рисует по такому конфигу.
     """
     header_ns = int(read_header(tracking)["timeStampNs"])
     total = count_samples(tracking)
@@ -751,16 +868,22 @@ def _head_cam_report(tracking: Path, samples: int) -> int:
     else:
         indices = [0]
 
+    summary = check_config()
     print(tracking)
     print("  T_head_cam из src/config.py (поза камеры в системе головы, cam → head):")
     for row in head_cam_matrix():
         print("    [" + " ".join(f"{value:>9.4f}" for value in row) + " ]")
     print(
+        f"  AXIS_CONVENTION = {summary['axis_convention']}, "
+        f"Y_DOWN_FLIP = {summary['y_down_flip']}, INVERT_QUAT = {summary['invert_quat']}"
+    )
+    print(
         f"  HEAD_CAM_ROTATION_RPY_DEG = {config.HEAD_CAM_ROTATION_RPY_DEG}, "
         f"HEAD_CAM_TRANSLATION_M = {config.HEAD_CAM_TRANSLATION_M}"
     )
+    print("  согласованность конфига: ок (оси совпадают с матрицей, det = +1)")
     print(
-        "  проверка на позах: точка взгляда (0, 0, 1) головы и 10 точек кистей → координаты камеры"
+        "  проверка на позах: точка перед головой (0, 0, −1) и 10 точек кистей → координаты камеры"
     )
     print(
         f"  {'#':>6}{'t, с':>9}  {'голова (x, y, z), м':<28}{'взгляд → p_cam':<24}"
@@ -774,7 +897,7 @@ def _head_cam_report(tracking: Path, samples: int) -> int:
         t_rel = (int(sample["timeStampNs"]) - header_ns) / 1e9
         matrix = world_to_camera_matrix(pose)
         other = world_to_camera_matrix(pose, invert_quat=True)
-        gaze_world = transform_point(head_to_world(pose), (0.0, 0.0, 1.0))
+        gaze_world = transform_point(head_to_world(pose), (0.0, 0.0, -1.0))
         gaze = transform_point(matrix, gaze_world)
         ahead = {False: 0, True: 0}
         finite = 0
@@ -791,8 +914,8 @@ def _head_cam_report(tracking: Path, samples: int) -> int:
         head = f"({pose[0]:.3f}, {pose[1]:.3f}, {pose[2]:.3f})"
         gaze_text = "(" + ", ".join(f"{_display(value):.3f}" for value in gaze) + ")"
         print(f"  {index:>6}{t_rel:>9.3f}  {head:<28}{gaze_text:<24}{hands:>26}")
-    print("  допущение: камера жёстко закреплена в голове (T_head_cam — константа, 07c).")
-    print("  кисти впереди: доля точек с z > 0 — проверка конвенции осей; финал — 07b/07c.")
+    print("  T_head_cam — константа 07b/07c: камера жёстко закреплена в голове.")
+    print("  кисти впереди (z > 0): у калиброванной конвенции обе руки перед камерой.")
     return 0
 
 
@@ -805,13 +928,13 @@ def _project_report(tracking: Path, meta_path: Path, frames: Sequence[int]) -> i
 
     Что печатается:
 
-    * проекция точки на оси взгляда ``(0, 0, 1)`` — обязана попасть в главную точку
+    * проекция точки на оси камеры ``(0, 0, 1)`` — обязана попасть в главную точку
       ``(539.5, 404.5)`` у левого глаза, а у правого — на 1080 правее;
     * сетка лучей внутри FOV (0.99 полуугла) — все пиксели обязаны лежать в ``1080×810``
       (это и есть проверка «центр сцены не выходит за кадр»: сама геометрия, без T_head_cam);
     * на отладочных кадрах — поза из ``sync.pose_at``, проекция взгляда и точки кистей:
-      сколько точек конечно, сколько видимо (``Z > 1 см``) и сколько попало в кадр, для обеих
-      конвенций кватерниона. «В кадре» у кистей пока 0 — калибровка осей это 07b.
+      сколько точек конечно, сколько видимо (``Z > 1 см``) и сколько попало в кадр, для
+      калиброванной конвенции (``config.py``, 07c) и отклонённого варианта ``invert_quat=True``.
     """
     from src.parse_tracking import timestamp_range
     from src.sync import frame_time, load_poses
@@ -855,7 +978,7 @@ def _project_report(tracking: Path, meta_path: Path, frames: Sequence[int]) -> i
         f"(углы до 0.99·FOV/2 = {fov_h / 2.0:.2f}° × {fov_v / 2.0:.2f}°)"
     )
     print(
-        f"  отладочные кадры: {'k':>5}{'t, с':>8}{'конвенция':>19}{'взгляд u, v':>18}"
+        f"  отладочные кадры: {'k':>5}{'t, с':>8} {'конвенция':>27}{'взгляд u, v':>18}"
         f"{'кисти: finite/видимо/в кадре':>30}"
     )
     for k in frames:
@@ -863,7 +986,9 @@ def _project_report(tracking: Path, meta_path: Path, frames: Sequence[int]) -> i
         pose = track.pose_at(frame.ts_ns)
         for invert in (False, True):
             matrix = world_to_camera_matrix(pose, invert_quat=invert)
-            gaze_world = transform_point(head_to_world(pose, invert_quat=invert), (0.0, 0.0, 1.0))
+            gaze_world = transform_point(
+                head_to_world(pose, invert_quat=invert), (0.0, 0.0, -1.0)
+            )
             gaze = project_eye(transform_point(matrix, gaze_world), intrinsics, "left")
             finite = visible = framed = 0
             for point_world in pose.hands.values():
@@ -873,12 +998,13 @@ def _project_report(tracking: Path, meta_path: Path, frames: Sequence[int]) -> i
                 point = project_eye(transform_point(matrix, point_world), intrinsics, "left")
                 visible += point.visible
                 framed += in_frame(point, intrinsics, "left")
-            label = "invert_quat=True" if invert else "invert_quat=False"
+            label = "invert_quat=True (отклонён)" if invert else "config.py (07c)"
             print(
-                f"  {k:>9}{frame.t_rel_s:>8.2f}{label:>19}"
+                f"  {k:>9}{frame.t_rel_s:>8.2f} {label:>27}"
                 f"{f'({gaze.u:.1f}, {gaze.v:.1f})':>18}{f'{finite}/10, {visible}, {framed}':>30}"
             )
-    print("  «в кадре 0» у кистей — ожидаемо: T_head_cam пока заглушка из 05b, калибровка — 07b/07c.")
+    print("  кисти в кадре — по калибровке 07b/07c; вариант invert_quat=True показан "
+          "как отклонённый перебором.")
     return 0
 
 
