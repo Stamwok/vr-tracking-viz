@@ -41,6 +41,21 @@ OpenXR с пястными костями). Политика разрывов т
 не трогаются. 5-точечный кадр 08a по умолчанию остаётся плоским, режим переключается
 ``--depth-color``/``--no-depth-color``.
 
+Доработка 08g-fix2 добавляет **второй канал глубины — прозрачность** (``alpha``): ближняя
+кость/точка непрозрачна, дальняя полупрозрачна (:func:`depth_alpha`, пол
+:data:`DEPTH_MIN_ALPHA`), поэтому глубина читается не только по яркости, но и по тому, что
+сквозь дальнюю кость виден фон. Кость по-прежнему рисуется :data:`DEPTH_BONE_SEGMENTS`
+отрезками, и каждый отрезок получает свою alpha по средней глубине своих концов; у точки —
+alpha по её глубине, а чёрная обводка остаётся полностью непрозрачной (иначе точка исчезает
+на тёмном фоне). Так как ``cv2.line``/``cv2.circle`` не умеют alpha, отрезок и круг рисуются
+в маску размером со свой bbox (:func:`_blend_line`, :func:`_blend_point`) — тот же приём, что
+у следа 08b, иначе на кадр лёг бы полупрозрачный тёмный прямоугольник. В режиме alpha
+дальние кости и точки рисуются **до** ближних (сортировка по ``p_cam.z`` по убыванию), чтобы
+полупрозрачная дальняя кость не просвечивала поверх непрозрачной ближней. Флаги —
+``--depth-alpha``/``--no-depth-alpha`` (по умолчанию включено для густого скелета и
+``--all-joints``, выключено для 5-точечного 08a), ``--no-depth-color`` отключает и яркость,
+и alpha; ``--no-depth-alpha`` воспроизводит кадр 08g-fix (только яркость).
+
 Поза головы = поза камеры (камера в голове, ``T_head_cam`` из ``config.py``), поэтому
 отдельного маркера головы в кадре нет — о ней говорит HUD (время и номер кадра).
 
@@ -286,6 +301,28 @@ def resolve_depth_shading(value: bool | None, skeleton: Skeleton) -> bool:
     return value
 
 
+def resolve_depth_alpha(value: bool | None, skeleton: Skeleton) -> bool:
+    """Включена ли прозрачность по глубине (08g-fix2) для выбранного скелета.
+
+    Правило авторежима то же, что у яркости (:func:`resolve_depth_shading`): ``None`` —
+    включено для любого скелета, кроме прежнего 5-точечного (:data:`FLAT_SKELETON`); явные
+    ``True``/``False`` (CLI ``--depth-alpha``/``--no-depth-alpha``) перекрывают авторежим.
+    Сравнение по имени набора — см. :func:`resolve_depth_shading`.
+
+    Отдельная функция, а не флаг внутри :func:`resolve_depth_shading`: яркость и alpha —
+    независимые каналы, и их можно включать порознь (сравнение «только яркость» / «только
+    alpha» / «оба» — это проверка доработки). ``--no-depth-color`` отключает оба канала сразу,
+    поэтому при выключенной яркости alpha не включается (:func:`render_video`).
+    """
+    if not isinstance(skeleton, Skeleton):
+        raise ValueError(f"skeleton: ожидался Skeleton, получено {skeleton!r}")
+    if value is None:
+        return skeleton.name != FLAT_SKELETON.name
+    if not isinstance(value, bool):
+        raise ValueError(f"depth_alpha: ожидалось bool или None, получено {value!r}")
+    return value
+
+
 #: Ширина кадра глаза, к которой отнесены радиус и толщина по умолчанию.
 REFERENCE_WIDTH = 1080
 
@@ -366,6 +403,14 @@ DEPTH_FAR_M = 0.48
 #: Нижняя граница множителя: дальняя кость приглушается, но не исчезает — на тёмном фоне
 #: (корзина, тени) линия остаётся различимой. Верхняя граница — 1.0 (полный цвет руки).
 DEPTH_MIN_FACTOR = 0.30
+
+#: Нижняя граница прозрачности в режиме глубины (доработка 08g-fix2), alpha: ближняя кость
+#: или точка полностью непрозрачна (1.0), дальняя — не прозрачнее 0.45. Это второй канал,
+#: независимый от яркости: сквозь дальнюю кость виден фон, поэтому глубина читается и на
+#: пёстром фоне, где приглушение насыщенного цвета руки само по себе почти незаметно
+#: (наблюдение пользователя по 08g-fix). Окно по умолчанию — то же :data:`DEPTH_NEAR_M`…
+#: :data:`DEPTH_FAR_M`: одна шкала для обоих каналов проще для интерпретации.
+DEPTH_MIN_ALPHA = 0.45
 
 #: Сколько отрезков рисуется на одну кость в режиме глубины (градиент вдоль кости, 08g).
 #: 5 — компромисс: градиент читается на линии толщиной 3 px, но не рвёт её на «рябь»;
@@ -719,6 +764,25 @@ def _coord(value: float) -> int:
     return max(-COORD_LIMIT, min(COORD_LIMIT, int(round(value))))
 
 
+def _check_depth_window(near: float, far: float, minimum: float, floor_name: str) -> None:
+    """Проверить окно глубины и нижнюю границу шкалы (общая для множителя и alpha).
+
+    ``minimum`` — значение шкалы на дальнем конце окна (множитель яркости или alpha),
+    ``floor_name`` — его имя для текста ошибки. Окно ``near``…``far`` — метры системы камеры.
+    """
+    for name, value in (("near", near), ("far", far), (floor_name, minimum)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name}: ожидалось число, получено {value!r}")
+        if not math.isfinite(value):
+            raise ValueError(f"{name}: должно быть конечным, получено {value!r}")
+    if near <= 0:
+        raise ValueError(f"near: должно быть > 0, получено {near!r}")
+    if far <= near:
+        raise ValueError(f"far: должно быть больше near ({near!r}), получено {far!r}")
+    if not 0.0 < minimum <= 1.0:
+        raise ValueError(f"{floor_name}: ожидалось в (0, 1], получено {minimum!r}")
+
+
 def depth_factor(
     depth: float,
     *,
@@ -738,17 +802,7 @@ def depth_factor(
     камерой (``z ≤ 0``) тоже упирается в ближнюю границу окна и даёт 1.0 — такая точка в
     кадр не попадает, множитель для неё смысла не имеет.
     """
-    for name, value in (("near", near), ("far", far), ("min_factor", min_factor)):
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ValueError(f"{name}: ожидалось число, получено {value!r}")
-        if not math.isfinite(value):
-            raise ValueError(f"{name}: должно быть конечным, получено {value!r}")
-    if near <= 0:
-        raise ValueError(f"near: должно быть > 0, получено {near!r}")
-    if far <= near:
-        raise ValueError(f"far: должно быть больше near ({near!r}), получено {far!r}")
-    if not 0.0 < min_factor <= 1.0:
-        raise ValueError(f"min_factor: ожидалось в (0, 1], получено {min_factor!r}")
+    _check_depth_window(near, far, min_factor, "min_factor")
     if isinstance(depth, bool) or not isinstance(depth, (int, float)):
         raise ValueError(f"depth: ожидалось число, получено {depth!r}")
     if not math.isfinite(depth):
@@ -759,6 +813,43 @@ def depth_factor(
     if t >= 1.0:
         return min_factor
     return 1.0 - (1.0 - min_factor) * t
+
+
+def depth_alpha(
+    depth: float,
+    *,
+    near: float = DEPTH_NEAR_M,
+    far: float = DEPTH_FAR_M,
+    min_alpha: float = DEPTH_MIN_ALPHA,
+) -> float:
+    """Прозрачность по глубине: 1.0 ближе ``near``, ``min_alpha`` дальше ``far`` (08g-fix2).
+
+    Второй, независимый от яркости канал: ближняя кость или точка рисуется полностью
+    непрозрачной, дальняя — полупрозрачной, сквозь неё виден фон. Шкала линейная и
+    монотонно не возрастает с ``z``, окно по умолчанию — **то же**, что у
+    :func:`depth_factor` (:data:`DEPTH_NEAR_M`…:data:`DEPTH_FAR_M`): одна шкала на оба канала
+    проще для интерпретации, а ``near``/``far``/``min_alpha`` можно перекрыть (например, для
+    сравнения вариантов), не меняя яркость.
+
+    Неизвестная глубина (``NaN``, ``±inf``) и глубина за камерой (``z ≤ 0``) дают 1.0 —
+    полную непрозрачность: отсутствие данных не повод «выцветать» или прятать точку, а такая
+    точка в кадр не попадает. Крайние значения окна возвращают ровно 1.0 / ``min_alpha``
+    (без ``0.44999999999999996``), дальше — зажим, а не экстраполяция.
+    """
+    _check_depth_window(near, far, min_alpha, "min_alpha")
+    if isinstance(depth, bool) or not isinstance(depth, (int, float)):
+        raise ValueError(f"depth: ожидалось число, получено {depth!r}")
+    if not math.isfinite(depth):
+        return 1.0
+    if depth <= 0.0:
+        return 1.0
+    t = (float(depth) - near) / (far - near)
+    if t <= 0.0:
+        return 1.0
+    if t >= 1.0:
+        return min_alpha
+    return 1.0 - (1.0 - min_alpha) * t
+
 
 
 def shade_color(color: Sequence[int], factor: float) -> tuple[int, int, int]:
@@ -783,6 +874,14 @@ def shade_color(color: Sequence[int], factor: float) -> tuple[int, int, int]:
     return tuple(shaded)  # type: ignore[return-value]
 
 
+def _check_segments(segments: int) -> None:
+    """Проверить число отрезков кости (общая проверка цветов и alpha по глубине)."""
+    if isinstance(segments, bool) or not isinstance(segments, int):
+        raise ValueError(f"segments: ожидалось целое число, получено {segments!r}")
+    if segments < 1:
+        raise ValueError(f"segments: должно быть ≥ 1, получено {segments!r}")
+
+
 def bone_gradient_colors(
     color: Sequence[int],
     depth_start: float,
@@ -802,10 +901,7 @@ def bone_gradient_colors(
     полный цвет руки: кость выглядит как прежняя плоская линия. Неположительное число
     отрезков — ``ValueError``.
     """
-    if isinstance(segments, bool) or not isinstance(segments, int):
-        raise ValueError(f"segments: ожидалось целое число, получено {segments!r}")
-    if segments < 1:
-        raise ValueError(f"segments: должно быть ≥ 1, получено {segments!r}")
+    _check_segments(segments)
     if not (math.isfinite(depth_start) and math.isfinite(depth_end)):
         base = shade_color(color, 1.0)
         return (base,) * segments
@@ -815,6 +911,33 @@ def bone_gradient_colors(
     return tuple(
         shade_color(color, start_factor + step * ((index + 0.5) / segments))
         for index in range(segments)
+    )
+
+
+def bone_gradient_alphas(
+    depth_start: float,
+    depth_end: float,
+    *,
+    segments: int = DEPTH_BONE_SEGMENTS,
+) -> tuple[float, ...]:
+    """Alpha ``segments`` отрезков кости — по средней глубине концов отрезка (08g-fix2).
+
+    Ровно как у :func:`bone_gradient_colors`, но для прозрачности: параметр вдоль кости
+    ``t = (i + 0.5)/N`` переводится в глубину (линейно между глубинами концов), а alpha
+    берётся :func:`depth_alpha` в этой точке. Средняя глубина концов отрезка — это и есть
+    глубина его середины, поэтому вдоль кости виден не только градиент яркости, но и
+    градиент плотности: ближний конец плотный, дальний просвечивает.
+
+    Глубина хотя бы одного конца неизвестна (``NaN``/``±inf``) — все отрезки непрозрачны
+    (1.0): отсутствие данных не делает кость полупрозрачной. Неположительное число отрезков —
+    ``ValueError``.
+    """
+    _check_segments(segments)
+    if not (math.isfinite(depth_start) and math.isfinite(depth_end)):
+        return (1.0,) * segments
+    step = (float(depth_end) - float(depth_start)) / segments
+    return tuple(
+        depth_alpha(depth_start + step * (index + 0.5)) for index in range(segments)
     )
 
 
@@ -828,24 +951,224 @@ def _lerp_point(
     )
 
 
+def _draw_segment(
+    image: Any,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    color: tuple[int, int, int],
+    thickness: int,
+    alpha: float = 1.0,
+) -> None:
+    """Отрезок между пикселями: alpha 1.0 — обычный ``cv2.line``, иначе смешивание по маске.
+
+    ``cv2.line`` не умеет alpha, поэтому прозрачный отрезок рисуется в маску размером со свой
+    ограничивающий прямоугольник (:func:`_blend_line`), иначе на кадр лёг бы полупрозрачный
+    тёмный прямоугольник вокруг линии (та же ловушка, что у следа 08b).
+    """
+    import cv2  # noqa: PLC0415
+
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise ValueError(f"alpha: ожидалось число, получено {alpha!r}")
+    if not 0.0 < alpha <= 1.0:
+        raise ValueError(f"alpha: должно быть в (0, 1], получено {alpha!r}")
+    if alpha >= 1.0:
+        cv2.line(image, start, end, color, thickness, cv2.LINE_AA)
+        return
+    _blend_line(image, start, end, color, thickness, alpha)
+
+
 def _draw_bone(
     image: Any,
     first: camera_model.ProjectedPoint,
     second: camera_model.ProjectedPoint,
     color: tuple[int, int, int],
     style: Style,
+    alpha: float = 1.0,
 ) -> None:
     """Одна линия ``first → second`` цветом ``color`` (плоский режим и кость в одном множителе)."""
-    import cv2  # noqa: PLC0415
-
-    cv2.line(
+    _draw_segment(
         image,
         (_coord(first.u), _coord(first.v)),
         (_coord(second.u), _coord(second.v)),
         color,
         style.line_thickness,
+        alpha,
+    )
+
+
+def _blend_bone_gradient(
+    image: Any,
+    first: camera_model.ProjectedPoint,
+    second: camera_model.ProjectedPoint,
+    segment_colors: Sequence[tuple[int, int, int]],
+    segment_alphas: Sequence[float],
+    thickness: int,
+) -> bool:
+    """Кость с прозрачностью: цвет и alpha на отрезок, но смешивание **один раз** (08g-fix2).
+
+    Если рисовать каждый из :data:`DEPTH_BONE_SEGMENTS` отрезков отдельным
+    :func:`_blend_line`, то на стыках два антиалиасных конца ложатся друг на друга и смешивание
+    идёт дважды: на кадре появляются «бусины» — более плотные точки через каждые 20 % кости
+    (видно на 6× зуме). Поэтому кость кладётся в **одну** маску (cv2.line с AA), а затем
+    каждый пиксель маски относится к своему отрезку по проекции на ось кости
+    ``t = (P−A)·(B−A)/|B−A|²``; цвет и alpha берутся по номеру отрезка, и смешивание с кадром
+    происходит ровно один раз. Швов между отрезками нет, а ступенька цвета на границе
+    отрезков остаётся (это и есть градиент из 5 отрезков).
+
+    Возврат — было ли что рисовать (кость целиком вне кадра — ``False``).
+    """
+    import cv2  # noqa: PLC0415
+    import numpy as np  # noqa: PLC0415
+
+    if len(segment_colors) != len(segment_alphas):
+        raise ValueError("segment_colors и segment_alphas: разная длина")
+    start = (_coord(first.u), _coord(first.v))
+    end = (_coord(second.u), _coord(second.v))
+    height, width = image.shape[:2]
+    pad = thickness + 2
+    left = max(0, min(start[0], end[0]) - pad)
+    top = max(0, min(start[1], end[1]) - pad)
+    right = min(width, max(start[0], end[0]) + pad)
+    bottom = min(height, max(start[1], end[1]) + pad)
+    if right <= left or bottom <= top:
+        return False
+    mask = np.zeros((bottom - top, right - left), np.uint8)
+    cv2.line(
+        mask,
+        (start[0] - left, start[1] - top),
+        (end[0] - left, end[1] - top),
+        255,
+        thickness,
         cv2.LINE_AA,
     )
+    if not mask.any():
+        return False
+    ax, ay = start[0] - left, start[1] - top
+    bx, by = end[0] - left, end[1] - top
+    dx, dy = bx - ax, by - ay
+    rows, cols = np.mgrid[0 : mask.shape[0], 0 : mask.shape[1]]
+    length2 = dx * dx + dy * dy
+    if length2:
+        t = ((cols - ax) * dx + (rows - ay) * dy) / float(length2)
+    else:
+        t = np.zeros_like(cols, dtype=np.float32)
+    np.clip(t, 0.0, 1.0, out=t)
+    count = len(segment_colors)
+    index = np.minimum((t * count).astype(np.int32), count - 1)
+    colors = np.asarray(segment_colors, np.float32)[index]
+    alphas = np.asarray(segment_alphas, np.float32)[index]
+    weight = ((mask.astype(np.float32) / 255.0) * alphas)[..., None]
+    roi = image[top:bottom, left:right]
+    blended = roi.astype(np.float32) * (1.0 - weight) + colors * weight
+    roi[:] = np.rint(blended).astype(np.uint8)
+    return True
+
+
+def _depth_sort_key(depth: float) -> float:
+    """Ключ сортировки «дальние раньше»: неизвестная глубина — раньше всех (она непрозрачная)."""
+    return depth if math.isfinite(depth) else math.inf
+
+
+def _bone_mean_depth(depths: Mapping[str, float], bone: tuple[str, str]) -> float:
+    """Средняя глубина концов ребра (глубина его середины); без данных — ``inf``."""
+    start, end = bone
+    first, second = depths[start], depths[end]
+    if not (math.isfinite(first) and math.isfinite(second)):
+        return math.inf
+    return (first + second) / 2.0
+
+
+def _paint_bone(
+    image: Any,
+    first: camera_model.ProjectedPoint,
+    second: camera_model.ProjectedPoint,
+    color: tuple[int, int, int],
+    style: Style,
+    depth_start: float | None = None,
+    depth_end: float | None = None,
+    *,
+    shade: bool = True,
+    alpha: bool = False,
+) -> None:
+    """Нарисовать ребро: плоское, с градиентом яркости и/или прозрачности по глубине.
+
+    ``depth_start``/``depth_end`` — ``None`` в плоском режиме (одна линия полного цвета).
+    Иначе цвет и alpha идут вдоль кости :data:`DEPTH_BONE_SEGMENTS` отрезками: цвет — по
+    множителю в середине отрезка (:func:`bone_gradient_colors`), alpha — по средней глубине
+    его концов (:func:`bone_gradient_alphas`). Если вся кость в одном множителе и одной alpha
+    (дальний конец упёрся в пол, глубина неизвестна, у `--no-depth-alpha`), она рисуется одной
+    линией — ровно как плоская, без швов антиалиасинга между стыкующимися отрезками.
+    """
+    if depth_start is None or depth_end is None:
+        _draw_bone(image, first, second, color, style)
+        return
+    segment_colors = (
+        bone_gradient_colors(color, depth_start, depth_end)
+        if shade
+        else (shade_color(color, 1.0),) * DEPTH_BONE_SEGMENTS
+    )
+    segment_alphas = bone_gradient_alphas(depth_start, depth_end) if alpha else None
+    alphas_uniform = segment_alphas is None or len(set(segment_alphas)) == 1
+    if len(set(segment_colors)) == 1 and alphas_uniform:
+        _draw_bone(
+            image,
+            first,
+            second,
+            segment_colors[0],
+            style,
+            1.0 if segment_alphas is None else segment_alphas[0],
+        )
+        return
+    if segment_alphas is not None and any(value < 1.0 for value in segment_alphas):
+        if len(set(segment_colors)) == 1 and len(set(segment_alphas)) == 1:
+            _draw_bone(image, first, second, segment_colors[0], style, segment_alphas[0])
+        else:
+            _blend_bone_gradient(
+                image, first, second, segment_colors, segment_alphas, style.line_thickness
+            )
+        return
+    segments = len(segment_colors)
+    for index, segment_color in enumerate(segment_colors):
+        _draw_segment(
+            image,
+            _lerp_point(first, second, index / segments),
+            _lerp_point(first, second, (index + 1) / segments),
+            segment_color,
+            style.line_thickness,
+            1.0 if segment_alphas is None else segment_alphas[index],
+        )
+
+
+def _paint_point(
+    image: Any,
+    point: camera_model.ProjectedPoint,
+    color: tuple[int, int, int],
+    style: Style,
+    depth: float | None = None,
+    *,
+    shade: bool = True,
+    alpha: bool = False,
+) -> None:
+    """Нарисовать точку сустава: цвет и прозрачность по её глубине, обводка всегда чёрная.
+
+    Обводка не прозрачная намеренно: иначе дальняя точка «исчезает» на тёмном фоне, а на
+    светлом остаётся цветное пятно без границы. ``depth = None`` — плоский кадр 08a/08f.
+    """
+    import cv2  # noqa: PLC0415
+
+    center = (_coord(point.u), _coord(point.v))
+    fill_color = color
+    fill_alpha = 1.0
+    if depth is not None and math.isfinite(depth):
+        if shade:
+            fill_color = shade_color(color, depth_factor(depth))
+        if alpha:
+            fill_alpha = depth_alpha(depth)
+    if fill_alpha >= 1.0:
+        cv2.circle(image, center, style.point_radius, fill_color, -1, cv2.LINE_AA)
+    else:
+        _blend_point(image, center, style.point_radius, fill_color, fill_alpha)
+    cv2.circle(image, center, style.point_radius, OUTLINE_COLOR, OUTLINE_THICKNESS, cv2.LINE_AA)
 
 
 def draw_skeleton(
@@ -857,15 +1180,17 @@ def draw_skeleton(
     joints: Sequence[str] = JOINTS,
     bones: Sequence[tuple[str, str]] = HAND_CHAINS,
     depths: Mapping[str, Mapping[str, float]] | None = None,
+    alpha: bool = False,
+    shade: bool = True,
 ) -> int:
     """Нарисовать скелет на кадре (in place) и вернуть число видимых точек.
 
     ``joints``/``bones`` (08f) — набор суставов и рёбер одной руки; по умолчанию прежний
-    5-точечный скелет 08a. Порядок: сначала линии (под точками), потом точки. Пара, в
-    которой хотя бы одна точка невидима, линией не соединяется — иначе отрезок «прибил» бы
-    руку к точке за камерой, а ``NaN`` («нет данных», 04b) дал бы линию через дырку.
-    Точки, вышедшие за край кадра, всё равно рисуются: cv2 обрежет круг/отрезок по границе,
-    и видимая часть кисти останется на месте.
+    5-точечный скелет 08a. Порядок: сначала линии (под точками), потом точки: точка сустава
+    всегда остаётся видимой поверх своей кости. Пара, в которой хотя бы одна точка невидима,
+    линией не соединяется — иначе отрезок «прибил» бы руку к точке за камерой, а ``NaN``
+    («нет данных», 04b) дал бы линию через дырку. Точки, вышедшие за край кадра, всё равно
+    рисуются: cv2 обрежет круг/отрезок по границе, и видимая часть кисти останется на месте.
 
     ``depths`` (08g) — глубина суставов в системе камеры, ``side → joint → z`` (как у
     :func:`project_skeleton_depth`). Если передана, цвет руки умножается на
@@ -876,9 +1201,25 @@ def draw_skeleton(
     (глубина неизвестна). Обводка точки остаётся чёрной при любом множителе — контраст на
     светлом фоне сохраняется. ``None`` (по умолчанию) — плоские цвета 08a: одна линия на
     кость, та же картинка, что до 08g.
-    """
-    import cv2  # noqa: PLC0415 — локальный импорт: чистые функции модуля работают без OpenCV
 
+    ``alpha`` (08g-fix2) — второй канал глубины: у точки прозрачность по её глубине
+    (:func:`depth_alpha`), у кости — по средней глубине концов каждого отрезка
+    (:func:`bone_gradient_alphas`). Чтобы полупрозрачная дальняя кость не просвечивала поверх
+    непрозрачной ближней, в этом режиме кости и точки рисуются **от дальних к ближним**
+    (сортировка по ``z`` по убыванию, в пределах кадра обе руки): неизвестная глубина идёт
+    первой, точки — после всех костей. Без ``alpha`` порядок остаётся прежним (список
+    ``bones``, затем точки, левая рука, правая), поэтому кадр 08g-fix воспроизводится
+    побайтово.
+
+    ``shade=False`` — отключить множитель яркости, оставив прозрачность: это режим «только
+    alpha» для сравнения каналов (CLI такого флага не имеет, см. ``docs/overlay.md``).
+    Плоский кадр (``depths=None``) он не трогает.
+    """
+    for name, value in (("alpha", alpha), ("shade", shade)):
+        if not isinstance(value, bool):
+            raise ValueError(f"{name}: ожидалось bool, получено {value!r}")
+    if alpha and depths is None:
+        raise ValueError("alpha: прозрачность по глубине невозможна без depths")
     if not isinstance(style, Style):
         raise ValueError(f"style: ожидался Style, получено {style!r}")
     if image is None or getattr(image, "ndim", 0) != 3:
@@ -896,65 +1237,124 @@ def draw_skeleton(
                 )
     if depths is not None and not isinstance(depths, Mapping):
         raise ValueError(f"depths: ожидался Mapping side → joint → z, получено {depths!r}")
-    drawn = 0
+
+    hands: dict[str, Mapping[str, camera_model.ProjectedPoint]] = {}
+    hand_depths: dict[str, Mapping[str, float]] = {}
     for side in ("left", "right"):
-        color = colors[side]
         hand = pixels.get(side)
         if hand is None:
             raise ValueError(f"pixels: нет руки {side!r}")
         missing = [joint for joint in names if joint not in hand]
         if missing:
             raise ValueError(f"pixels[{side!r}]: нет суставов {missing}")
-        hand_depths = None if depths is None else depths.get(side)
+        hands[side] = hand
         if depths is not None:
-            if hand_depths is None:
+            side_depths = depths.get(side)
+            if side_depths is None:
                 raise ValueError(f"depths: нет руки {side!r}")
-            missing = [joint for joint in names if joint not in hand_depths]
+            missing = [joint for joint in names if joint not in side_depths]
             if missing:
                 raise ValueError(f"depths[{side!r}]: нет суставов {missing}")
+            hand_depths[side] = side_depths
+
+    if depths is None:
+        # плоский кадр 08a/08f: кости в порядке списка, затем точки; руки — левая, правая
+        drawn = 0
+        for side in ("left", "right"):
+            for start, end in pairs:
+                first, second = hands[side][start], hands[side][end]
+                if first.visible and second.visible:
+                    _paint_bone(image, first, second, colors[side], style)
+            for joint in names:
+                point = hands[side][joint]
+                if point.visible:
+                    _paint_point(image, point, colors[side], style)
+                    drawn += 1
+        return drawn
+
+    if not alpha:
+        # 08g-fix: только яркость, порядок костей — как в списке ``bones``
+        drawn = 0
+        for side in ("left", "right"):
+            for start, end in pairs:
+                first, second = hands[side][start], hands[side][end]
+                if first.visible and second.visible:
+                    _paint_bone(
+                        image,
+                        first,
+                        second,
+                        colors[side],
+                        style,
+                        hand_depths[side][start],
+                        hand_depths[side][end],
+                        shade=shade,
+                    )
+            for joint in names:
+                point = hands[side][joint]
+                if point.visible:
+                    _paint_point(
+                        image,
+                        point,
+                        colors[side],
+                        style,
+                        hand_depths[side][joint],
+                        shade=shade,
+                    )
+                    drawn += 1
+        return drawn
+
+    # 08g-fix2: alpha как второй канал — сначала все кости от дальних к ближним, затем точки
+    # от дальних к ближним (точка сустава должна остаться видимой поверх своей кости)
+    bones_plan: list[
+        tuple[float, str, camera_model.ProjectedPoint, camera_model.ProjectedPoint, float, float]
+    ] = []
+    for side in ("left", "right"):
         for start, end in pairs:
-            first, second = hand[start], hand[end]
+            first, second = hands[side][start], hands[side][end]
             if not (first.visible and second.visible):
                 continue
-            if hand_depths is None:
-                _draw_bone(image, first, second, color, style)
-                continue
-            depth_start = hand_depths[start]
-            depth_end = hand_depths[end]
-            segment_colors = bone_gradient_colors(color, depth_start, depth_end)
-            if len(set(segment_colors)) == 1:
-                # вся кость в одном множителе (дальний конец упёрся в пол, глубина неизвестна):
-                # одна линия — ровно как в плоском режиме 08f, без швов антиалиасинга
-                _draw_bone(image, first, second, segment_colors[0], style)
-                continue
-            segments = len(segment_colors)
-            for index, segment_color in enumerate(segment_colors):
-                t0 = index / segments
-                t1 = (index + 1) / segments
-                cv2.line(
-                    image,
-                    _lerp_point(first, second, t0),
-                    _lerp_point(first, second, t1),
-                    segment_color,
-                    style.line_thickness,
-                    cv2.LINE_AA,
+            depth_start = hand_depths[side][start]
+            depth_end = hand_depths[side][end]
+            bones_plan.append(
+                (
+                    _bone_mean_depth(hand_depths[side], (start, end)),
+                    side,
+                    first,
+                    second,
+                    depth_start,
+                    depth_end,
                 )
-        for joint in names:
-            point = hand[joint]
-            if not point.visible:
-                continue
-            center = (_coord(point.u), _coord(point.v))
-            fill_color = color
-            if hand_depths is not None:
-                depth = hand_depths[joint]
-                if math.isfinite(depth):
-                    fill_color = shade_color(color, depth_factor(depth))
-            cv2.circle(image, center, style.point_radius, fill_color, -1, cv2.LINE_AA)
-            cv2.circle(
-                image, center, style.point_radius, OUTLINE_COLOR, OUTLINE_THICKNESS, cv2.LINE_AA
             )
-            drawn += 1
-    return drawn
+    bones_plan.sort(key=lambda item: item[0], reverse=True)
+    for _, side, first, second, depth_start, depth_end in bones_plan:
+        _paint_bone(
+            image,
+            first,
+            second,
+            colors[side],
+            style,
+            depth_start,
+            depth_end,
+            shade=shade,
+            alpha=True,
+        )
+    points_plan: list[tuple[float, str, str]] = []
+    for side in ("left", "right"):
+        for joint in names:
+            if hands[side][joint].visible:
+                points_plan.append((_depth_sort_key(hand_depths[side][joint]), side, joint))
+    points_plan.sort(key=lambda item: item[0], reverse=True)
+    for _, side, joint in points_plan:
+        _paint_point(
+            image,
+            hands[side][joint],
+            colors[side],
+            style,
+            hand_depths[side][joint],
+            shade=shade,
+            alpha=True,
+        )
+    return len(points_plan)
 
 
 def _trail_window(seconds: float, step_s: float) -> int:
@@ -1069,13 +1469,87 @@ def _blend_line(
         thickness,
         cv2.LINE_AA,
     )
+    return _blend_mask(image, mask, left, top, color, alpha)
+
+
+def _blend_mask(
+    image: Any,
+    mask: Any,
+    left: int,
+    top: int,
+    color: tuple[int, int, int],
+    alpha: float,
+) -> bool:
+    """Смешать пиксели кадра с ``color`` по маске в позиции ``(left, top)`` (08b, 08g-fix2).
+
+    Общая часть :func:`_blend_line` и :func:`_blend_point`: OpenCV не умеет alpha в
+    примитивах, поэтому сначала примитив рисуется в одноканальную маску, а затем кадр
+    смешивается с цветом только там, где маска ненулевая. Иначе вокруг линии или круга лёг
+    бы полупрозрачный тёмный прямоугольник (ловушка из NOTES 08b). Возврат — было ли что
+    рисовать (маска не пуста).
+    """
+    import numpy as np  # noqa: PLC0415
+
+    if mask is None or getattr(mask, "ndim", 0) != 2:
+        raise ValueError("mask: ожидалась одноканальная маска")
     if not mask.any():
         return False
     weight = (mask.astype(np.float32) * (alpha / 255.0))[..., None]
-    roi = image[top:bottom, left:right]
+    height, width = mask.shape[:2]
+    roi = image[top : top + height, left : left + width]
     blended = roi.astype(np.float32) * (1.0 - weight) + np.asarray(color, np.float32) * weight
     roi[:] = np.rint(blended).astype(np.uint8)
     return True
+
+
+def _blend_point(
+    image: Any,
+    center: tuple[int, int],
+    radius: int,
+    color: tuple[int, int, int],
+    alpha: float,
+) -> bool:
+    """Круг с прозрачностью ``alpha``, только по своей маске (возврат — нарисован ли).
+
+    Аналог :func:`_blend_line` для точки сустава (08g-fix2): ``cv2.circle`` не умеет alpha,
+    поэтому круг кладётся в маску размером со свой bbox, и кадр смешивается с цветом только
+    там, где маска ненулевая — иначе вокруг точки появилось бы полупрозрачное тёмное пятно
+    на пёстром фоне. Антиалиасинг края сохраняется (``cv2.LINE_AA`` в маске).
+    """
+    import cv2  # noqa: PLC0415
+    import numpy as np  # noqa: PLC0415
+
+    if isinstance(center, bool) or not isinstance(center, tuple) or len(center) != 2:
+        raise ValueError(f"center: ожидалась пара (x, y), получено {center!r}")
+    for value in center:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"center: ожидались целые координаты, получено {center!r}")
+    if isinstance(radius, bool) or not isinstance(radius, int) or radius < 1:
+        raise ValueError(f"radius: ожидалось целое ≥ 1, получено {radius!r}")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise ValueError(f"alpha: ожидалось число, получено {alpha!r}")
+    if not 0.0 < alpha <= 1.0:
+        raise ValueError(f"alpha: должно быть в (0, 1], получено {alpha!r}")
+
+    height, width = image.shape[:2]
+    pad = radius + 2
+    left = max(0, center[0] - pad)
+    top = max(0, center[1] - pad)
+    right = min(width, center[0] + pad)
+    bottom = min(height, center[1] + pad)
+    if right <= left or bottom <= top:
+        return False  # точка целиком вне кадра
+
+    mask = np.zeros((bottom - top, right - left), np.uint8)
+    cv2.circle(
+        mask,
+        (center[0] - left, center[1] - top),
+        radius,
+        255,
+        -1,
+        cv2.LINE_AA,
+    )
+    return _blend_mask(image, mask, left, top, color, alpha)
 
 
 def draw_trail(
@@ -1284,12 +1758,17 @@ def _draw_pose(
     skeleton: Skeleton = FIVE_POINT,
     *,
     depth_shading: bool = False,
+    depth_alpha: bool = False,
 ) -> int:
     """Спроецировать скелет кадра и нарисовать его на уже обрезанном кадре глаза.
 
     ``depth_shading`` (08g) — красить ли по глубине: тогда вместе с пикселями считается
     ``z`` в системе камеры (:func:`project_skeleton_depth`), и цвет кости/точки гаснет с
     расстоянием. По умолчанию выключено: кадр 08a воспроизводится без изменений.
+
+    ``depth_alpha`` (08g-fix2) — прозрачность по глубине (только вместе с ``depth_shading``:
+    без глубин её не из чего считать). Порядок отрисовки в этом режиме — от дальних костей и
+    точек к ближним, см. :func:`draw_skeleton`.
     """
     if depth_shading:
         pixels, depths = project_skeleton_depth(
@@ -1306,7 +1785,13 @@ def _draw_pose(
         if target > style.line_thickness:
             draw_style = Style(point_radius=style.point_radius, line_thickness=target)
     return draw_skeleton(
-        image, pixels, draw_style, joints=skeleton.joints, bones=skeleton.bones, depths=depths
+        image,
+        pixels,
+        draw_style,
+        joints=skeleton.joints,
+        bones=skeleton.bones,
+        depths=depths,
+        alpha=depth_shading and depth_alpha,
     )
 
 
@@ -1389,6 +1874,8 @@ class RenderStats:
     joints_per_hand: int = 5
     #: 08g: красился ли скелет по глубине (множитель к цвету руки).
     depth_shading: bool = False
+    #: 08g-fix2: включалась ли прозрачность по глубине (второй канал, сортировка по z).
+    depth_alpha: bool = False
 
     @property
     def frames(self) -> int:
@@ -1441,6 +1928,7 @@ def render_video(
     trail_seconds: float = TRAIL_SECONDS,
     skeleton: Skeleton = FIVE_POINT,
     depth_shading: bool | None = None,
+    depth_alpha: bool | None = None,
     log: Callable[[str], None] = print,
 ) -> RenderStats:
     """Отрендерить диапазон кадров ``start…end`` в ``out`` и вернуть :class:`RenderStats`.
@@ -1460,6 +1948,11 @@ def render_video(
     ``depth_shading`` (08g) — кодировать ли глубину цветом: ``None`` — авторежим
     (:func:`resolve_depth_shading`: да для густого скелета, нет для 5-точечного 08a),
     ``True``/``False`` — принудительно.
+
+    ``depth_alpha`` (08g-fix2) — прозрачность по глубине (второй канал): авторежим
+    (:func:`resolve_depth_alpha`) включается вместе с яркостью для густого скелета и
+    ``--all-joints``; без ``depth_shading`` не включается, потому что глубины не считаются.
+    Явное ``False`` — «только яркость», кадр 08g-fix.
     """
     import cv2  # noqa: PLC0415
 
@@ -1472,6 +1965,7 @@ def render_video(
             raise ValueError(f"{name}: ожидалось bool, получено {value!r}")
     _require_skeleton_track(scene.track, skeleton)
     shading = resolve_depth_shading(depth_shading, skeleton)
+    transparency = shading and resolve_depth_alpha(depth_alpha, skeleton)
     if trail:
         _trail_window(trail_seconds, TRAIL_STEP_S)  # проверка окна до открытия файлов
     video = Path(video)
@@ -1511,7 +2005,13 @@ def render_video(
                         view, pose, scene.track, scene.intrinsics, style, seconds=trail_seconds
                     )
                 joints += _draw_pose(
-                    view, pose, scene, style, skeleton, depth_shading=shading
+                    view,
+                    pose,
+                    scene,
+                    style,
+                    skeleton,
+                    depth_shading=shading,
+                    depth_alpha=transparency,
                 )
                 if hud:
                     draw_hud(
@@ -1564,6 +2064,7 @@ def render_video(
         skeleton=skeleton.name,
         joints_per_hand=len(skeleton.joints),
         depth_shading=shading,
+        depth_alpha=transparency,
     )
 
 
@@ -1579,6 +2080,7 @@ def render_stills(
     trail_seconds: float = TRAIL_SECONDS,
     skeleton: Skeleton = FIVE_POINT,
     depth_shading: bool | None = None,
+    depth_alpha: bool | None = None,
     log: Callable[[str], None] = print,
 ) -> list[Path]:
     """Сохранить PNG-кадры с наложением (по умолчанию 5 отладочных кадров 07a).
@@ -1593,6 +2095,8 @@ def render_stills(
     ``depth_shading`` (08g) — как у :func:`render_video`: ``None`` — авторежим (да для густого
     скелета, нет для 5-точечного 08a), ``True``/``False`` — принудительно; на PNG это
     видно без кодирования видео, поэтому «до/после» снимается именно ``--stills``.
+    ``depth_alpha`` (08g-fix2) — как у :func:`render_video`: прозрачность по глубине
+    (авторежим как у яркости, без яркости не включается).
     """
     import cv2  # noqa: PLC0415
 
@@ -1603,6 +2107,7 @@ def render_stills(
     style = style_for(scene.eye_size[0], scale)
     _require_skeleton_track(scene.track, skeleton)
     shading = resolve_depth_shading(depth_shading, skeleton)
+    transparency = shading and resolve_depth_alpha(depth_alpha, skeleton)
     if trail:
         _trail_window(trail_seconds, TRAIL_STEP_S)
     out = Path(out_dir)
@@ -1628,7 +2133,13 @@ def render_stills(
                     view, pose, scene.track, scene.intrinsics, style, seconds=trail_seconds
                 )
             drawn = _draw_pose(
-                view, pose, scene, style, skeleton, depth_shading=shading
+                view,
+                pose,
+                scene,
+                style,
+                skeleton,
+                depth_shading=shading,
+                depth_alpha=transparency,
             )
             if hud:
                 draw_hud(
@@ -1665,9 +2176,15 @@ def _format_stats(stats: RenderStats) -> str:
     )
     if stats.depth_shading:
         shading_line = (
-            f"да (окно {DEPTH_NEAR_M:g}…{DEPTH_FAR_M:g} м, множитель "
-            f"{DEPTH_MIN_FACTOR:g}…1.0)"
+            f"яркость: окно {DEPTH_NEAR_M:g}…{DEPTH_FAR_M:g} м, множитель "
+            f"{DEPTH_MIN_FACTOR:g}…1.0"
         )
+        if stats.depth_alpha:
+            shading_line += (
+                f"; alpha: {DEPTH_MIN_ALPHA:g}…1.0, дальние раньше ближних"
+            )
+        else:
+            shading_line += "; только яркость, без alpha (кадр 08g-fix)"
     else:
         shading_line = "нет (плоские цвета рук)"
     lines = [
@@ -1752,10 +2269,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="плоские цвета рук, как в 08f (кадр 5 точек 08a воспроизводится без изменений)",
     )
+    alpha_group = parser.add_mutually_exclusive_group()
+    alpha_group.add_argument(
+        "--depth-alpha",
+        dest="depth_alpha",
+        action="store_true",
+        default=None,
+        help="прозрачность по глубине принудительно (по умолчанию — для густого скелета)",
+    )
+    alpha_group.add_argument(
+        "--no-depth-alpha",
+        dest="depth_alpha",
+        action="store_false",
+        default=None,
+        help="только яркость, без прозрачности (кадр 08g-fix)",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     skeleton = ALL_JOINTS if args.all_joints else FIVE_POINT if args.five_points else DEFAULT_SKELETON
     depth_shading = resolve_depth_shading(args.depth_shading, skeleton)
+    if args.depth_alpha is True and args.depth_shading is not False:
+        # alpha считается из глубин: явный --depth-alpha включает и яркость (кроме
+        # --no-depth-color, который отключает всё разом)
+        depth_shading = True
+    depth_alpha = depth_shading and resolve_depth_alpha(args.depth_alpha, skeleton)
     try:
         scene = load_scene(args.meta, args.tracking, extra_keys=skeleton.extra_keys)
         if args.time_offset_ms is not None:
@@ -1787,6 +2324,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else ""
             )
         )
+        print(
+            f"глубина → alpha: {'да' if depth_alpha else 'нет'}"
+            + (f" (пол {DEPTH_MIN_ALPHA:g}, дальние раньше ближних)" if depth_alpha else "")
+        )
         trail = not args.no_trail
         hud = not args.no_hud
         if args.stills is not None:
@@ -1801,6 +2342,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 trail_seconds=args.trail_seconds,
                 skeleton=skeleton,
                 depth_shading=depth_shading,
+                depth_alpha=depth_alpha,
             )
             print(f"PNG с наложением: {len(paths)} файлов в {args.stills}")
             return 0
@@ -1819,6 +2361,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             trail_seconds=args.trail_seconds,
             skeleton=skeleton,
             depth_shading=depth_shading,
+            depth_alpha=depth_alpha,
         )
     except (OSError, ValueError) as exc:
         print(f"ошибка: {exc}", file=sys.stderr)
