@@ -1408,6 +1408,74 @@ class DenseRenderTest(SyntheticVideoCase):
         five_on = still("alpha_five_on", "--five-points", "--depth-alpha")
         self.assertFalse(np.array_equal(five, five_on))
 
+    def test_render_reports_depth_relative(self) -> None:
+        """08g-fix3: относительная шкала — авторежим как у яркости, без яркости не включается."""
+        dense = ov.render_video(
+            self.video, self.out, self._dense_scene(), progress_every=0, log=lambda _: None,
+            skeleton=ov.DENSE,
+        )
+        self.assertTrue(dense.depth_shading)
+        self.assertTrue(dense.depth_relative)
+        five = ov.render_video(
+            self.video, self.out, self._scene(), progress_every=0, log=lambda _: None,
+            skeleton=ov.FIVE_POINT,
+        )
+        self.assertFalse(five.depth_relative)
+        absolute = ov.render_video(
+            self.video, self.out, self._dense_scene(), progress_every=0, log=lambda _: None,
+            skeleton=ov.DENSE, depth_relative=False,
+        )
+        self.assertFalse(absolute.depth_relative)
+        self.assertTrue(absolute.depth_shading)
+        self.assertTrue(absolute.depth_alpha)
+        no_color = ov.render_video(
+            self.video, self.out, self._dense_scene(), progress_every=0, log=lambda _: None,
+            skeleton=ov.DENSE, depth_shading=False, depth_relative=True,
+        )
+        self.assertFalse(no_color.depth_relative)
+        self.assertFalse(no_color.depth_shading)
+
+    def test_cli_depth_relative_flag(self) -> None:
+        """08g-fix3: ``--depth-relative``/``--no-depth-relative``; ``--no-depth-alpha`` = 08g-fix."""
+        import contextlib
+        import io
+
+        def still(name: str, *flags: str) -> np.ndarray:
+            out = self.dir / name
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = ov.main(
+                    [
+                        str(self.video), "--stills", str(out), "--frames", "5",
+                        "--tracking", str(self.tracking), "--meta", str(self.meta_path), *flags,
+                    ]
+                )
+            self.assertEqual(code, 0)
+            image = cv2.imread(str(out / "frame_00005.png"))
+            self.assertIsNotNone(image)
+            return image
+
+        default = still("rel_default")
+        explicit = still("rel_explicit", "--depth-relative")
+        self.assertTrue(np.array_equal(default, explicit))
+        absolute = still("rel_absolute", "--no-depth-relative")
+        self.assertFalse(np.array_equal(default, absolute))
+        # согласовано с пользователем: --no-depth-alpha без явного --depth-relative =
+        # абсолютная яркость 08g-fix
+        no_alpha = still("rel_no_alpha", "--no-depth-alpha")
+        absolute_no_alpha = still(
+            "rel_absolute_no_alpha", "--no-depth-relative", "--no-depth-alpha"
+        )
+        self.assertTrue(np.array_equal(no_alpha, absolute_no_alpha))
+        # но явный --depth-relative возвращает относительную яркость и без alpha
+        relative_no_alpha = still(
+            "rel_relative_no_alpha", "--depth-relative", "--no-depth-alpha"
+        )
+        self.assertFalse(np.array_equal(no_alpha, relative_no_alpha))
+        # --no-depth-color отключает всё разом, относительность ничего не возвращает
+        flat = still("rel_flat", "--no-depth-color")
+        flat_relative = still("rel_flat_relative", "--no-depth-color", "--depth-relative")
+        self.assertTrue(np.array_equal(flat, flat_relative))
+
 
 # --- 08g: глубина → интенсивность цвета --------------------------------------------------
 
@@ -1841,6 +1909,296 @@ class DepthAlphaTest(unittest.TestCase):
             ov.resolve_depth_alpha(1, ov.DENSE)
         with self.assertRaises(ValueError):
             ov.resolve_depth_alpha(None, "dense")
+
+
+class DepthReferenceTest(unittest.TestCase):
+    """08g-fix3: опорная точка руки — min по конечным положительным глубинам."""
+
+    def test_empty_and_unusable_input_gives_none(self) -> None:
+        self.assertIsNone(ov.depth_reference([]))
+        self.assertIsNone(ov.depth_reference(iter(())))
+        self.assertIsNone(ov.depth_reference([math.nan, math.inf, -math.inf]))
+        # ноль и отрицательные — «нет данных»/за камерой, а не ближайшая точка
+        self.assertIsNone(ov.depth_reference([-1.0, -0.001, 0.0]))
+        self.assertIsNone(ov.depth_reference([math.nan, 0.0, -2.0]))
+
+    def test_picks_minimum_finite_positive(self) -> None:
+        self.assertEqual(ov.depth_reference([0.4, 0.25, math.nan, 0.9]), 0.25)
+        # inf и глубина за камерой не участвуют в минимуме
+        self.assertEqual(ov.depth_reference([math.inf, 0.3, -1.0, 0.2]), 0.2)
+        self.assertEqual(ov.depth_reference([1.0]), 1.0)
+        # итератор, а не список, тоже подходит (depths.values() — генератор-представление)
+        self.assertEqual(ov.depth_reference({"a": 0.5, "b": 0.2}.values()), 0.2)
+
+    def test_validation(self) -> None:
+        for bad in ([True], ["0.3"], [None]):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                ov.depth_reference(bad)
+
+
+class RelativeDepthTest(unittest.TestCase):
+    """08g-fix3: относительная глубина — сдвиг точки отсчёта без смены формы шкалы."""
+
+    def test_subtracts_the_reference(self) -> None:
+        self.assertAlmostEqual(ov.relative_depth(0.4, 0.25), 0.15, places=12)
+        self.assertEqual(ov.relative_depth(0.3, 0.3), 0.0)
+        self.assertAlmostEqual(ov.relative_depth(0.7, 0.3), 0.4, places=12)
+
+    def test_zero_reference_is_the_old_absolute_depth(self) -> None:
+        for depth in (0.01, 0.22, 0.34, 0.48, 1.0):
+            with self.subTest(depth=depth):
+                self.assertEqual(ov.relative_depth(depth, 0.0), depth)
+
+    def test_monotone_in_depth(self) -> None:
+        values = [ov.relative_depth(depth, 0.3) for depth in (0.30, 0.31, 0.35, 0.40, 0.50)]
+        for previous, current in zip(values, values[1:]):
+            self.assertLess(previous, current)
+
+    def test_non_finite_passes_through(self) -> None:
+        self.assertTrue(math.isnan(ov.relative_depth(math.nan, 0.3)))
+        self.assertEqual(ov.relative_depth(math.inf, 0.3), math.inf)
+
+    def test_validation(self) -> None:
+        for depth, z_ref in ((True, 0.3), ("0.4", 0.3), (0.4, True), (0.4, "0.3")):
+            with self.subTest(depth=depth, z_ref=z_ref), self.assertRaises(ValueError):
+                ov.relative_depth(depth, z_ref)  # type: ignore[arg-type]
+
+
+class DepthFactorRelativeTest(unittest.TestCase):
+    """08g-fix3: z_ref сдвигает только точку отсчёта; края, NaN и z ≤ 0 — как раньше."""
+
+    def test_zero_reference_reproduces_absolute_behaviour(self) -> None:
+        for depth in (0.0, -1.0, 0.1, ov.DEPTH_NEAR_M, 0.30, 0.34, ov.DEPTH_FAR_M, 5.0):
+            with self.subTest(depth=depth):
+                self.assertEqual(
+                    ov.depth_factor(depth, z_ref=0.0), ov.depth_factor(depth)
+                )
+                self.assertEqual(
+                    ov.depth_alpha(depth, z_ref=0.0), ov.depth_alpha(depth)
+                )
+
+    def test_edges_are_exact_in_relative_window(self) -> None:
+        # числа, представимые в двоичной дроби: z_ref=0.25, far=0.125
+        self.assertEqual(
+            ov.depth_factor(0.25, near=0.0, far=0.125, z_ref=0.25), 1.0
+        )
+        self.assertEqual(
+            ov.depth_factor(0.375, near=0.0, far=0.125, z_ref=0.25),
+            ov.DEPTH_MIN_FACTOR,
+        )
+        self.assertEqual(
+            ov.depth_alpha(0.25, near=0.0, far=0.125, z_ref=0.25), 1.0
+        )
+        self.assertEqual(
+            ov.depth_alpha(0.375, near=0.0, far=0.125, z_ref=0.25),
+            ov.DEPTH_MIN_ALPHA,
+        )
+
+    def test_shift_changes_only_the_reference(self) -> None:
+        # одинаковая относительная позиция на разной абсолютной глубине — тот же множитель
+        for depth in (0.30, 0.34, 0.40):
+            with self.subTest(depth=depth):
+                self.assertAlmostEqual(
+                    ov.depth_factor(depth, near=0.0, far=0.16, z_ref=0.28),
+                    ov.depth_factor(depth - 0.28 + 0.5, near=0.0, far=0.16, z_ref=0.5),
+                    places=12,
+                )
+
+    def test_relative_scale_reaches_floor_over_the_spread(self) -> None:
+        z_ref = 0.50
+        bright = {
+            depth: ov.depth_factor(depth, near=0.0, far=ov.DEPTH_RELATIVE_FAR_M, z_ref=z_ref)
+            for depth in (0.50, 0.58, 0.66)
+        }
+        self.assertEqual(bright[0.50], 1.0)
+        self.assertGreater(bright[0.50], bright[0.58])
+        self.assertGreater(bright[0.58], bright[0.66])
+        self.assertAlmostEqual(bright[0.66], ov.DEPTH_MIN_FACTOR, places=12)
+
+    def test_unknown_and_behind_camera_are_full_colour(self) -> None:
+        for depth in (math.nan, math.inf, -math.inf, -1.0, 0.0):
+            with self.subTest(depth=depth):
+                # абсолютный режим (z_ref=0) и относительный — одинаковый фолбэк
+                self.assertEqual(ov.depth_factor(depth), 1.0)
+                self.assertEqual(ov.depth_alpha(depth), 1.0)
+                self.assertEqual(
+                    ov.depth_factor(depth, near=0.0, far=0.16, z_ref=0.3), 1.0
+                )
+                self.assertEqual(
+                    ov.depth_alpha(depth, near=0.0, far=0.16, z_ref=0.3), 1.0
+                )
+
+    def test_window_validation(self) -> None:
+        # near = 0 — законная граница только с ненулевой опорной точкой
+        with self.assertRaises(ValueError):
+            ov.depth_factor(0.4, near=0.0)
+        with self.assertRaises(ValueError):
+            ov.depth_alpha(0.4, near=0.0)
+        ov.depth_factor(0.4, near=0.0, far=0.16, z_ref=0.3)
+        ov.depth_alpha(0.4, near=0.0, far=0.16, z_ref=0.3)
+        with self.assertRaises(ValueError):
+            ov.depth_factor(0.4, near=-0.1, far=0.16, z_ref=0.3)
+        with self.assertRaises(ValueError):
+            ov.depth_factor(0.4, near=0.0, far=0.16, z_ref=math.nan)
+        with self.assertRaises(ValueError):
+            ov.depth_alpha(0.4, near=0.0, far=0.16, z_ref=True)
+
+
+class BoneGradientRelativeTest(unittest.TestCase):
+    """08g-fix3: градиент вдоль кости считается от z_ref руки, а не от шлема."""
+
+    def test_shifted_bone_gets_the_same_gradient(self) -> None:
+        base = ov.bone_gradient_colors(
+            ov.COLORS["left"], 0.35, 0.40, z_ref=0.30, near=0.0, far=0.16
+        )
+        shifted = ov.bone_gradient_colors(
+            ov.COLORS["left"], 0.45, 0.50, z_ref=0.40, near=0.0, far=0.16
+        )
+        self.assertEqual(base, shifted)
+
+    def test_colours_match_midpoint_factors_in_relative_window(self) -> None:
+        start, end = 0.32, 0.40
+        z_ref, near, far = 0.30, 0.0, ov.DEPTH_RELATIVE_FAR_M
+        colors = ov.bone_gradient_colors(
+            ov.COLORS["left"], start, end, z_ref=z_ref, near=near, far=far
+        )
+        factors = [
+            ov.depth_factor(depth, near=near, far=far, z_ref=z_ref)
+            for depth in (start, end)
+        ]
+        step = factors[1] - factors[0]
+        for index, color in enumerate(colors):
+            expected = ov.shade_color(
+                ov.COLORS["left"], factors[0] + step * ((index + 0.5) / len(colors))
+            )
+            self.assertEqual(color, expected)
+
+    def test_alphas_match_midpoint_depth_in_relative_window(self) -> None:
+        start, end = 0.32, 0.40
+        z_ref = 0.30
+        values = ov.bone_gradient_alphas(
+            start, end, z_ref=z_ref, near=0.0, far=ov.DEPTH_RELATIVE_FAR_M
+        )
+        step = (end - start) / len(values)
+        for index, value in enumerate(values):
+            self.assertAlmostEqual(
+                value,
+                ov.depth_alpha(
+                    start + step * (index + 0.5), near=0.0, far=ov.DEPTH_RELATIVE_FAR_M,
+                    z_ref=z_ref,
+                ),
+                places=12,
+            )
+
+
+class ResolveDepthRelativeTest(unittest.TestCase):
+    """08g-fix3: авторежим относительной шкалы — как у яркости/alpha."""
+
+    def test_auto_mode_follows_skeleton(self) -> None:
+        self.assertTrue(ov.resolve_depth_relative(None, ov.DENSE))
+        self.assertTrue(ov.resolve_depth_relative(None, ov.ALL_JOINTS))
+        self.assertFalse(ov.resolve_depth_relative(None, ov.FIVE_POINT))
+        clone = ov.Skeleton("five", "5 точек", ov.JOINTS, ov.HAND_CHAINS)
+        self.assertFalse(ov.resolve_depth_relative(None, clone))
+
+    def test_explicit_flag_overrides_auto_mode(self) -> None:
+        self.assertTrue(ov.resolve_depth_relative(True, ov.FIVE_POINT))
+        self.assertFalse(ov.resolve_depth_relative(False, ov.DENSE))
+
+    def test_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            ov.resolve_depth_relative(1, ov.DENSE)
+        with self.assertRaises(ValueError):
+            ov.resolve_depth_relative("yes", ov.DENSE)
+        with self.assertRaises(ValueError):
+            ov.resolve_depth_relative(None, "dense")
+
+
+@unittest.skipIf(cv2 is None, NO_CV2)
+class RelativeDepthDrawTest(unittest.TestCase):
+    """08g-fix3: у каждой руки своя опорная точка — ближний сустав каждой получает 1.0."""
+
+    def setUp(self) -> None:
+        self.style = ov.style_for(1080)
+        self.pixels = {
+            "left": {
+                "palm": camera_model.ProjectedPoint(100.0, 100.0, True),
+                "thumb": camera_model.ProjectedPoint(300.0, 100.0, True),
+            },
+            "right": {
+                "palm": camera_model.ProjectedPoint(600.0, 100.0, True),
+                "thumb": camera_model.ProjectedPoint(800.0, 100.0, True),
+            },
+        }
+        self.joints = ("palm", "thumb")
+        self.bones = (("palm", "thumb"),)
+        # у обеих рук разброс 0.10 м, но абсолютно правая на 0.30 м дальше
+        self.depths = {
+            "left": {"palm": 0.30, "thumb": 0.40},
+            "right": {"palm": 0.60, "thumb": 0.70},
+        }
+
+    def _draw(self, relative: bool) -> np.ndarray:
+        image = np.zeros((810, 1080, 3), np.uint8)
+        ov.draw_skeleton(
+            image,
+            self.pixels,
+            self.style,
+            joints=self.joints,
+            bones=self.bones,
+            depths=self.depths,
+            relative=relative,
+        )
+        return image
+
+    def test_each_hand_has_its_own_reference(self) -> None:
+        left_ref = ov.depth_reference(self.depths["left"].values())
+        right_ref = ov.depth_reference(self.depths["right"].values())
+        self.assertEqual(left_ref, 0.30)
+        self.assertEqual(right_ref, 0.60)
+        self.assertNotEqual(left_ref, right_ref)
+
+    def test_near_joint_of_each_hand_is_full_colour(self) -> None:
+        image = self._draw(True)
+        # в абсолютной шкале правая рука была бы на полу, в относительной — полный цвет
+        self.assertEqual(tuple(int(v) for v in image[100, 100]), ov.COLORS["left"])
+        self.assertEqual(tuple(int(v) for v in image[100, 600]), ov.COLORS["right"])
+        # одна и та же доля разброса даёт один и тот же множитель у обеих рук
+        spread = 0.10
+        far_factor = ov.depth_factor(
+            0.30 + spread, near=0.0, far=ov.DEPTH_RELATIVE_FAR_M, z_ref=0.30
+        )
+        self.assertEqual(
+            tuple(int(v) for v in image[100, 300]),
+            ov.shade_color(ov.COLORS["left"], far_factor),
+        )
+        self.assertEqual(
+            tuple(int(v) for v in image[100, 800]),
+            ov.shade_color(ov.COLORS["right"], far_factor),
+        )
+
+    def test_absolute_mode_keeps_the_global_scale(self) -> None:
+        image = self._draw(False)
+        self.assertEqual(
+            tuple(int(v) for v in image[100, 100]),
+            ov.shade_color(ov.COLORS["left"], ov.depth_factor(0.30)),
+        )
+        # правая рука целиком за абсолютным окном — пол, разница между руками видна
+        self.assertEqual(
+            tuple(int(v) for v in image[100, 600]),
+            ov.shade_color(ov.COLORS["right"], ov.DEPTH_MIN_FACTOR),
+        )
+
+    def test_relative_without_depths_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            ov.draw_skeleton(
+                np.zeros((810, 1080, 3), np.uint8),
+                self.pixels,
+                self.style,
+                joints=self.joints,
+                bones=self.bones,
+                relative=True,
+            )
 
 
 class BoneAlphaGradientTest(unittest.TestCase):

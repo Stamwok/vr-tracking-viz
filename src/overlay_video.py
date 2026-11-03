@@ -56,6 +56,18 @@ alpha по её глубине, а чёрная обводка остаётся 
 ``--all-joints``, выключено для 5-точечного 08a), ``--no-depth-color`` отключает и яркость,
 и alpha; ``--no-depth-alpha`` воспроизводит кадр 08g-fix (только яркость).
 
+Доработка 08g-fix3 делает шкалу глубины **относительной**: для каждой руки отдельно находится
+ближайший к камере видимый сустав (``z_ref``, :func:`depth_reference`) и глубина отсчитывается
+от него (:func:`relative_depth`), ``near = 0``, ``far = DEPTH_RELATIVE_FAR_M`` — это ширина
+окна, а не абсолютные метры. Поэтому ближняя кость руки **всегда** получает полный цвет, а
+дальняя приглушается по разбросу глубин внутри руки, а не по её абсолютному удалению от
+шлема. Абсолютная разница между руками в относительном режиме по яркости/alpha не читается
+(обе ближние кости — 1.0); она остаётся в абсолютном режиме и в порядке alpha-наложения. Окно и
+пол шкалы (0.30 у яркости, 0.45 у alpha) те же, что в 08g-fix/08g-fix2. ``z_ref`` считается по
+каждому кадру отдельно (сглаживания по времени нет — см. ``docs/NOTES.md``, 08g-fix3). Флаги
+``--depth-relative``/``--no-depth-relative``: ``--no-depth-relative`` — прежняя абсолютная
+шкала (кадр 08g-fix2 побайтово), ``--no-depth-alpha`` — абсолютная яркость 08g-fix.
+
 Поза головы = поза камеры (камера в голове, ``T_head_cam`` из ``config.py``), поэтому
 отдельного маркера головы в кадре нет — о ней говорит HUD (время и номер кадра).
 
@@ -323,6 +335,28 @@ def resolve_depth_alpha(value: bool | None, skeleton: Skeleton) -> bool:
     return value
 
 
+def resolve_depth_relative(value: bool | None, skeleton: Skeleton) -> bool:
+    """Относительная ли шкала глубины (08g-fix3) для выбранного скелета.
+
+    Правило авторежима то же, что у яркости и alpha (:func:`resolve_depth_shading`):
+    ``None`` — включено для любого скелета, кроме прежнего 5-точечного
+    (:data:`FLAT_SKELETON`); явные ``True``/``False`` (CLI ``--depth-relative``/
+    ``--no-depth-relative``) перекрывают авторежим. Сравнение по имени набора — см.
+    :func:`resolve_depth_shading`.
+
+    Взаимодействие с alpha задаёт CLI: ``--no-depth-alpha`` без явного ``--depth-relative``
+    выключает ещё и относительность, чтобы один флаг воспроизводил абсолютную яркость
+    08g-fix (см. :func:`main`). Сама функция об этом не знает — она только про шкалу.
+    """
+    if not isinstance(skeleton, Skeleton):
+        raise ValueError(f"skeleton: ожидался Skeleton, получено {skeleton!r}")
+    if value is None:
+        return skeleton.name != FLAT_SKELETON.name
+    if not isinstance(value, bool):
+        raise ValueError(f"depth_relative: ожидалось bool или None, получено {value!r}")
+    return value
+
+
 #: Ширина кадра глаза, к которой отнесены радиус и толщина по умолчанию.
 REFERENCE_WIDTH = 1080
 
@@ -411,6 +445,21 @@ DEPTH_MIN_FACTOR = 0.30
 #: (наблюдение пользователя по 08g-fix). Окно по умолчанию — то же :data:`DEPTH_NEAR_M`…
 #: :data:`DEPTH_FAR_M`: одна шкала для обоих каналов проще для интерпретации.
 DEPTH_MIN_ALPHA = 0.45
+
+#: Окно **относительной** шкалы глубины (доработка 08g-fix3), м: глубина отсчитывается от
+#: ближайшего к камере видимого сустава своей руки (``z_ref``, :func:`depth_reference`), т.е.
+#: ``near = DEPTH_RELATIVE_NEAR_M = 0`` — это сама ближайшая кость руки (полный цвет), а
+#: ``far`` задаёт **ширину** окна в метрах, а не абсолютное расстояние от шлема. Ширина
+#: подобрана по замеру разброса ``max(z) − min(z)`` по видимым суставам одной руки на всех
+#: 7279 кадрах (14 507 пар «кадр × рука», 26 суставов): p50 0.103 м, p90 0.129, p99 0.148,
+#: max 0.167. ``0.155`` — компромисс: p50 даёт контраст ближняя/дальняя кость 1.87×, p99
+#: (0.148) ещё внутри окна, а самый малый разброс активной кисти на 5 кадрах 07a (0.100 м,
+#: k = 7200) даёт 1.83× — при 0.16 он опускался до 1.78×, при 0.18 до 1.64×; зажим
+#: начинается только у экстремальных разбросов > 0.155 (≤ 1 % пар, max 0.167). Окно общее
+#: для яркости и alpha (как и абсолютное окно 08g-fix2), полы — :data:`DEPTH_MIN_FACTOR`/:
+#: :data:`DEPTH_MIN_ALPHA`.
+DEPTH_RELATIVE_NEAR_M = 0.0
+DEPTH_RELATIVE_FAR_M = 0.155
 
 #: Сколько отрезков рисуется на одну кость в режиме глубины (градиент вдоль кости, 08g).
 #: 5 — компромисс: градиент читается на линии толщиной 3 px, но не рвёт её на «рябь»;
@@ -764,19 +813,65 @@ def _coord(value: float) -> int:
     return max(-COORD_LIMIT, min(COORD_LIMIT, int(round(value))))
 
 
-def _check_depth_window(near: float, far: float, minimum: float, floor_name: str) -> None:
+def depth_reference(points_depths: Iterable[float]) -> float | None:
+    """Ближайшая к камере глубина среди точек: ``min`` по конечным положительным ``z`` (08g-fix3).
+
+    Это опорная точка ``z_ref`` относительной шкалы: берётся по **видимым** суставам одной
+    руки на одном кадре (у невидимых глубина ``NaN`` или ``z ≤ 0``). Возвращает ``None``,
+    если точек нет или ни одна не годится: тогда рука не рисуется, и опорная точка не нужна.
+    ``NaN``/``±inf`` и ``z ≤ 0`` игнорируются, а не портят минимум; ноль — не «ближайшая
+    точка», а «нет данных» у проекции (:data:`camera_model.MIN_DEPTH_M`).
+
+    Функция чистая: только вход и результат, без обращения к кадру и без состояния между
+    кадрами (поэтому ``z_ref`` руки плавно следует за рукой, а не скачет от min–max по кадру).
+    """
+    best: float | None = None
+    for value in points_depths:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"points_depths: ожидалось число, получено {value!r}")
+        candidate = float(value)
+        if not math.isfinite(candidate) or candidate <= 0.0:
+            continue
+        if best is None or candidate < best:
+            best = candidate
+    return best
+
+
+def relative_depth(depth: float, z_ref: float) -> float:
+    """Глубина относительно опорной точки руки: ``depth − z_ref`` (08g-fix3).
+
+    При ``z_ref = 0`` это ровно прежняя абсолютная глубина, поэтому относительный режим
+    «выключается» нулевой опорной точкой, а не отдельной ветвью формулы. Знак и форма шкалы
+    не меняются: ближе к камере — меньше, дальше — больше; нефинитные значения проходят как
+    есть (``NaN``), их отсекает :func:`depth_factor`/:func:`depth_alpha`.
+    """
+    for name, value in (("depth", depth), ("z_ref", z_ref)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name}: ожидалось число, получено {value!r}")
+    return float(depth) - float(z_ref)
+
+
+def _check_depth_window(
+    near: float, far: float, minimum: float, floor_name: str, *, z_ref: float = 0.0
+) -> None:
     """Проверить окно глубины и нижнюю границу шкалы (общая для множителя и alpha).
 
     ``minimum`` — значение шкалы на дальнем конце окна (множитель яркости или alpha),
     ``floor_name`` — его имя для текста ошибки. Окно ``near``…``far`` — метры системы камеры.
+    ``z_ref`` (08g-fix3) — опорная точка относительной шкалы: при нуле окно абсолютное, и
+    ``near`` обязан быть > 0 (как раньше); при ненулевой опоре ``near = 0`` — законная
+    граница («сама ближайшая кость руки»), поэтому проверка ослаблена до ``near ≥ 0``.
     """
-    for name, value in (("near", near), ("far", far), (floor_name, minimum)):
+    for name, value in (("near", near), ("far", far), (floor_name, minimum), ("z_ref", z_ref)):
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"{name}: ожидалось число, получено {value!r}")
         if not math.isfinite(value):
             raise ValueError(f"{name}: должно быть конечным, получено {value!r}")
-    if near <= 0:
-        raise ValueError(f"near: должно быть > 0, получено {near!r}")
+    if z_ref == 0.0:
+        if near <= 0:
+            raise ValueError(f"near: должно быть > 0, получено {near!r}")
+    elif near < 0:
+        raise ValueError(f"near: при относительной шкале должно быть ≥ 0, получено {near!r}")
     if far <= near:
         raise ValueError(f"far: должно быть больше near ({near!r}), получено {far!r}")
     if not 0.0 < minimum <= 1.0:
@@ -789,25 +884,34 @@ def depth_factor(
     near: float = DEPTH_NEAR_M,
     far: float = DEPTH_FAR_M,
     min_factor: float = DEPTH_MIN_FACTOR,
+    z_ref: float = 0.0,
 ) -> float:
     """Множитель к цвету руки по глубине: 1.0 ближе ``near``, ``min_factor`` дальше ``far``.
 
     Линейно по глубине (без гаммы и ступеней) и монотонно не возрастает с ``z``: ближе —
-    ярче и насыщеннее, дальше — приглушённее. Окно **абсолютное**, в метрах системы камеры
-    (:data:`DEPTH_NEAR_M`…:data:`DEPTH_FAR_M` замерены по всей записи), поэтому множитель не
-    зависит от того, что попало в кадр, и не «дышит» от кадра к кадру.
+    ярче и насыщеннее, дальше — приглушённее. По умолчанию окно **абсолютное**, в метрах
+    системы камеры (:data:`DEPTH_NEAR_M`…:data:`DEPTH_FAR_M` замерены по всей записи), поэтому
+    множитель не зависит от того, что попало в кадр, и не «дышит» от кадра к кадру.
+
+    ``z_ref`` (08g-fix3) сдвигает точку отсчёта: глубина заменяется на
+    :func:`relative_depth` ``z − z_ref``. При ``z_ref = 0`` формула и числа ровно прежние
+    (абсолютная шкала). При относительной шкале ``near = 0``, ``far`` — ширина окна
+    (:data:`DEPTH_RELATIVE_FAR_M`): ближайшая кость руки получает 1.0, дальняя — тем меньше,
+    чем больше разброс внутри руки, независимо от абсолютного расстояния до шлема.
 
     Неизвестная глубина (``NaN``, ``±inf``) даёт 1.0 — полный цвет: невидимая точка всё
     равно не рисуется, а выцветать из-за отсутствия данных скелет не должен. Глубина за
     камерой (``z ≤ 0``) тоже упирается в ближнюю границу окна и даёт 1.0 — такая точка в
     кадр не попадает, множитель для неё смысла не имеет.
     """
-    _check_depth_window(near, far, min_factor, "min_factor")
+    _check_depth_window(near, far, min_factor, "min_factor", z_ref=z_ref)
     if isinstance(depth, bool) or not isinstance(depth, (int, float)):
         raise ValueError(f"depth: ожидалось число, получено {depth!r}")
     if not math.isfinite(depth):
         return 1.0
-    t = (float(depth) - near) / (far - near)
+    if depth <= 0.0:
+        return 1.0
+    t = (relative_depth(depth, z_ref) - near) / (far - near)
     if t <= 0.0:
         return 1.0
     if t >= 1.0:
@@ -821,6 +925,7 @@ def depth_alpha(
     near: float = DEPTH_NEAR_M,
     far: float = DEPTH_FAR_M,
     min_alpha: float = DEPTH_MIN_ALPHA,
+    z_ref: float = 0.0,
 ) -> float:
     """Прозрачность по глубине: 1.0 ближе ``near``, ``min_alpha`` дальше ``far`` (08g-fix2).
 
@@ -831,19 +936,23 @@ def depth_alpha(
     проще для интерпретации, а ``near``/``far``/``min_alpha`` можно перекрыть (например, для
     сравнения вариантов), не меняя яркость.
 
+    ``z_ref`` (08g-fix3) — как у :func:`depth_factor`: сдвиг точки отсчёта на ближайший
+    сустав руки; ``near = 0``, ``far`` = ширина относительного окна. При ``z_ref = 0``
+    поведение и числа прежние.
+
     Неизвестная глубина (``NaN``, ``±inf``) и глубина за камерой (``z ≤ 0``) дают 1.0 —
     полную непрозрачность: отсутствие данных не повод «выцветать» или прятать точку, а такая
     точка в кадр не попадает. Крайние значения окна возвращают ровно 1.0 / ``min_alpha``
     (без ``0.44999999999999996``), дальше — зажим, а не экстраполяция.
     """
-    _check_depth_window(near, far, min_alpha, "min_alpha")
+    _check_depth_window(near, far, min_alpha, "min_alpha", z_ref=z_ref)
     if isinstance(depth, bool) or not isinstance(depth, (int, float)):
         raise ValueError(f"depth: ожидалось число, получено {depth!r}")
     if not math.isfinite(depth):
         return 1.0
     if depth <= 0.0:
         return 1.0
-    t = (float(depth) - near) / (far - near)
+    t = (relative_depth(depth, z_ref) - near) / (far - near)
     if t <= 0.0:
         return 1.0
     if t >= 1.0:
@@ -888,6 +997,9 @@ def bone_gradient_colors(
     depth_end: float,
     *,
     segments: int = DEPTH_BONE_SEGMENTS,
+    z_ref: float = 0.0,
+    near: float = DEPTH_NEAR_M,
+    far: float = DEPTH_FAR_M,
 ) -> tuple[tuple[int, int, int], ...]:
     """Цвета ``segments`` отрезков кости: множитель плавно идёт от одного конца к другому.
 
@@ -897,6 +1009,10 @@ def bone_gradient_colors(
     Множители концов — :func:`depth_factor` от ``z``: ближний конец ярче, дальний темнее,
     поэтому на экране видно, каким концом кость смотрит в камеру.
 
+    ``z_ref``/``near``/``far`` (08g-fix3) прокидываются в :func:`depth_factor`: при
+    относительной шкале ``z_ref`` — ближайший сустав руки, ``near = 0``, ``far`` — ширина
+    окна. По умолчанию (``z_ref = 0``) окно и числа прежние, абсолютные.
+
     Глубина хотя бы одного конца неизвестна (``NaN``/``±inf``) — все отрезки получают
     полный цвет руки: кость выглядит как прежняя плоская линия. Неположительное число
     отрезков — ``ValueError``.
@@ -905,8 +1021,8 @@ def bone_gradient_colors(
     if not (math.isfinite(depth_start) and math.isfinite(depth_end)):
         base = shade_color(color, 1.0)
         return (base,) * segments
-    start_factor = depth_factor(depth_start)
-    end_factor = depth_factor(depth_end)
+    start_factor = depth_factor(depth_start, near=near, far=far, z_ref=z_ref)
+    end_factor = depth_factor(depth_end, near=near, far=far, z_ref=z_ref)
     step = end_factor - start_factor
     return tuple(
         shade_color(color, start_factor + step * ((index + 0.5) / segments))
@@ -919,6 +1035,9 @@ def bone_gradient_alphas(
     depth_end: float,
     *,
     segments: int = DEPTH_BONE_SEGMENTS,
+    z_ref: float = 0.0,
+    near: float = DEPTH_NEAR_M,
+    far: float = DEPTH_FAR_M,
 ) -> tuple[float, ...]:
     """Alpha ``segments`` отрезков кости — по средней глубине концов отрезка (08g-fix2).
 
@@ -927,6 +1046,9 @@ def bone_gradient_alphas(
     берётся :func:`depth_alpha` в этой точке. Средняя глубина концов отрезка — это и есть
     глубина его середины, поэтому вдоль кости виден не только градиент яркости, но и
     градиент плотности: ближний конец плотный, дальний просвечивает.
+
+    ``z_ref``/``near``/``far`` (08g-fix3) прокидываются в :func:`depth_alpha` так же, как у
+    цветов: при ``z_ref = 0`` окно и числа прежние.
 
     Глубина хотя бы одного конца неизвестна (``NaN``/``±inf``) — все отрезки непрозрачны
     (1.0): отсутствие данных не делает кость полупрозрачной. Неположительное число отрезков —
@@ -937,7 +1059,8 @@ def bone_gradient_alphas(
         return (1.0,) * segments
     step = (float(depth_end) - float(depth_start)) / segments
     return tuple(
-        depth_alpha(depth_start + step * (index + 0.5)) for index in range(segments)
+        depth_alpha(depth_start + step * (index + 0.5), near=near, far=far, z_ref=z_ref)
+        for index in range(segments)
     )
 
 
@@ -1089,13 +1212,18 @@ def _paint_bone(
     *,
     shade: bool = True,
     alpha: bool = False,
+    z_ref: float = 0.0,
+    near: float = DEPTH_NEAR_M,
+    far: float = DEPTH_FAR_M,
 ) -> None:
     """Нарисовать ребро: плоское, с градиентом яркости и/или прозрачности по глубине.
 
     ``depth_start``/``depth_end`` — ``None`` в плоском режиме (одна линия полного цвета).
     Иначе цвет и alpha идут вдоль кости :data:`DEPTH_BONE_SEGMENTS` отрезками: цвет — по
     множителю в середине отрезка (:func:`bone_gradient_colors`), alpha — по средней глубине
-    его концов (:func:`bone_gradient_alphas`). Если вся кость в одном множителе и одной alpha
+    его концов (:func:`bone_gradient_alphas`). ``z_ref``/``near``/``far`` (08g-fix3) задают
+    шкалу: по умолчанию абсолютную, при относительной ``z_ref`` — ближайший сустав руки,
+    ``near = 0``, ``far`` — ширина окна. Если вся кость в одном множителе и одной alpha
     (дальний конец упёрся в пол, глубина неизвестна, у `--no-depth-alpha`), она рисуется одной
     линией — ровно как плоская, без швов антиалиасинга между стыкующимися отрезками.
     """
@@ -1103,11 +1231,15 @@ def _paint_bone(
         _draw_bone(image, first, second, color, style)
         return
     segment_colors = (
-        bone_gradient_colors(color, depth_start, depth_end)
+        bone_gradient_colors(color, depth_start, depth_end, z_ref=z_ref, near=near, far=far)
         if shade
         else (shade_color(color, 1.0),) * DEPTH_BONE_SEGMENTS
     )
-    segment_alphas = bone_gradient_alphas(depth_start, depth_end) if alpha else None
+    segment_alphas = (
+        bone_gradient_alphas(depth_start, depth_end, z_ref=z_ref, near=near, far=far)
+        if alpha
+        else None
+    )
     alphas_uniform = segment_alphas is None or len(set(segment_alphas)) == 1
     if len(set(segment_colors)) == 1 and alphas_uniform:
         _draw_bone(
@@ -1148,11 +1280,16 @@ def _paint_point(
     *,
     shade: bool = True,
     alpha: bool = False,
+    z_ref: float = 0.0,
+    near: float = DEPTH_NEAR_M,
+    far: float = DEPTH_FAR_M,
 ) -> None:
     """Нарисовать точку сустава: цвет и прозрачность по её глубине, обводка всегда чёрная.
 
     Обводка не прозрачная намеренно: иначе дальняя точка «исчезает» на тёмном фоне, а на
     светлом остаётся цветное пятно без границы. ``depth = None`` — плоский кадр 08a/08f.
+    ``z_ref``/``near``/``far`` (08g-fix3) — шкала глубины: по умолчанию абсолютная, при
+    относительной ``z_ref`` — ближайший сустав руки, ``near = 0``, ``far`` — ширина окна.
     """
     import cv2  # noqa: PLC0415
 
@@ -1161,9 +1298,11 @@ def _paint_point(
     fill_alpha = 1.0
     if depth is not None and math.isfinite(depth):
         if shade:
-            fill_color = shade_color(color, depth_factor(depth))
+            fill_color = shade_color(
+                color, depth_factor(depth, near=near, far=far, z_ref=z_ref)
+            )
         if alpha:
-            fill_alpha = depth_alpha(depth)
+            fill_alpha = depth_alpha(depth, near=near, far=far, z_ref=z_ref)
     if fill_alpha >= 1.0:
         cv2.circle(image, center, style.point_radius, fill_color, -1, cv2.LINE_AA)
     else:
@@ -1182,6 +1321,7 @@ def draw_skeleton(
     depths: Mapping[str, Mapping[str, float]] | None = None,
     alpha: bool = False,
     shade: bool = True,
+    relative: bool = False,
 ) -> int:
     """Нарисовать скелет на кадре (in place) и вернуть число видимых точек.
 
@@ -1214,12 +1354,23 @@ def draw_skeleton(
     ``shade=False`` — отключить множитель яркости, оставив прозрачность: это режим «только
     alpha» для сравнения каналов (CLI такого флага не имеет, см. ``docs/overlay.md``).
     Плоский кадр (``depths=None``) он не трогает.
+
+    ``relative`` (08g-fix3) — относительная шкала глубины **на каждую руку отдельно**: для
+    каждой руки берётся ``z_ref = min`` по её видимым суставам (:func:`depth_reference`), и
+    цвет/alpha считаются от ``z − z_ref`` с окном ``near = 0``…
+    :data:`DEPTH_RELATIVE_FAR_M` (ширина, а не абсолютные метры). Ближний сустав руки всегда
+    получает 1.0, дальний — по разбросу внутри руки; между руками абсолютная разница глубин
+    сохраняется. ``False`` (по умолчанию) — прежняя абсолютная шкала (08g-fix2), кадр
+    воспроизводится побайтово. Без ``depths`` относительная шкала невозможна — ``ValueError``
+    (ноль глубин не из чего отсчитывать); плоский кадр включайте только через ``depths=None``.
     """
-    for name, value in (("alpha", alpha), ("shade", shade)):
+    for name, value in (("alpha", alpha), ("shade", shade), ("relative", relative)):
         if not isinstance(value, bool):
             raise ValueError(f"{name}: ожидалось bool, получено {value!r}")
     if alpha and depths is None:
         raise ValueError("alpha: прозрачность по глубине невозможна без depths")
+    if relative and depths is None:
+        raise ValueError("relative: относительная шкала невозможна без depths")
     if not isinstance(style, Style):
         raise ValueError(f"style: ожидался Style, получено {style!r}")
     if image is None or getattr(image, "ndim", 0) != 3:
@@ -1257,6 +1408,18 @@ def draw_skeleton(
                 raise ValueError(f"depths[{side!r}]: нет суставов {missing}")
             hand_depths[side] = side_depths
 
+    # 08g-fix3: у каждой руки своя опорная точка; без глубин шкала не нужна
+    z_refs: dict[str, float] = {"left": 0.0, "right": 0.0}
+    if relative:
+        for side in ("left", "right"):
+            reference = depth_reference(hand_depths[side].values())
+            z_refs[side] = 0.0 if reference is None else reference
+    scale_near, scale_far = (
+        (DEPTH_RELATIVE_NEAR_M, DEPTH_RELATIVE_FAR_M)
+        if relative
+        else (DEPTH_NEAR_M, DEPTH_FAR_M)
+    )
+
     if depths is None:
         # плоский кадр 08a/08f: кости в порядке списка, затем точки; руки — левая, правая
         drawn = 0
@@ -1288,6 +1451,9 @@ def draw_skeleton(
                         hand_depths[side][start],
                         hand_depths[side][end],
                         shade=shade,
+                        z_ref=z_refs[side],
+                        near=scale_near,
+                        far=scale_far,
                     )
             for joint in names:
                 point = hands[side][joint]
@@ -1299,6 +1465,9 @@ def draw_skeleton(
                         style,
                         hand_depths[side][joint],
                         shade=shade,
+                        z_ref=z_refs[side],
+                        near=scale_near,
+                        far=scale_far,
                     )
                     drawn += 1
         return drawn
@@ -1337,6 +1506,9 @@ def draw_skeleton(
             depth_end,
             shade=shade,
             alpha=True,
+            z_ref=z_refs[side],
+            near=scale_near,
+            far=scale_far,
         )
     points_plan: list[tuple[float, str, str]] = []
     for side in ("left", "right"):
@@ -1353,6 +1525,9 @@ def draw_skeleton(
             hand_depths[side][joint],
             shade=shade,
             alpha=True,
+            z_ref=z_refs[side],
+            near=scale_near,
+            far=scale_far,
         )
     return len(points_plan)
 
@@ -1759,6 +1934,7 @@ def _draw_pose(
     *,
     depth_shading: bool = False,
     depth_alpha: bool = False,
+    depth_relative: bool = False,
 ) -> int:
     """Спроецировать скелет кадра и нарисовать его на уже обрезанном кадре глаза.
 
@@ -1769,6 +1945,10 @@ def _draw_pose(
     ``depth_alpha`` (08g-fix2) — прозрачность по глубине (только вместе с ``depth_shading``:
     без глубин её не из чего считать). Порядок отрисовки в этом режиме — от дальних костей и
     точек к ближним, см. :func:`draw_skeleton`.
+
+    ``depth_relative`` (08g-fix3) — относительная шкала: каждая рука отсчитывает глубину от
+    своего ближайшего видимого сустава (только вместе с ``depth_shading``), см.
+    :func:`draw_skeleton`. Без яркости флаг игнорируется: платить за проекцию глубин незачем.
     """
     if depth_shading:
         pixels, depths = project_skeleton_depth(
@@ -1792,6 +1972,7 @@ def _draw_pose(
         bones=skeleton.bones,
         depths=depths,
         alpha=depth_shading and depth_alpha,
+        relative=depth_shading and depth_relative,
     )
 
 
@@ -1876,6 +2057,8 @@ class RenderStats:
     depth_shading: bool = False
     #: 08g-fix2: включалась ли прозрачность по глубине (второй канал, сортировка по z).
     depth_alpha: bool = False
+    #: 08g-fix3: была ли шкала глубины относительной (z_ref своей руки на кадр).
+    depth_relative: bool = False
 
     @property
     def frames(self) -> int:
@@ -1929,6 +2112,7 @@ def render_video(
     skeleton: Skeleton = FIVE_POINT,
     depth_shading: bool | None = None,
     depth_alpha: bool | None = None,
+    depth_relative: bool | None = None,
     log: Callable[[str], None] = print,
 ) -> RenderStats:
     """Отрендерить диапазон кадров ``start…end`` в ``out`` и вернуть :class:`RenderStats`.
@@ -1953,6 +2137,11 @@ def render_video(
     (:func:`resolve_depth_alpha`) включается вместе с яркостью для густого скелета и
     ``--all-joints``; без ``depth_shading`` не включается, потому что глубины не считаются.
     Явное ``False`` — «только яркость», кадр 08g-fix.
+
+    ``depth_relative`` (08g-fix3) — относительная шкала глубины: авторежим
+    (:func:`resolve_depth_relative`) включается вместе с яркостью для густого скелета и
+    ``--all-joints``; без ``depth_shading`` не включается. Явное ``False`` — абсолютная шкала
+    08g-fix2.
     """
     import cv2  # noqa: PLC0415
 
@@ -1966,6 +2155,7 @@ def render_video(
     _require_skeleton_track(scene.track, skeleton)
     shading = resolve_depth_shading(depth_shading, skeleton)
     transparency = shading and resolve_depth_alpha(depth_alpha, skeleton)
+    relative = shading and resolve_depth_relative(depth_relative, skeleton)
     if trail:
         _trail_window(trail_seconds, TRAIL_STEP_S)  # проверка окна до открытия файлов
     video = Path(video)
@@ -2012,6 +2202,7 @@ def render_video(
                     skeleton,
                     depth_shading=shading,
                     depth_alpha=transparency,
+                    depth_relative=relative,
                 )
                 if hud:
                     draw_hud(
@@ -2065,6 +2256,7 @@ def render_video(
         joints_per_hand=len(skeleton.joints),
         depth_shading=shading,
         depth_alpha=transparency,
+        depth_relative=relative,
     )
 
 
@@ -2081,6 +2273,7 @@ def render_stills(
     skeleton: Skeleton = FIVE_POINT,
     depth_shading: bool | None = None,
     depth_alpha: bool | None = None,
+    depth_relative: bool | None = None,
     log: Callable[[str], None] = print,
 ) -> list[Path]:
     """Сохранить PNG-кадры с наложением (по умолчанию 5 отладочных кадров 07a).
@@ -2097,6 +2290,8 @@ def render_stills(
     видно без кодирования видео, поэтому «до/после» снимается именно ``--stills``.
     ``depth_alpha`` (08g-fix2) — как у :func:`render_video`: прозрачность по глубине
     (авторежим как у яркости, без яркости не включается).
+    ``depth_relative`` (08g-fix3) — как у :func:`render_video`: относительная шкала от
+    ближайшего сустава каждой руки (авторежим как у яркости).
     """
     import cv2  # noqa: PLC0415
 
@@ -2108,6 +2303,7 @@ def render_stills(
     _require_skeleton_track(scene.track, skeleton)
     shading = resolve_depth_shading(depth_shading, skeleton)
     transparency = shading and resolve_depth_alpha(depth_alpha, skeleton)
+    relative = shading and resolve_depth_relative(depth_relative, skeleton)
     if trail:
         _trail_window(trail_seconds, TRAIL_STEP_S)
     out = Path(out_dir)
@@ -2140,6 +2336,7 @@ def render_stills(
                 skeleton,
                 depth_shading=shading,
                 depth_alpha=transparency,
+                depth_relative=relative,
             )
             if hud:
                 draw_hud(
@@ -2175,10 +2372,17 @@ def _format_stats(stats: RenderStats) -> str:
         else f"след выключен; HUD: {'да' if stats.hud else 'нет'}"
     )
     if stats.depth_shading:
-        shading_line = (
-            f"яркость: окно {DEPTH_NEAR_M:g}…{DEPTH_FAR_M:g} м, множитель "
-            f"{DEPTH_MIN_FACTOR:g}…1.0"
-        )
+        if stats.depth_relative:
+            shading_line = (
+                f"яркость: относительная (z_ref — ближайший сустав руки), ширина окна "
+                f"{DEPTH_RELATIVE_NEAR_M:g}…{DEPTH_RELATIVE_FAR_M:g} м, множитель "
+                f"{DEPTH_MIN_FACTOR:g}…1.0"
+            )
+        else:
+            shading_line = (
+                f"яркость: абсолютная, окно {DEPTH_NEAR_M:g}…{DEPTH_FAR_M:g} м, множитель "
+                f"{DEPTH_MIN_FACTOR:g}…1.0"
+            )
         if stats.depth_alpha:
             shading_line += (
                 f"; alpha: {DEPTH_MIN_ALPHA:g}…1.0, дальние раньше ближних"
@@ -2282,7 +2486,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         dest="depth_alpha",
         action="store_false",
         default=None,
-        help="только яркость, без прозрачности (кадр 08g-fix)",
+        help="только яркость, без прозрачности (кадр 08g-fix; без --depth-relative — абсолютная)",
+    )
+    relative_group = parser.add_mutually_exclusive_group()
+    relative_group.add_argument(
+        "--depth-relative",
+        dest="depth_relative",
+        action="store_true",
+        default=None,
+        help="глубина от ближайшего сустава каждой руки (по умолчанию — для густого скелета)",
+    )
+    relative_group.add_argument(
+        "--no-depth-relative",
+        dest="depth_relative",
+        action="store_false",
+        default=None,
+        help="абсолютная шкала 0.22…0.48 м, как в 08g-fix2",
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -2292,7 +2511,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         # alpha считается из глубин: явный --depth-alpha включает и яркость (кроме
         # --no-depth-color, который отключает всё разом)
         depth_shading = True
+    if args.depth_relative is True and args.depth_shading is not False:
+        # --depth-relative тоже требует проекции глубин и включает яркость, если её выключили
+        depth_shading = True
     depth_alpha = depth_shading and resolve_depth_alpha(args.depth_alpha, skeleton)
+    depth_relative = depth_shading and resolve_depth_relative(args.depth_relative, skeleton)
+    if args.depth_relative is None and args.depth_alpha is False:
+        # 08g-fix3: --no-depth-alpha без явного --depth-relative воспроизводит 08g-fix —
+        # абсолютную яркость без прозрачности (согласовано с пользователем)
+        depth_relative = False
     try:
         scene = load_scene(args.meta, args.tracking, extra_keys=skeleton.extra_keys)
         if args.time_offset_ms is not None:
@@ -2318,8 +2545,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"глубина → цвет: {'да' if depth_shading else 'нет'}"
             + (
-                f" (окно {DEPTH_NEAR_M:g}…{DEPTH_FAR_M:g} м, множитель "
-                f"{DEPTH_MIN_FACTOR:g}…1.0)"
+                (
+                    f" (относительная: z_ref — ближайший сустав руки, ширина окна "
+                    f"{DEPTH_RELATIVE_NEAR_M:g}…{DEPTH_RELATIVE_FAR_M:g} м, множитель "
+                    f"{DEPTH_MIN_FACTOR:g}…1.0)"
+                    if depth_relative
+                    else (
+                        f" (абсолютная: окно {DEPTH_NEAR_M:g}…{DEPTH_FAR_M:g} м, множитель "
+                        f"{DEPTH_MIN_FACTOR:g}…1.0)"
+                    )
+                )
                 if depth_shading
                 else ""
             )
@@ -2343,6 +2578,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 skeleton=skeleton,
                 depth_shading=depth_shading,
                 depth_alpha=depth_alpha,
+                depth_relative=depth_relative,
             )
             print(f"PNG с наложением: {len(paths)} файлов в {args.stills}")
             return 0
@@ -2362,6 +2598,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             skeleton=skeleton,
             depth_shading=depth_shading,
             depth_alpha=depth_alpha,
+            depth_relative=depth_relative,
         )
     except (OSError, ValueError) as exc:
         print(f"ошибка: {exc}", file=sys.stderr)
