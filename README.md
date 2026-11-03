@@ -396,12 +396,16 @@ distance transform, `src/drift_diag.py`): на 50 быстрых кадрах в
 git clone https://github.com/Stamwok/vr-tracking-viz.git
 cd vr-tracking-viz
 
-python3 -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate   # Python 3.12+ (numpy 2.5 / pandas 3.1)
 pip install -r requirements.txt
 
-# входные файлы — в data/ (в репозитории их нет)
+# входные файлы — в data/ (в репозитории их нет; git не хранит пустые каталоги)
+mkdir -p data
 # data/CameraRecord_20260505_165740.mp4
 # data/trackingData_20260505_165740.txt
+
+# метаданные видео (video_meta.json) — их читают рендер и тесты, выходного CSV они не касаются
+python src/video_meta.py data/CameraRecord_20260505_165740.mp4
 
 python src/parse_tracking.py data/trackingData_20260505_165740.txt -o output/tracking.csv
 python src/overlay_video.py data/CameraRecord_20260505_165740.mp4 \
@@ -413,9 +417,15 @@ python src/sync_viewer.py --tracking output/tracking.csv -o output/sync_viewer.h
 # sync_viewer.html открывается только через сервер (file:// блокирует <video>):
 python -m http.server -d output 8000     # → http://localhost:8000/sync_viewer.html
 
-# тесты (688, ≈1.5 мин; часть помечена skip, если нет data/ и output/):
+# тесты (688, ≈1.5 мин; часть помечена skip, если нет data/ или output/video_meta.json):
 python -m unittest discover -s tests -t .
 ```
+
+Проверено с нуля (11, 03.11): чистый клон → новый venv → `pip install -r requirements.txt`
+(84 с на закреплённых версиях) → все шаги выше. Полный прогон занимает ≈2 мин 20 с (метаданные
+21 с, парсинг 18 с, рендер 80–98 с, графики 0.8 с, вьюер 0.4 с), тесты — ещё 1.5 мин;
+`tracking.csv`, `overlay.mp4`, `trajectory.html` и `sync_viewer.html` побайтово совпали с
+артефактами прогона на машине разработки, `video_meta.json` — тоже.
 
 Рендер по умолчанию — ровно те параметры, которыми собран [`docs/preview.png`](docs/preview.png):
 все 26 джойнтов OpenXR, 10-см указатель на локоть, без следа (`--all-joints --no-trail
@@ -426,9 +436,10 @@ python -m unittest discover -s tests -t .
 Полный клип — 7279 кадров, 1080×810, H.264 — со всеми 26 суставами на руку, обоими каналами
 глубины (яркость + alpha), указателем на локоть и HUD занимает **98.6 МиБ** (103 359 014 байт);
 фрагмент 301 кадра идёт **73.4 кадр/с** (4.1 с, 4.0 МиБ), то есть полный клип на этой машине —
-около **100 с**, и рендер упирается в кодек, а не в скелет; время сильно зависит от CPU/кодека
-и внешней нагрузки (тот же клип без глубины под нагрузкой шёл 1006 с), прогресс печатается
-каждые 300 кадров.
+около **100 с**, и рендер упирается в кодек, а не в скелет; два свежих прогона с нуля (11)
+отрендерили те же 7279 кадров примерно за 80 и 95 с (итого 85 и 98 с вместе с открытием видео и
+записью); время сильно зависит от CPU/кодека и внешней нагрузки (тот же клип без глубины под
+нагрузкой шёл 1006 с), прогресс печатается каждые 300 кадров.
 PNG-проверка наложения на 5 отладочных кадрах: `python src/overlay_video.py
 data/CameraRecord_*.mp4 --stills output/debug/overlay`.
 Скелет переключается флагами: по умолчанию все 26 джойнтов OpenXR на руку, `--dense` —
@@ -474,8 +485,9 @@ Chrome запрещает перемотку; вьюер это замечает
 после чего клик и перемотка работают (на сервере с Range этого не требуется). Ссылка
 `sync_viewer.html?t=60` открывает страницу сразу на нужной секунде.
 
-Результаты: `output/tracking.csv`, `output/overlay.mp4`, `output/trajectory.html`
-(открывается в браузере без сервера), `output/sync_viewer.html` (через `http.server`).
+Результаты: `output/video_meta.json`, `output/tracking.csv`, `output/overlay.mp4`,
+`output/trajectory.html` (открывается в браузере без сервера), `output/sync_viewer.html`
+(через `http.server`).
 
 ## Структура репозитория
 
@@ -496,8 +508,8 @@ vr-tracking-viz/
 │   ├── plot_trajectory.py   # Plotly: 3D-траектории, x/y/z(t), скорость, высота кистей
 │   └── sync_viewer.py       # видео + 3D-траектории, синхронные с video.currentTime
 ├── tests/                   # unittest: парсер, синхронизация, камера, рендер, графики
-├── output/                  # tracking.csv, overlay.mp4, trajectory.html, sync_viewer.html
-│                            # (не коммитятся)
+├── output/                  # video_meta.json, tracking.csv, overlay.mp4, trajectory.html,
+│                            # sync_viewer.html (не коммитятся)
 ├── docs/                    # intrinsics.md, projection_notes.md, overlay.md, NOTES.md,
 │                            # images/ (картинки для README), preview.png/gif,
 │                            # preview_trajectory.png, media/overlay_10s.mp4
