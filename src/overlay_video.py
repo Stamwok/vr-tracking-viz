@@ -8,7 +8,8 @@
 интринсикам, 05a–05c), затем рисует по 5 точек на руку и линии «ладонь → запястье /
 большой / указательный / средний». Левая и правая руки — разные цвета.
 
-Задача 08b добавляет след кистей и HUD (оба включаются флагами ``--no-trail``/``--no-hud``):
+Задача 08b добавляет след кистей и HUD (след по умолчанию выключен — 10c, включается
+``--trail``; HUD выключается ``--no-hud``):
 
 * **След** — мировой путь ладони за последние :data:`TRAIL_SECONDS` секунд, спроецированный
   матрицей **текущего** кадра: шлейф показывает, где кисть была, с точки зрения нынешней
@@ -23,15 +24,15 @@
   что ``cv2.putText`` с Hershey-шрифтами кириллицу не рисует.
 
 Задача 08f рисует **густой скелет** вместо 5 точек: список рёбер задан явно в коде
-(:data:`DENSE_BONES` для 17 суставов по умолчанию, :data:`FULL_BONES` — все 26 джойнтов
+(:data:`DENSE_BONES` для 17 суставов ``--dense``, :data:`FULL_BONES` — все 26 джойнтов
 OpenXR с пястными костями). Политика разрывов та же, что у 5-точечного варианта: кость
 рисуется, только если **оба** её конца видны; ``NaN`` («нет данных», правило 04b) и точка
 за камерой дают ``visible = False``, поэтому через дырку линия не проводится и не
 интерполируется. Пять опорных суставов берутся из :class:`sync.Pose` (как в 08a), остальные —
 через :meth:`sync.PoseTrack.joint_at` с той же интерполяцией и тем же моментом времени
-(:func:`src.calib_bones` использует этот путь с 08e). CLI: по умолчанию густой скелет,
-``--all-joints`` — все 26 суставов, ``--five-points`` — прежний 5-точечный кадр 08a
-(для сравнений «до/после»).
+(:func:`src.calib_bones` использует этот путь с 08e). CLI: по умолчанию все 26 суставов
+(10c, по просьбе пользователя), ``--dense`` — густой скелет 08f из 17 суставов,
+``--five-points`` — прежний 5-точечный кадр 08a (для сравнений «до/после»).
 
 Задача 08g кодирует **глубину цветом**: множитель к цвету руки зависит от ``z`` сустава
 в системе камеры (``p_cam.z``, а не от мировой координаты и не от min–max по кадру — окно
@@ -102,6 +103,11 @@ OpenCV без OpenH264 первый вариант просто не откро�
 Запуск (весь клип, 7279 кадров, ≈242.66 с):
     python src/overlay_video.py data/CameraRecord_20260505_165740.mp4 \\
         --tracking data/trackingData_20260505_165740.txt --out output/overlay.mp4
+
+По умолчанию (10c, по просьбе пользователя) рендерятся все 26 суставов OpenXR, короткий
+10-см указатель на локоть включён, а след кистей выключен: ``--dense``/``--five-points``
+меняют скелет, ``--no-forearm`` убирает указатель, ``--trail`` возвращает след. HUD включён,
+если не задан ``--no-hud``.
 
 Короткий фрагмент, PNG-проверка на 5 отладочных кадрах 07a и рендер «как было в 08a»
 (без следа и HUD — этот кадр идёт в сравнение «до/после»):
@@ -294,7 +300,7 @@ class Skeleton:
 #: Прежний 5-точечный скелет 08a (значения по умолчанию у функций рисования).
 FIVE_POINT = Skeleton("five", "5 точек", JOINTS, HAND_CHAINS)
 
-#: Густой скелет по умолчанию: 17 суставов на руку (задача 08f).
+#: Густой скелет 08f: 17 суставов на руку (режим ``--dense``).
 DENSE = Skeleton("dense", "густой (17 суставов)", DENSE_JOINTS, DENSE_BONES)
 
 #: Полный скелет: все 26 джойнтов OpenXR на руку (``--all-joints``).
@@ -305,8 +311,8 @@ SKELETONS: Mapping[str, Skeleton] = {
     skeleton.name: skeleton for skeleton in (FIVE_POINT, DENSE, ALL_JOINTS)
 }
 
-#: Скелет, который рисует CLI без флагов (задача 08f).
-DEFAULT_SKELETON = DENSE
+#: Скелет, который рисует CLI без флагов (10c: все 26 джойнтов, а не 17 из 08f).
+DEFAULT_SKELETON = ALL_JOINTS
 
 #: Скелет, кадр которого должен воспроизводиться без новых эффектов (задача 08a).
 FLAT_SKELETON = FIVE_POINT
@@ -3001,7 +3007,7 @@ def _format_stats(stats: RenderStats) -> str:
             f"{stats.forearm_degenerate})"
         )
     else:
-        forearm_line = "нет (по умолчанию; флаг --forearm)"
+        forearm_line = "нет (--no-forearm)"
     lines = [
         f"записано: {stats.out}",
         f"  кадры: {stats.first_frame}…{stats.last_frame} ({stats.frames}), "
@@ -3053,8 +3059,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="режим PNG: сохранить кадры --frames в этот каталог и выйти")
     parser.add_argument("--frames", default=",".join(str(k) for k in DEBUG_FRAMES),
                         help="кадры для --stills (по умолчанию 5 кадров 07a)")
-    parser.add_argument("--no-trail", action="store_true",
-                        help="не рисовать след кистей (кадр «как в 08a»)")
+    trail_group = parser.add_mutually_exclusive_group()
+    trail_group.add_argument(
+        "--trail",
+        dest="trail",
+        action="store_true",
+        default=False,
+        help="рисовать затухающий след кистей (10c: по умолчанию выключено)",
+    )
+    trail_group.add_argument(
+        "--no-trail",
+        dest="trail",
+        action="store_false",
+        help="не рисовать след кистей (значение по умолчанию)",
+    )
     parser.add_argument("--no-hud", action="store_true",
                         help="не рисовать HUD (панель времени/кадра/состояния рук)")
     parser.add_argument("--trail-seconds", type=float, default=TRAIL_SECONDS,
@@ -3063,7 +3081,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     skeleton_group.add_argument(
         "--all-joints",
         action="store_true",
-        help="рисовать все 26 суставов OpenXR на руку (по умолчанию густой скелет из 17)",
+        help="рисовать все 26 суставов OpenXR на руку (значение по умолчанию, 10c)",
+    )
+    skeleton_group.add_argument(
+        "--dense",
+        action="store_true",
+        help="густой скелет 08f — 17 суставов на руку",
     )
     skeleton_group.add_argument(
         "--five-points",
@@ -3137,22 +3160,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--forearm",
         dest="forearm",
         action="store_true",
-        default=False,
+        default=True,
         help="дорисовать короткий указатель (10 см) от запястья в сторону додуманного "
-        "локтя (Body.joints[18/19]); по умолчанию выключено",
+        "локтя (Body.joints[18/19]); по умолчанию включён (10c)",
     )
     forearm_group.add_argument(
         "--no-forearm",
         dest="forearm",
         action="store_false",
-        help="не рисовать указатель (кадр по умолчанию, побайтово прежний)",
+        help="не рисовать указатель (кадр 08h-fix2 и раньше)",
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     try:
         skeleton = (
-            ALL_JOINTS if args.all_joints
-            else FIVE_POINT if args.five_points
+            FIVE_POINT if args.five_points
+            else DENSE if args.dense
             else DEFAULT_SKELETON
         )
         forearm = bool(args.forearm)
@@ -3207,7 +3230,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print(
             f"скелет: {skeleton.name} — {skeleton.title}, "
-            f"рёбер {len(skeleton.bones)} на руку (--all-joints — 26 суставов, "
+            f"рёбер {len(skeleton.bones)} на руку (--dense — 17 суставов, "
             f"--five-points — 5 точек)"
         )
         print(
@@ -3241,10 +3264,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"Body.joints[18/19], базовый цвет руки, толщина "
                 f"{FOREARM_LINE_THICKNESS_PX} px, длина в пикселях fx·{FOREARM_POINTER_M:g}/z"
                 if forearm
-                else "нет (по умолчанию; включить — --forearm)"
+                else "нет (--no-forearm)"
             )
         )
-        trail = not args.no_trail
+        trail = args.trail
         hud = not args.no_hud
         if args.stills is not None:
             paths = render_stills(

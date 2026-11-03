@@ -435,13 +435,15 @@ class GammaRenderTest(SyntheticVideoCase):
 
     def test_no_depth_gamma_equals_legacy_linear_render(self) -> None:
         self._write_varied_tracking()
-        base = ("--five-points", "--depth-relative")
+        # 10c: у CLI по умолчанию указатель на локоть включён, а след выключен — здесь
+        # сравнивается только шкала глубины, поэтому оба эффекта выключаются явно.
+        base = ("--five-points", "--depth-relative", "--no-forearm")
         linear_cli = self._stills("gamma_legacy_cli", *base, "--no-depth-gamma")
         direct = self.dir / "gamma_legacy_direct"
         ov.render_stills(
             self.video, self._scene(), direct, frames=range(5),
             skeleton=ov.FIVE_POINT, depth_shading=True, depth_relative=True,
-            depth_gamma=1.0, log=lambda _: None,
+            depth_gamma=1.0, trail=False, forearm=False, log=lambda _: None,
         )
         for index in range(5):
             expected = cv2.imread(str(direct / f"frame_{index:05d}.png"))

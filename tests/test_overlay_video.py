@@ -1048,8 +1048,10 @@ class SkeletonDefinitionTest(unittest.TestCase):
         self.assertEqual(len(ov.ALL_JOINTS.joints), 26)
         self.assertEqual(len(ov.ALL_JOINTS.bones), 25)
 
-    def test_default_skeleton_fits_card_budget(self) -> None:
-        self.assertIs(ov.DEFAULT_SKELETON, ov.DENSE)
+    def test_default_skeleton_is_all_joints(self) -> None:
+        """10c: CLI без флагов рисует все 26 суставов; густой режим — ``--dense``."""
+        self.assertIs(ov.DEFAULT_SKELETON, ov.ALL_JOINTS)
+        self.assertEqual(len(ov.DEFAULT_SKELETON.joints), 26)
         self.assertTrue(15 <= len(ov.DENSE.joints) <= 18)
         self.assertEqual(ov.SKELETONS["dense"], ov.DENSE)
 
