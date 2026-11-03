@@ -88,8 +88,21 @@ bbox) и `_blend_bone_gradient` (смешивание всей кости оди
 ≤ 0.013 м/кадр на 10-с окне); метрики **40/40**, 0 px, кости **10/48, 60.9 px**, drift
 **34.6 px**; тесты **628/628**; 10-с рендер `output/overlay_10s_relative.mp4` — 301 кадр,
 3.95 МиБ, 3.7 с.
-Осталось `todo`: 10a–10c, 11, 12; мерж **08d → 08e → 08f → 08g → 08g-fix → 08g-fix2 → 08g-fix3** —
-пользователь.
+**08g-fix4 — `in_review`** (ветка `VTR-08g-fix4`, от `VTR-08g-fix3`): шкала глубины
+**нелинейная** — параметр вдоль окна `t = clamp((z − z_ref − near)/(far − near), 0, 1)`
+возводится в степень `γ = 0.7` (функции `depth_parameter`/`gamma_parameter`), множитель
+яркости/alpha и градиент кости считаются по `t'` (у кости — по середине отрезка). Нелинейный
+режим использует окно **0.18 м** (`DEPTH_GAMMA_FAR_M`), потому что разброс внутри руки доходит
+до 0.167 м и в окне 0.155 м 72 сустава (0.019 %) упирались в пол; теперь суставов ровно в полу
+**0**, near-floor — 0 (было 153). `γ = 1.0` — прежняя линейная шкала 08g-fix3 целиком (окно
+0.155 м), `--no-depth-gamma` побайтово = `VTR-08g-fix3` (sha256 5/5); `--depth-gamma G` — явная
+степень (0 < G ≤ 1, иначе `ValueError`), авторежим: 0.7 для густого/26, 1.0 для 5 точек.
+Контраст активной правой руки (яркость) **2.32 / 2.09 / 2.18 / 1.95 / 1.87**, на k = 4285 —
+**2.44**, alpha **1.81 / 1.70 / 1.74 / 1.62 / 1.57** / **1.87**, p50 **1.90×** (в 08g-fix3
+1.87×); метрики **40/40**, 0 px, кости **10/48, 60.9 px**, drift **34.6 px**; тесты
+**659/659**; 10-с рендер `output/overlay_10s_gamma.mp4` — 301 кадр, 3.94 МиБ, 3.7 с.
+Осталось `todo`: 10a–10c, 11, 12; мерж **08d → 08e → 08f → 08g → 08g-fix → 08g-fix2 → 08g-fix3
+→ 08g-fix4** — пользователь.
 В репозитории есть
 `src/{parse_tracking,sync,camera_model,calib_frames,calib_bones,calib_search,config,overlay_video,
 drift_diag,plot_trajectory}.py`, `tests/` и
@@ -335,7 +348,10 @@ pose = pose_at(t_frame_k)   # позиция — линейно, кватерн�
    цвета = 08f. Доработка 08g-fix3: шкала глубины **относительная** — у каждой руки своя
    опорная точка (ближайший видимый сустав, `depth_reference`), окно — ширина 0…0.155 м
    (`DEPTH_RELATIVE_FAR_M`), ближняя кость руки всегда 1.0; флаги
-   `--depth-relative`/`--no-depth-relative` (`--no-depth-relative` = 08g-fix2).
+   `--depth-relative`/`--no-depth-relative` (`--no-depth-relative` = 08g-fix2). Доработка
+   08g-fix4: шкала **нелинейная** — `t' = t**γ`, γ = 0.7 (по умолчанию для густого/26), окно
+   нелинейного режима 0.18 м, а при γ = 1.0 — прежние 0.155 м и побайтовый откат 08g-fix3;
+   флаги `--depth-gamma G`/`--no-depth-gamma` (`--no-depth-gamma` = 08g-fix3).
 4. Работаем с левой половиной SBS-кадра (моно); правая — опционально для проверки стерео.
 5. Один подход, маленькое законченное решение; «приблизительность» наложения допустима и объясняется.
 6. Структура: `data/`, `src/{parse_tracking,video_meta,sync,camera_model,calib_frames,calib_search,
@@ -489,15 +505,19 @@ python -c "import cv2;c=cv2.VideoCapture('data/CameraRecord_20260505_165740.mp4'
   относительная шкала 08g-fix3 (`depth_reference`/`relative_depth`, `z_ref` своей руки,
   `DEPTH_RELATIVE_FAR_M = 0.155` — ширина окна, флаги `--depth-relative`/`--no-depth-relative`,
   `--no-depth-relative` = 08g-fix2; следствие — ближняя кость каждой руки 1.0, межрукная
-  абсолютная разница видна только в абсолютном режиме),
+  абсолютная разница видна только в абсолютном режиме), нелинейная шкала 08g-fix4
+  (`t`/`t' = t**γ`, γ = 0.7, окно 0.18 м для γ < 1 и 0.155 м для γ = 1, флаги
+  `--depth-gamma`/`--no-depth-gamma`, `--no-depth-gamma` = 08g-fix3; 72 сустава в полу → 0),
   числа прогона (64.9 с / 202 108 отрезков у 08b; 08f — 7279 кадров, 100.2 МиБ, 246 619 суставов,
   686.8 с; 08g — 98.7 МиБ, 107.5 с; 08g-fix — 10-с фрагмент 4.0 МиБ / 3.0 с; 08g-fix2 — 10-с
-  фрагмент с alpha 3.9 МиБ / 4.0 с, 301 кадр; 08g-fix3 — 10-с фрагмент 3.95 МиБ / 3.7 с),
+  фрагмент с alpha 3.9 МиБ / 4.0 с, 301 кадр; 08g-fix3 — 10-с фрагмент 3.95 МиБ / 3.7 с;
+  08g-fix4 — 10-с фрагмент 3.94 МиБ / 3.7 с),
   картинки `docs/images/overlay_before_after.png`, `docs/images/overlay_dense_vs_five.png`
   (5 точек / густой 17 / все 26), `docs/images/overlay_depth_before_after.png` (5 кадров плоско/по
   глубине), `docs/images/overlay_depth_zoom.png` (крупно),
-  `docs/images/overlay_depth_alpha_modes.png` (3 режима: яркость / alpha / оба на k = 1800 и 4285)
-  и `docs/images/overlay_depth_relative_modes.png` (абсолютная / относительная / относительная+alpha),
+  `docs/images/overlay_depth_alpha_modes.png` (3 режима: яркость / alpha / оба на k = 1800 и 4285),
+  `docs/images/overlay_depth_relative_modes.png` (абсолютная / относительная / относительная+alpha)
+  и `docs/images/overlay_depth_gamma.png` (линейно / γ = 0.7 / γ + alpha на k = 1800 и 4285),
   команды воспроизведения.
 - `src/parse_tracking.py` — стриминговый парсер (03a–03d, расширен в 08d): `read_header`,
   `iter_samples`, `parse_pose` (десятичная запятая), `extract_sample` (голова + **все 26**
@@ -587,7 +607,16 @@ python -c "import cv2;c=cv2.VideoCapture('data/CameraRecord_20260505_165740.mp4'
   метры), `_draw_pose`/`render_video`/`render_stills` с `depth_relative`,
   `RenderStats.depth_relative`, `resolve_depth_relative`, CLI
   `--depth-relative`/`--no-depth-relative` (явный `--depth-relative` включает и яркость;
-  `--no-depth-relative` = 08g-fix2). Вход — сырой
+  `--no-depth-relative` = 08g-fix2). 08g-fix4 — нелинейная шкала: `depth_parameter` (clamp t,
+  0 для NaN/±inf/z ≤ 0) и `gamma_parameter` (t' = t**γ, края ровно 0/1, γ = 1 — тождество);
+  `depth_factor`/`depth_alpha` с `gamma=1.0` (множитель от t', края 1.0/пол прежние);
+  `bone_gradient_colors`/`bone_gradient_alphas` с γ (при γ = 1.0 — прежняя линейная
+  интерполяция побайтово, при γ < 1 — по t' середины отрезка); `_paint_bone`/`_paint_point`/
+  `draw_skeleton`/`_draw_pose` прокидывают γ; `relative_depth_window(γ)` — 0…0.155 м при
+  γ = 1.0 и 0…0.18 м при γ < 1; `resolve_depth_gamma` (авто 0.7/1.0),
+  `RenderStats.depth_gamma`, CLI `--depth-gamma`/`--no-depth-gamma`; авто-γ включается только
+  вместе с относительной шкалой (абсолютная остаётся линейной — 08g-fix/08g-fix2 побайтово).
+  Вход — сырой
   `trackingData_*.txt`, не `tracking.csv`: для синхронизации нужен `header.timeStampNs`, которого
   в CSV нет.
 - `src/drift_diag.py` — диагностика слёта скелета (08a, расширена в 08c): 50 самых быстрых кадров
