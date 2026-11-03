@@ -1,13 +1,15 @@
-"""Assert-тесты для предплечья 08h: Body.joints[18/19] → Hand.wrist.
+"""Assert-тесты указателя на локоть 08h/08h-fix2: Body.joints[18/19] → от Hand.wrist.
 
 Запуск: python -m unittest discover -s tests -t . -v
 
 Проверяется извлечение локтей (валидность, «все нули», отсутствие Body), то, что
 ``tracking.csv``-путь не меняется (локти включаются только по запросу), загрузка через
-``sync.extra_keys``/``joint_at``, защита от «улетевшего» локтя (0.15…0.40 м), стиль
-(тоньше костей кисти, но **ровно базовым цветом руки**, 08h-fix), разрывы ребра, HUD-маркер,
+``sync.extra_keys``/``joint_at``, геометрия указателя 08h-fix2 — 10 см в плоскости запястья
+(``px = fx·0.10/z``, мировая длина 0.10 м на любой глубине), направление
+``normalize(elbow_px − wrist_px)``, вырожденное направление (< 1 px) — стиль (тоньше костей
+кисти, но **ровно базовым цветом руки**, 08h-fix), разрывы, HUD-маркер ``fixed``/``n/a``,
 CLI-флаги ``--forearm``/``--no-forearm``, дефолт выключен и детерминизм. Отдельно — цвет
-ребра: точное равенство ``LEFT_COLOR``/``RIGHT_COLOR`` и независимость от шести флагов
+указателя: точное равенство ``LEFT_COLOR``/``RIGHT_COLOR`` и независимость от шести флагов
 глубины (``--depth-color``/``--no-depth-color``/``--depth-relative``/``--no-depth-relative``/
 ``--depth-gamma``/``--no-depth-gamma``). Рендер-тесты используют синтетическое видео из
 ``tests.test_overlay_video`` и пропускаются без OpenCV.
@@ -260,30 +262,69 @@ def _forearm_pose(
 
 
 class ForearmGeometryTest(unittest.TestCase):
-    """08h: длина ребра, порог 0.15…0.40 м, видимость и «хвост» HUD-маркера."""
+    """08h-fix2: указатель 10 см, направление, мировая длина, вырождение."""
 
-    def test_length_and_validation(self) -> None:
-        self.assertAlmostEqual(ov.forearm_length((0.0, 0.0, 0.0), (0.0, 0.0, 0.25)), 0.25)
-        self.assertAlmostEqual(ov.forearm_length((0.0, 0.0, 0.0), (0.03, 0.04, 0.0)), 0.05)
-        for bad in (math.nan, math.inf, -math.inf):
-            self.assertTrue(math.isnan(ov.forearm_length((bad, 0.0, 0.0), (0.0, 0.0, 0.25))))
+    def test_pointer_length_formula_and_validation(self) -> None:
+        fx = 686.868
+        self.assertAlmostEqual(ov.FOREARM_POINTER_M, 0.10)
+        self.assertAlmostEqual(
+            ov.pointer_length_px(0.45, fx), fx * ov.FOREARM_POINTER_M / 0.45, places=12
+        )
+        for bad_z in (math.nan, math.inf, -math.inf, 0.0, -0.5):
+            self.assertTrue(math.isnan(ov.pointer_length_px(bad_z, fx)), bad_z)
+        for bad_fx in (math.nan, math.inf, 0.0, -1.0):
+            self.assertTrue(math.isnan(ov.pointer_length_px(0.45, bad_fx)), bad_fx)
         with self.assertRaises(ValueError):
-            ov.forearm_length((0.0, 0.0), (0.0, 0.0, 0.25))  # type: ignore[arg-type]
+            ov.pointer_length_px("0.45", fx)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            ov.pointer_length_px(0.45, True)  # type: ignore[arg-type]
 
-    def test_projection_and_out_of_range(self) -> None:
-        # перед камерой (OpenXR вперёд — −z), длина 0.22 м → ребро рисуется
-        track = _forearm_track((0.11, 0.0, -0.78), (0.21, 0.1, -0.78))
+    def test_ten_centimetres_in_wrist_plane_at_any_depth(self) -> None:
+        # 10 см откладываются в плоскости запястья: px ∝ 1/z, а px·z/fx = 0.10 м на любой
+        # глубине. Пиксельная длина при этом РАЗНАЯ — это перспектива, а не «10 см на экране».
+        eye = camera_model.eye_intrinsics(EYE, "left")
+        lengths: list[float] = []
+        for depth in (0.25, 0.40, 0.60):
+            wrist = (0.11, 0.0, -depth)
+            track = _forearm_track((0.11, 0.25, -depth), (0.21, 0.1, -1.0), left_wrist=wrist)
+            forearms = ov.project_forearms(_forearm_pose(track, left_wrist=wrist), EYE, track)
+            item = forearms["left"]
+            self.assertTrue(item.drawable, f"z={depth}")
+            self.assertAlmostEqual(
+                item.length_px * depth / eye.fx, ov.FOREARM_POINTER_M, places=9
+            )
+            lengths.append(item.length_px)
+        self.assertGreater(lengths[0], lengths[1])
+        self.assertGreater(lengths[1], lengths[2])
+
+    def test_tip_follows_normalized_direction(self) -> None:
+        wrist = (0.11, 0.0, -0.8)
+        track = _forearm_track((0.16, 0.25, -0.8), (0.21, 0.1, -1.0), left_wrist=wrist)
+        forearms = ov.project_forearms(_forearm_pose(track, left_wrist=wrist), EYE, track)
+        item = forearms["left"]
+        self.assertTrue(item.drawable)
+        self.assertEqual(item.status, "fixed")
+        du = item.elbow.u - item.wrist.u
+        dv = item.elbow.v - item.wrist.v
+        tu = item.tip.u - item.wrist.u
+        tv = item.tip.v - item.wrist.v
+        self.assertAlmostEqual(math.hypot(tu, tv), item.length_px, places=9)
+        # направление tip − wrist совпадает с elbow − wrist: векторное произведение 0
+        self.assertAlmostEqual(tu * dv - tv * du, 0.0, places=6)
+        self.assertGreater(tu * du + tv * dv, 0.0, "tip должен лежать в сторону локтя")
+        eye = camera_model.eye_intrinsics(EYE, "left")
+        self.assertAlmostEqual(item.length_px * 0.8 / eye.fx, 0.10, places=9)
+
+    def test_degenerate_direction_is_skipped(self) -> None:
+        # локоть совпал с запястьем: направление не определено → указателя нет
+        track = _forearm_track(
+            (0.11, 0.0, -1.0), (0.21, 0.1, -0.8), left_wrist=(0.11, 0.0, -1.0)
+        )
         forearms = ov.project_forearms(_forearm_pose(track), EYE, track)
-        self.assertTrue(forearms["left"].drawable)
-        self.assertAlmostEqual(forearms["left"].length, 0.22, places=12)
-        self.assertEqual(forearms["left"].status, "IK")
-        self.assertFalse(forearms["left"].out_of_range)
-        # локоть улетел: длина 0.5 м → ребра нет, но это не «нет данных»
-        far = _forearm_track((0.11, 0.0, -0.5), (0.21, 0.1, -0.78))
-        forearms = ov.project_forearms(_forearm_pose(far), EYE, far)
         self.assertFalse(forearms["left"].drawable)
-        self.assertTrue(forearms["left"].out_of_range)
+        self.assertTrue(forearms["left"].degenerate)
         self.assertEqual(forearms["left"].status, "n/a")
+        self.assertFalse(forearms["right"].degenerate)
 
     def test_nan_and_behind_camera_are_not_drawn(self) -> None:
         behind_wrist = (0.21, 0.1, 1.0)  # за камерой: z > 0 в мире
@@ -296,10 +337,10 @@ class ForearmGeometryTest(unittest.TestCase):
             _forearm_pose(track, right_wrist=behind_wrist), EYE, track
         )
         self.assertFalse(forearms["left"].drawable)
-        self.assertFalse(forearms["left"].out_of_range)
+        self.assertFalse(forearms["left"].degenerate)
         self.assertFalse(forearms["right"].drawable)
         self.assertFalse(forearms["right"].elbow.visible)
-        self.assertFalse(forearms["right"].out_of_range)
+        self.assertFalse(forearms["right"].degenerate)
 
     def test_requires_elbow_extra_keys(self) -> None:
         track = _forearm_track((0.11, 0.0, -0.78), (0.21, 0.1, -0.78))
@@ -316,60 +357,67 @@ class ForearmGeometryTest(unittest.TestCase):
         self.assertEqual(style.line_thickness, 2)
         self.assertEqual(ov.forearm_style(style).line_thickness, 2)
         self.assertEqual(ov.forearm_style(ov.style_for(1080, 2.0)).line_thickness, 4)
-        # цвет ребра не рисуется множителем: в модуле больше нет «бледного» коэффициента
+        # цвет указателя не рисуется множителем: в модуле больше нет «бледного» коэффициента
         self.assertFalse(hasattr(ov, "FOREARM_COLOR_FACTOR"))
+        self.assertFalse(hasattr(ov, "FOREARM_MIN_LENGTH_M"))
+        self.assertFalse(hasattr(ov, "FOREARM_MAX_LENGTH_M"))
 
 
 @unittest.skipIf(cv2 is None, "OpenCV недоступен")
 class ForearmDrawTest(unittest.TestCase):
-    """08h: ребро рисуется до кисти, разрывы и счётчики пропусков."""
+    """08h-fix2: указатель рисуется до кисти, разрывы и счётчики."""
 
     def _image(self) -> np.ndarray:
         return np.zeros((810, 1080, 3), np.uint8)
 
-    def _forearm(self, side="left", *, elbow=(100.0, 100.0), wrist=(300.0, 100.0),
-                 length=0.22, visible=True) -> ov.Forearm:
+    def _forearm(self, side="left", *, wrist=(100.0, 100.0), tip=(200.0, 100.0),
+                 elbow=(0.0, 100.0), visible=True) -> ov.Forearm:
         return ov.Forearm(
             side=side,
-            elbow=camera_model.ProjectedPoint(elbow[0], elbow[1], visible),
             wrist=camera_model.ProjectedPoint(wrist[0], wrist[1], visible),
-            length=length,
+            tip=camera_model.ProjectedPoint(tip[0], tip[1], visible),
+            elbow=camera_model.ProjectedPoint(elbow[0], elbow[1], visible),
+            length_px=math.hypot(tip[0] - wrist[0], tip[1] - wrist[1]),
         )
 
     def test_draws_base_colour_line_and_counts(self) -> None:
         image = self._image()
-        forearms = {"left": self._forearm(), "right": self._forearm("right", elbow=(600, 100), wrist=(800, 100))}
+        forearms = {"left": self._forearm(), "right": self._forearm("right", wrist=(700, 100), tip=(800, 100), elbow=(600, 100))}
         counts = ov.draw_forearms(image, forearms, ov.style_for(1080))
         self.assertEqual(counts, (2, 0, 0))
         # 08h-fix: ровно базовый цвет руки, без множителя ×0.60 и без shade_color
-        self.assertEqual(tuple(int(v) for v in image[100, 200]), ov.COLORS["left"])
-        self.assertEqual(tuple(int(v) for v in image[100, 700]), ov.COLORS["right"])
+        self.assertEqual(tuple(int(v) for v in image[100, 150]), ov.COLORS["left"])
+        self.assertEqual(tuple(int(v) for v in image[100, 750]), ov.COLORS["right"])
+        # конец указателя — tip, а не додуманный локоть: за tip пикселей нет
+        self.assertFalse(image[100, 220].any())
 
-    def test_out_of_range_and_invisible_are_skipped(self) -> None:
+    def test_degenerate_and_invisible_are_skipped(self) -> None:
         image = self._image()
         forearms = {
-            "left": self._forearm(length=0.50),
-            "right": self._forearm("right", elbow=(600.0, 100.0), wrist=(800.0, 100.0), visible=False),
+            # локоть совпал с запястьем: направление вырождено → счётчик degenerate
+            "left": self._forearm(wrist=(300.0, 100.0), tip=(300.0, 100.0), elbow=(300.0, 100.0)),
+            "right": self._forearm("right", wrist=(600.0, 100.0), tip=(700.0, 100.0),
+                                   elbow=(500.0, 100.0), visible=False),
         }
         counts = ov.draw_forearms(image, forearms, ov.style_for(1080))
         self.assertEqual(counts, (0, 2, 1))
-        self.assertFalse(image.any(), "пропущенное ребро не должно оставлять пикселей")
+        self.assertFalse(image.any(), "пропущенный указатель не должен оставлять пикселей")
 
     def test_flat_colour_is_base_and_does_not_depend_on_depth(self) -> None:
-        # глубина/alpha к ребру не применяются: цвет постоянен вдоль всей линии, а не
+        # глубина/alpha к указателю не применяются: цвет постоянен вдоль всей линии, а не
         # градиентом по z (Body-локоть — IK-оценка, глубина не измерена), и это ровно
         # базовый цвет руки, а не затемнённый (08h-fix)
         image = self._image()
-        forearms = {"left": self._forearm(), "right": self._forearm("right", elbow=(600, 100), wrist=(800, 100))}
+        forearms = {"left": self._forearm(), "right": self._forearm("right", wrist=(700, 100), tip=(800, 100), elbow=(600, 100))}
         counts = ov.draw_forearms(image, forearms, ov.style_for(1080))
         self.assertEqual(counts, (2, 0, 0))
         expected = ov.COLORS["left"]
-        for u in (120, 150, 200, 250, 280):
+        for u in (120, 150, 180, 195):
             self.assertEqual(tuple(int(v) for v in image[100, u]), expected)
 
 
 class ForearmHudTest(unittest.TestCase):
-    """08h: маркер forearm появляется только при включённом предплечье."""
+    """08h: маркер forearm появляется только при включённом указателе."""
 
     def _moment(self) -> sync.FrameTime:
         return sync.FrameTime(index=3, ts_ns=BASE_NS, t_rel_s=1.5, in_tracking=True)
@@ -388,12 +436,12 @@ class ForearmHudTest(unittest.TestCase):
         self.assertEqual(texts[2], "left: OK")
         self.assertEqual(texts[3], "right: NO DATA")
 
-    def test_marker_ik_and_na(self) -> None:
+    def test_marker_fixed_and_na(self) -> None:
         rows = ov.hud_items(
             self._moment(), self._pose(), 100, forearm={"left": True, "right": False}
         )
         texts = [text for text, _color in rows]
-        self.assertEqual(texts[2], "left: OK | forearm: IK")
+        self.assertEqual(texts[2], "left: OK | forearm: fixed")
         self.assertEqual(texts[3], "right: NO DATA | forearm: n/a")
         self.assertEqual(rows[3][1], ov.HUD_WARNING_COLOR)
 
@@ -405,25 +453,28 @@ class ForearmHudTest(unittest.TestCase):
 
 @unittest.skipIf(cv2 is None, "OpenCV недоступен")
 class ForearmRenderTest(SyntheticVideoCase):
-    """08h: CLI-флаги, дефолт выключен, побайтовость дефолта и детерминизм."""
+    """08h-fix2: CLI-флаги, дефолт выключен, побайтовость дефолта и детерминизм."""
 
     FRAMES = 5
     FPS = 30.0
 
     def setUp(self) -> None:
         super().setUp()
-        # локоть на 0.2 м позади запястья по −z: ребро видно и не «улетает»
-        self._write_video(
-            self.FRAMES,
-            self.FRAMES,
-            left_series=None,
-        )
+        self._write_video(self.FRAMES, self.FRAMES, left_series=None)
+        self._write_clear_elbows()
+
+    def _write_clear_elbows(self) -> None:
+        """Трекинг, где указатель уходит в пустую часть кадра: слева вверх, справа вниз.
+
+        Направление должно быть заметно в пикселях, а не вдоль оси взгляда: иначе проекция
+        локтя совпадает с запястьем, и направление вырождено (08h-fix2).
+        """
         _write_tracking(
             self.tracking,
             [BASE_NS + int(round(k * (self.FRAMES / self.FPS) / self.FRAMES * 1e9)) for k in range(self.FRAMES)],
             body_elbows={
-                "left": (LEFT_POINTS["wrist"][0], LEFT_POINTS["wrist"][1], LEFT_POINTS["wrist"][2] + 0.2),
-                "right": (RIGHT_POINTS["wrist"][0], RIGHT_POINTS["wrist"][1], RIGHT_POINTS["wrist"][2] + 0.2),
+                "left": (0.11, 0.25, -1.0),   # вверх от запястья
+                "right": (0.21, -0.30, -1.0),  # вниз от запястья
             },
         )
 
@@ -468,26 +519,10 @@ class ForearmRenderTest(SyntheticVideoCase):
         for index in range(5):
             self.assertTrue(np.array_equal(with_arm[index], again[index]))
 
-    def _write_clear_elbows(self) -> None:
-        """Трекинг, где ребро уходит в пустую часть кадра: слева вверх, справа вниз.
-
-        Иначе (как в ``setUp``, локоть позади запястья по −z) ребро проецируется почти
-        в линию кисти, и «вне кисти» пиксель для проверки цвета не найти.
-        """
-        _write_tracking(
-            self.tracking,
-            [BASE_NS + int(round(k * (self.FRAMES / self.FPS) / self.FRAMES * 1e9)) for k in range(self.FRAMES)],
-            body_elbows={
-                "left": (0.11, 0.25, -1.0),   # v ≈ 233 против v ≈ 405 у запястья
-                "right": (0.21, -0.30, -1.0),  # v ≈ 611 против v ≈ 336 у запястья
-            },
-        )
-
     def test_colour_is_exact_base_in_six_depth_modes(self) -> None:
-        # 08h-fix: цвет ребра — ровно LEFT_COLOR/RIGHT_COLOR и не зависит ни от одного из
-        # шести флагов глубины. Ребро уведено в пустую область, пиксель берётся в середине
-        # отрезка — вне кисти и HUD.
-        self._write_clear_elbows()
+        # 08h-fix: цвет указателя — ровно LEFT_COLOR/RIGHT_COLOR и не зависит ни от одного
+        # из шести флагов глубины. Пиксель берётся в середине отрезка wrist → tip, вне кисти
+        # и HUD.
         index = 2
         scene = ov.load_scene(
             self.meta_path, self.tracking, extra_keys=ov.DENSE.extra_keys + ov.FOREARM_KEYS
@@ -498,9 +533,9 @@ class ForearmRenderTest(SyntheticVideoCase):
         expected: dict[str, tuple[int, int]] = {}
         for side in ("left", "right"):
             forearm = forearms[side]
-            self.assertTrue(forearm.drawable, f"ребро {side} должно рисоваться")
-            u = (forearm.elbow.u + forearm.wrist.u) / 2.0
-            v = (forearm.elbow.v + forearm.wrist.v) / 2.0
+            self.assertTrue(forearm.drawable, f"указатель {side} должен рисоваться")
+            u = (forearm.wrist.u + forearm.tip.u) / 2.0
+            v = (forearm.wrist.v + forearm.tip.v) / 2.0
             x0, y0, x1, y1 = ov.hud_rect(scene.eye_size)
             self.assertFalse(x0 <= u <= x1 and y0 <= v <= y1, "пиксель не должен быть на HUD")
             expected[side] = (int(round(u)), int(round(v)))
@@ -531,7 +566,7 @@ class ForearmRenderTest(SyntheticVideoCase):
                 colours = {tuple(int(channel) for channel in pixel) for pixel in window.reshape(-1, 3)}
                 self.assertIn(
                     ov.COLORS[side], colours,
-                    f"{name}: у ({u}, {v}) нет пикселя ребра ровно базового цвета {ov.COLORS[side]}",
+                    f"{name}: у ({u}, {v}) нет пикселя указателя ровно базового цвета {ov.COLORS[side]}",
                 )
         # флаги глубины действительно применены (кисть в этих режимах разная) — иначе
         # утверждение о независимости цвета ничего бы не проверяло
@@ -545,20 +580,20 @@ class ForearmRenderTest(SyntheticVideoCase):
         self.assertTrue(stats.forearm)
         self.assertEqual(stats.forearm_drawn, 10)
         self.assertEqual(stats.forearm_skipped, 0)
-        self.assertEqual(stats.forearm_out_of_range, 0)
+        self.assertEqual(stats.forearm_degenerate, 0)
         self.assertEqual(stats.forearm_total, 10)
         self.assertEqual(stats.forearm_drawn_share, 1.0)
         image = self._stills("marker", "--forearm")[0]
         crop = image[12:148, 12:342]
         self.assertGreater(int((crop.astype(int).sum(axis=2) > 300).sum()), 0)
 
-    def test_out_of_range_elbow_is_skipped(self) -> None:
+    def test_degenerate_elbow_is_skipped(self) -> None:
         _write_tracking(
             self.tracking,
             [BASE_NS + int(round(k * (self.FRAMES / self.FPS) / self.FRAMES * 1e9)) for k in range(self.FRAMES)],
             body_elbows={
-                "left": (1.0, 0.0, -1.0),  # длина ≫ 0.40 м
-                "right": (RIGHT_POINTS["wrist"][0], RIGHT_POINTS["wrist"][1], RIGHT_POINTS["wrist"][2] + 0.2),
+                "left": LEFT_POINTS["wrist"],  # локоть совпал с запястьем → направление вырождено
+                "right": (0.21, -0.30, -1.0),
             },
         )
         stats = ov.render_video(
@@ -567,7 +602,7 @@ class ForearmRenderTest(SyntheticVideoCase):
         )
         self.assertEqual(stats.forearm_drawn, 5)
         self.assertEqual(stats.forearm_skipped, 5)
-        self.assertEqual(stats.forearm_out_of_range, 5)
+        self.assertEqual(stats.forearm_degenerate, 5)
 
     def test_missing_elbow_keys_raise_before_render(self) -> None:
         scene = ov.load_scene(self.meta_path, self.tracking)
@@ -580,7 +615,7 @@ class ForearmRenderTest(SyntheticVideoCase):
 
 @unittest.skipIf(cv2 is None, "OpenCV недоступен")
 class ForearmFlatSkeletonTest(unittest.TestCase):
-    """08h: предплечье работает и с 5-точечным плоским кадром (без глубины)."""
+    """08h: указатель работает и с 5-точечным плоским кадром (без глубины)."""
 
     def test_five_points_with_forearm_draws(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -589,15 +624,17 @@ class ForearmFlatSkeletonTest(unittest.TestCase):
             forearms = {
                 "left": ov.Forearm(
                     side="left",
-                    elbow=camera_model.ProjectedPoint(100.0, 100.0, True),
-                    wrist=camera_model.ProjectedPoint(300.0, 100.0, True),
-                    length=0.22,
+                    wrist=camera_model.ProjectedPoint(100.0, 100.0, True),
+                    tip=camera_model.ProjectedPoint(200.0, 100.0, True),
+                    elbow=camera_model.ProjectedPoint(0.0, 100.0, True),
+                    length_px=100.0,
                 ),
                 "right": ov.Forearm(
                     side="right",
-                    elbow=camera_model.ProjectedPoint(600.0, 100.0, True),
-                    wrist=camera_model.ProjectedPoint(800.0, 100.0, True),
-                    length=0.22,
+                    wrist=camera_model.ProjectedPoint(600.0, 100.0, True),
+                    tip=camera_model.ProjectedPoint(700.0, 100.0, True),
+                    elbow=camera_model.ProjectedPoint(500.0, 100.0, True),
+                    length_px=100.0,
                 ),
             }
             counts = ov.draw_forearms(image, forearms, ov.style_for(1080))
@@ -609,14 +646,14 @@ class ForearmFlatSkeletonTest(unittest.TestCase):
 @unittest.skipIf(cv2 is None, NO_CV2)
 @unittest.skipIf(VIDEO is None, "нет data/CameraRecord_*.mp4 (видео не коммитится)")
 class ForearmColourRealDataTest(unittest.TestCase):
-    """08h-fix: на 5 кадрах 07a цвет ребра точно равен базовому во всех 6 режимах глубины.
+    """08h-fix2: на 5 кадрах 07a цвет указателя точно равен базовому во всех 6 режимах.
 
     Путь тот же, что у ``--stills`` (``sync.frame_time`` → ``sync.pose_at_frame`` →
     ``project_forearms`` → ``_draw_pose``), а PNG пишется без потерь — поэтому цвет пикселя
     массива и есть цвет пикселя PNG. Пиксель выбирается на видимой части ребра: не ближе
     20 px к любому суставу густого скелета (обе руки) и вне панели HUD, то есть вне обводки
-    и пересечений с кистью. Где видимого куска ребра нет (локоть за кадром, на 07a это
-    левый на k = 1800/3600/5400), пара пропускается; видимых пар 6 из 10.
+    и пересечений с кистью. Указатель короткий (10 см у кисти), поэтому видимая часть есть
+    почти на всех парах; пары без свободного пикселя пропускаются.
     """
 
     #: Шесть режимов = шесть значений флагов глубины; значения уже разрешены так же, как в
@@ -673,8 +710,8 @@ class ForearmColourRealDataTest(unittest.TestCase):
         x0, y0, x1, y1 = ov.hud_rect((width, height))
         for step in range(15, 86, 2):
             t = step / 100.0
-            u = forearm.elbow.u + (forearm.wrist.u - forearm.elbow.u) * t
-            v = forearm.elbow.v + (forearm.wrist.v - forearm.elbow.v) * t
+            u = forearm.wrist.u + (forearm.tip.u - forearm.wrist.u) * t
+            v = forearm.wrist.v + (forearm.tip.v - forearm.wrist.v) * t
             if not (10.0 <= u <= width - 11.0 and 10.0 <= v <= height - 11.0):
                 continue
             if x0 <= u <= x1 and y0 <= v <= y1:
@@ -740,7 +777,7 @@ class ForearmColourRealDataTest(unittest.TestCase):
         finally:
             capture.release()
         self.assertGreaterEqual(
-            checked, 5, "на 5 кадрах 07a должно найтись не меньше 5 видимых рёбер"
+            checked, 5, "на 5 кадрах 07a должно найтись не меньше 5 видимых указателей"
         )
 
 
