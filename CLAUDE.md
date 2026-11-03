@@ -129,8 +129,23 @@ bbox) и `_blend_bone_gradient` (смешивание всей кости оди
 **10/48, 60.9 px**, drift **34.6 px**;
 тесты **686/686**; 10-с фрагмент — 301 кадр, **4.05 МиБ** (4 249 491 байт), 3.9 с, 602 ребра;
 картинка `docs/images/overlay_forearm.png` перегенерирована. Мерж — пользователь.
+**08h-fix2 — `in_review`** (ветка `VTR-08h-fix2`, от `VTR-08h-fix`): ребро `elbow → wrist`
+заменено на **короткий указатель на локоть длиной 10 см** (`FOREARM_POINTER_M = 0.10`).
+Начало — точный `Hand.wrist`, направление — `normalize(elbow_px − wrist_px)` по
+`Body.joints[18/19]`, конец — `wrist_px + d · (fx_eye/z_wrist) · 0.10`: 10 см в плоскости
+запястья, поэтому мировая длина у кисти постоянна (`px·z/fx = 0.10`), а пиксельная ∝ 1/z
+(на 07a 169–254 px при z 0.270–0.406). Прежняя проверка длины 0.15–0.40 м удалена, вместо неё
+вырожденное направление `< 1 px` (`FOREARM_MIN_DIRECTION_PX`) и счётчик
+`RenderStats.forearm_degenerate` (переименован из `forearm_out_of_range`, оба не тащим).
+HUD — `forearm: fixed` / `forearm: n/a`; цвет — ровно базовый без множителя, толщина 2 px,
+плоский, путь данных и `tracking.csv` не менялись. Побайтово: дефолт = `VTR-08g-fix4` 5/5,
+`--five-points` = `VTR-08f` 5/5; цвет — 6 видимых указателей во всех 6 режимах ровно
+`(255,140,0)`/`(0,0,255)`. По всей записи 14 507 указателей, 0 вырожденных, 0 пересечений
+с HUD. Регрессии **40/40**, 0 px, кости **10/48, 60.9 px**, drift **34.6 px**; тесты
+**688/688**; 10-с фрагмент — 301 кадр, 3.99 МиБ, 4.4 с, 602 указателя. Картинка
+`docs/images/overlay_forearm.png` перегенерирована. Мерж — пользователь.
 Осталось `todo`: 10a–10c, 11, 12; мерж **08d → 08e → 08f → 08g → 08g-fix → 08g-fix2 → 08g-fix3
-→ 08g-fix4 → 08h → 08h-fix** — пользователь.
+→ 08g-fix4 → 08h → 08h-fix → 08h-fix2** — пользователь.
 В репозитории есть
 `src/{parse_tracking,sync,camera_model,calib_frames,calib_bones,calib_search,config,overlay_video,
 drift_diag,plot_trajectory}.py`, `tests/` и
@@ -185,7 +200,7 @@ cameraIntrinsics  [cx, cy, fx, fy] полного кадра SBS — см. ра�
 | `appState` | `{"focus": true}` на всех сэмплах |
 | `Head` | `{pose, status}`; `pose` = 7 чисел: `x,y,z` + кватернион `qx,qy,qz,qw` (статья §II-B); `status` = 3 (валидно) везде |
 | `Hand` | `leftHand`, `rightHand`; каждый `{isActive, count:26, scale, HandJointLocations}` |
-| `Body` | `joints` — 24 джойнта + `va`/`wva`; для 03a/03c не разбирался, с 08h из него берутся только локти 18/19 (опциональное предплечье) |
+| `Body` | `joints` — 24 джойнта + `va`/`wva`; для 03a/03c не разбирался, с 08h/08h-fix2 из него берутся только локти 18/19 (опциональный указатель на локоть) |
 | `Input` | = 2 (gesture) на всех сэмплах |
 | `Controller` | **отсутствует** — контроллеры не записывались, работаем только с руками |
 
@@ -379,7 +394,12 @@ pose = pose_at(t_frame_k)   # позиция — линейно, кватерн�
    `--depth-relative`/`--no-depth-relative` (`--no-depth-relative` = 08g-fix2). Доработка
    08g-fix4: шкала **нелинейная** — `t' = t**γ`, γ = 0.7 (по умолчанию для густого/26), окно
    нелинейного режима 0.18 м, а при γ = 1.0 — прежние 0.155 м и побайтовый откат 08g-fix3;
-   флаги `--depth-gamma G`/`--no-depth-gamma` (`--no-depth-gamma` = 08g-fix3).
+   флаги `--depth-gamma G`/`--no-depth-gamma` (`--no-depth-gamma` = 08g-fix3). Доработка
+   08h-fix2: вместо ребра до локтя — короткий **указатель на локоть 10 см** от точного
+   `Hand.wrist` в сторону IK-локтя (`FOREARM_POINTER_M`; конец `wrist + d·(fx/z)·0.10`, `d` —
+   `normalize(elbow_px − wrist_px)`); цвет/толщина/плоскость как в 08h-fix, HUD `forearm: fixed` /
+   `n/a`, разрыв на NaN/за камерой/вырожденном направлении. Длина предплечья 0.19–0.38 м
+   остаётся обоснованием IK-оценки, а не свойством указателя.
 4. Работаем с левой половиной SBS-кадра (моно); правая — опционально для проверки стерео.
 5. Один подход, маленькое законченное решение; «приблизительность» наложения допустима и объясняется.
 6. Структура: `data/`, `src/{parse_tracking,video_meta,sync,camera_model,calib_frames,calib_search,
@@ -494,7 +514,7 @@ pose = pose_at(t_frame_k)   # позиция — линейно, кватерн�
 | Видео длиннее трекинга на 119 мс | Замораживать последнюю позу, зафиксировать в README |
 | Правая рука невалидна первые 0.8 с | Не рисовать точки при `s == 0` / `isActive == 0` |
 | Большой файл трекинга (258 МБ) | Стриминговый парсинг построчно; CSV складывать в `output/` (в git не нужен) |
-| `Body` (24 джойнта) не используем | Осознанно: ТЗ про голову и руки, тело не требуется; исключение 08h — только локти 18/19 для опционального предплечья (`--forearm`), тело не строится |
+| `Body` (24 джойнта) не используем | Осознанно: ТЗ про голову и руки, тело не требуется; исключение 08h/08h-fix2 — только локти 18/19 для опционального указателя на локоть (`--forearm`), тело не строится |
 | ~~Конвенция кватерниона в данных не стандартная~~ (решено в 07b, §3.6) | Оказалось ориентацией камеры, а не кватерниона: `A = diag(1, −1, −1)`, `invert_quat=False`, смещение 0; остаточный риск — точность разметки ±50 px и смещение ~70 px на самой близкой кисти (k=30) |
 
 ## 11. Быстрые проверки (sanity)
@@ -536,6 +556,9 @@ python -c "import cv2;c=cv2.VideoCapture('data/CameraRecord_20260505_165740.mp4'
   абсолютная разница видна только в абсолютном режиме), нелинейная шкала 08g-fix4
   (`t`/`t' = t**γ`, γ = 0.7, окно 0.18 м для γ < 1 и 0.155 м для γ = 1, флаги
   `--depth-gamma`/`--no-depth-gamma`, `--no-depth-gamma` = 08g-fix3; 72 сустава в полу → 0),
+  указатель на локоть (08h/08h-fix2: `FOREARM_POINTER_M = 0.10`, конец
+  `wrist + d·(fx/z)·0.10`, HUD `fixed`/`n/a`, `forearm_degenerate`; длина предплечья
+  0.19–0.38 м — только обоснование IK-оценки),
   числа прогона (64.9 с / 202 108 отрезков у 08b; 08f — 7279 кадров, 100.2 МиБ, 246 619 суставов,
   686.8 с; 08g — 98.7 МиБ, 107.5 с; 08g-fix — 10-с фрагмент 4.0 МиБ / 3.0 с; 08g-fix2 — 10-с
   фрагмент с alpha 3.9 МиБ / 4.0 с, 301 кадр; 08g-fix3 — 10-с фрагмент 3.95 МиБ / 3.7 с;
@@ -546,6 +569,7 @@ python -c "import cv2;c=cv2.VideoCapture('data/CameraRecord_20260505_165740.mp4'
   `docs/images/overlay_depth_alpha_modes.png` (3 режима: яркость / alpha / оба на k = 1800 и 4285),
   `docs/images/overlay_depth_relative_modes.png` (абсолютная / относительная / относительная+alpha)
   и `docs/images/overlay_depth_gamma.png` (линейно / γ = 0.7 / γ + alpha на k = 1800 и 4285),
+  `docs/images/overlay_forearm.png` (полные кадры до/после + 5 крупных кропов 10-см указателя),
   команды воспроизведения.
 - `src/parse_tracking.py` — стриминговый парсер (03a–03d, расширен в 08d): `read_header`,
   `iter_samples`, `parse_pose` (десятичная запятая), `extract_sample` (голова + **все 26**
@@ -648,14 +672,17 @@ python -c "import cv2;c=cv2.VideoCapture('data/CameraRecord_20260505_165740.mp4'
   γ = 1.0 и 0…0.18 м при γ < 1; `resolve_depth_gamma` (авто 0.7/1.0),
   `RenderStats.depth_gamma`, CLI `--depth-gamma`/`--no-depth-gamma`; авто-γ включается только
   вместе с относительной шкалой (абсолютная остаётся линейной — 08g-fix/08g-fix2 побайтово).
-  08h — предплечье: `FOREARM_KEYS`, `Forearm` (elbow/wrist пиксели + мировая длина),
-  `forearm_length`, `project_forearms` (Body elbow через `joint_at` + точный Hand.wrist),
-  `forearm_style` (2 px) и `draw_forearms` (плоский цвет × 0.60, рисуется до скелета;
-  глубина/alpha/сортировка к ребру не применяются, разрыв при NaN/за камерой/длине вне
-  0.15–0.40 м, счётчики
-  `(drawn, skipped, out_of_range)`); `_draw_pose` возвращает `PoseDraw`, CLI
-  `--forearm`/`--no-forearm` (по умолчанию выключено), HUD-маркер `forearm: IK`/`n/a`,
-  `RenderStats.forearm*`; `OPTIONAL_BONES` пуст — плечо (константа 0.2290/0.2307 м) не рисуется.
+  08h/08h-fix2 — указатель на локоть: `FOREARM_KEYS`, `FOREARM_POINTER_M = 0.10`,
+  `FOREARM_MIN_DIRECTION_PX`, `Forearm` (wrist/tip/elbow пиксели + `length_px`; свойства
+  `direction_px`/`degenerate`/`drawable`/`status`), `pointer_length_px(z, fx)`,
+  `project_forearms` (Body elbow через `joint_at` задаёт направление, точный Hand.wrist —
+  начало; конец `wrist_px + normalize(elbow_px − wrist_px)·(fx/z)·0.10`), `forearm_style`
+  (2 px) и `draw_forearms` (плоский цвет — ровно базовый, рисуется до скелета; глубина/alpha/
+  сортировка не применяются, разрыв при NaN/за камерой/вырожденном направлении < 1 px,
+  счётчики `(drawn, skipped, degenerate)`); `_draw_pose` возвращает `PoseDraw`, CLI
+  `--forearm`/`--no-forearm` (по умолчанию выключено), HUD-маркер `forearm: fixed`/`n/a`,
+  `RenderStats.forearm*`/`forearm_degenerate`; `OPTIONAL_BONES` пуст — плечо (константа
+  0.2290/0.2307 м) не рисуется.
   Вход — сырой
   `trackingData_*.txt`, не `tracking.csv`: для синхронизации нужен `header.timeStampNs`, которого
   в CSV нет.
