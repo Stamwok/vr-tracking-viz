@@ -327,14 +327,9 @@ FOREARM_KEYS = ELBOW_KEYS
 FOREARM_MIN_LENGTH_M = 0.15
 FOREARM_MAX_LENGTH_M = 0.40
 
-#: Множитель цвета ребра-оценки: линия тоньше и бледнее измеренных костей кисти, поэтому
-#: в кадре читается как «приблизительно». Цвет руки сохраняется (умножаются все каналы),
-#: но глубина ребро **не красит**: она не измерена (Body-локоть — IK-оценка), поэтому ребро
-#: всегда плоское — ровно :data:`FOREARM_COLOR_FACTOR` от цвета руки.
-FOREARM_COLOR_FACTOR = 0.60
-
 #: Толщина ребра-оценки на кадре 1080×810, px (у костей кисти 2, с глубиной 3): ребро
-#: визуально тоньше и не спорит с измеренным скелетом.
+#: визуально тоньше и не спорит с измеренным скелетом. Отличается от костей кисти именно
+#: толщиной, **не цветом** (08h-fix): ребро рисуется ровно базовым цветом руки.
 FOREARM_LINE_THICKNESS_PX = 2
 
 #: Кандидаты в дополнительные рёбра, которые **сознательно не рисуются** (08h).
@@ -353,7 +348,8 @@ class Forearm:
     ``elbow``/``wrist`` — пиксели глаза (``ProjectedPoint``: видимость уже посчитана),
     ``length`` — длина ребра **в мире** (метры). Глубины здесь нет намеренно: ребро —
     IK-оценка, и красить его глубиной значило бы выдать оценку за измерение; в кадре оно
-    всегда плоское (цвет руки × :data:`FOREARM_COLOR_FACTOR`). Концом ребра служит точный
+    всегда плоское — ровно базовым цветом руки (08h-fix), без множителя, alpha и градиента.
+    Концом ребра служит точный
     ``Hand.wrist``, а не ``Body.wrist``: Body-запястье лишь аппроксимирует его (медиана
     0.9/7.2 мм, max 16/60 мм), и подмена внесла бы второй источник координат.
     """
@@ -491,7 +487,9 @@ def draw_forearms(
 
     Ребро **плоское**: глубина, alpha и градиент к нему не применяются, потому что локоть
     Body — IK-оценка, а не измерение; красить оценку глубиной значило бы выдать её за факт.
-    Цвет — рука × :data:`FOREARM_COLOR_FACTOR`, толщина — :data:`FOREARM_LINE_THICKNESS_PX`.
+    Цвет — **ровно базовый цвет руки** из :data:`COLORS` (08h-fix: без множителя, без
+    :func:`shade_color`, без alpha и без зависимости от ``--depth-color``/
+    ``--depth-relative``/``--depth-gamma``), толщина — :data:`FOREARM_LINE_THICKNESS_PX`.
     Ребро рисуется **до** скелета кисти, поэтому всегда лежит под измеренными точками и
     костями и не участвует в сортировке по глубине (она есть только у кисти). Точка за
     камерой/``NaN`` или длина вне 0.15…0.40 м — ребро пропускается и попадает в счётчик;
@@ -506,9 +504,6 @@ def draw_forearms(
             raise ValueError(f"forearms: нет руки {side!r}")
     palette = COLORS if colors is None else colors
     draw_style = forearm_style(style)
-    base_colors = {
-        side: shade_color(palette[side], FOREARM_COLOR_FACTOR) for side in ("left", "right")
-    }
     drawn = skipped = out_of_range = 0
     for side in ("left", "right"):
         forearm = forearms[side]
@@ -519,7 +514,7 @@ def draw_forearms(
             if forearm.out_of_range:
                 out_of_range += 1
             continue
-        _paint_bone(image, forearm.elbow, forearm.wrist, base_colors[side], draw_style)
+        _paint_bone(image, forearm.elbow, forearm.wrist, tuple(palette[side]), draw_style)
         drawn += 1
     return drawn, skipped, out_of_range
 
@@ -2952,7 +2947,7 @@ def _format_stats(stats: RenderStats) -> str:
         shading_line = "нет (плоские цвета рук)"
     if stats.forearm:
         forearm_line = (
-            f"да (цвет × {FOREARM_COLOR_FACTOR:g}, толщина {FOREARM_LINE_THICKNESS_PX} px, "
+            f"да (базовый цвет руки, толщина {FOREARM_LINE_THICKNESS_PX} px, "
             f"0.15…0.40 м): нарисовано {stats.forearm_drawn}, пропущено "
             f"{stats.forearm_skipped} (из них длина вне диапазона "
             f"{stats.forearm_out_of_range})"
@@ -3193,7 +3188,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             "предплечье (оценка): "
             + (
-                f"да — Body.joints[18/19] → Hand.wrist, цвет × {FOREARM_COLOR_FACTOR:g}, "
+                f"да — Body.joints[18/19] → Hand.wrist, базовый цвет руки, "
                 f"толщина {FOREARM_LINE_THICKNESS_PX} px, ребро только при длине "
                 f"{FOREARM_MIN_LENGTH_M:g}…{FOREARM_MAX_LENGTH_M:g} м"
                 if forearm

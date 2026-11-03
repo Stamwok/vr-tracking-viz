@@ -5,9 +5,12 @@
 Проверяется извлечение локтей (валидность, «все нули», отсутствие Body), то, что
 ``tracking.csv``-путь не меняется (локти включаются только по запросу), загрузка через
 ``sync.extra_keys``/``joint_at``, защита от «улетевшего» локтя (0.15…0.40 м), стиль
-(тоньше и бледнее костей кисти), разрывы ребра, HUD-маркер, CLI-флаги
-``--forearm``/``--no-forearm``, дефолт выключен и детерминизм. Рендер-тесты используют
-синтетическое видео из ``tests.test_overlay_video`` и пропускаются без OpenCV.
+(тоньше костей кисти, но **ровно базовым цветом руки**, 08h-fix), разрывы ребра, HUD-маркер,
+CLI-флаги ``--forearm``/``--no-forearm``, дефолт выключен и детерминизм. Отдельно — цвет
+ребра: точное равенство ``LEFT_COLOR``/``RIGHT_COLOR`` и независимость от шести флагов
+глубины (``--depth-color``/``--no-depth-color``/``--depth-relative``/``--no-depth-relative``/
+``--depth-gamma``/``--no-depth-gamma``). Рендер-тесты используют синтетическое видео из
+``tests.test_overlay_video`` и пропускаются без OpenCV.
 """
 from __future__ import annotations
 
@@ -35,11 +38,16 @@ except ImportError:
 
 from tests.test_overlay_video import (  # noqa: E402
     BASE_NS,
+    DATA,
     EYE,
     HEADER,
     LEFT_POINTS,
+    META_PATH,
+    NO_CV2,
+    NO_DATA,
     RIGHT_POINTS,
     SyntheticVideoCase,
+    VIDEO,
     _hand,
     _pose_string,
     _write_tracking,
@@ -303,14 +311,13 @@ class ForearmGeometryTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             ov.project_forearms(_forearm_pose(track), EYE, bare)
 
-    def test_style_is_thinner_and_fainter(self) -> None:
+    def test_style_is_thinner_than_hand_bones(self) -> None:
         style = ov.style_for(1080)
         self.assertEqual(style.line_thickness, 2)
         self.assertEqual(ov.forearm_style(style).line_thickness, 2)
         self.assertEqual(ov.forearm_style(ov.style_for(1080, 2.0)).line_thickness, 4)
-        colored = ov.shade_color(ov.COLORS["right"], ov.FOREARM_COLOR_FACTOR)
-        self.assertLessEqual(max(colored), int(0.70 * 255))
-        self.assertLess(max(colored), max(ov.COLORS["right"]))
+        # цвет ребра не рисуется множителем: в модуле больше нет «бледного» коэффициента
+        self.assertFalse(hasattr(ov, "FOREARM_COLOR_FACTOR"))
 
 
 @unittest.skipIf(cv2 is None, "OpenCV недоступен")
@@ -329,15 +336,14 @@ class ForearmDrawTest(unittest.TestCase):
             length=length,
         )
 
-    def test_draws_faint_line_and_counts(self) -> None:
+    def test_draws_base_colour_line_and_counts(self) -> None:
         image = self._image()
         forearms = {"left": self._forearm(), "right": self._forearm("right", elbow=(600, 100), wrist=(800, 100))}
         counts = ov.draw_forearms(image, forearms, ov.style_for(1080))
         self.assertEqual(counts, (2, 0, 0))
-        expected = ov.shade_color(ov.COLORS["left"], ov.FOREARM_COLOR_FACTOR)
-        self.assertEqual(tuple(int(v) for v in image[100, 200]), expected)
-        # цвет ребра бледнее полного цвета руки
-        self.assertLess(max(int(v) for v in image[100, 200]), max(ov.COLORS["left"]))
+        # 08h-fix: ровно базовый цвет руки, без множителя ×0.60 и без shade_color
+        self.assertEqual(tuple(int(v) for v in image[100, 200]), ov.COLORS["left"])
+        self.assertEqual(tuple(int(v) for v in image[100, 700]), ov.COLORS["right"])
 
     def test_out_of_range_and_invisible_are_skipped(self) -> None:
         image = self._image()
@@ -349,14 +355,15 @@ class ForearmDrawTest(unittest.TestCase):
         self.assertEqual(counts, (0, 2, 1))
         self.assertFalse(image.any(), "пропущенное ребро не должно оставлять пикселей")
 
-    def test_flat_colour_does_not_depend_on_depth(self) -> None:
+    def test_flat_colour_is_base_and_does_not_depend_on_depth(self) -> None:
         # глубина/alpha к ребру не применяются: цвет постоянен вдоль всей линии, а не
-        # градиентом по z (Body-локоть — IK-оценка, глубина не измерена)
+        # градиентом по z (Body-локоть — IK-оценка, глубина не измерена), и это ровно
+        # базовый цвет руки, а не затемнённый (08h-fix)
         image = self._image()
         forearms = {"left": self._forearm(), "right": self._forearm("right", elbow=(600, 100), wrist=(800, 100))}
         counts = ov.draw_forearms(image, forearms, ov.style_for(1080))
         self.assertEqual(counts, (2, 0, 0))
-        expected = ov.shade_color(ov.COLORS["left"], ov.FOREARM_COLOR_FACTOR)
+        expected = ov.COLORS["left"]
         for u in (120, 150, 200, 250, 280):
             self.assertEqual(tuple(int(v) for v in image[100, u]), expected)
 
@@ -461,6 +468,75 @@ class ForearmRenderTest(SyntheticVideoCase):
         for index in range(5):
             self.assertTrue(np.array_equal(with_arm[index], again[index]))
 
+    def _write_clear_elbows(self) -> None:
+        """Трекинг, где ребро уходит в пустую часть кадра: слева вверх, справа вниз.
+
+        Иначе (как в ``setUp``, локоть позади запястья по −z) ребро проецируется почти
+        в линию кисти, и «вне кисти» пиксель для проверки цвета не найти.
+        """
+        _write_tracking(
+            self.tracking,
+            [BASE_NS + int(round(k * (self.FRAMES / self.FPS) / self.FRAMES * 1e9)) for k in range(self.FRAMES)],
+            body_elbows={
+                "left": (0.11, 0.25, -1.0),   # v ≈ 233 против v ≈ 405 у запястья
+                "right": (0.21, -0.30, -1.0),  # v ≈ 611 против v ≈ 336 у запястья
+            },
+        )
+
+    def test_colour_is_exact_base_in_six_depth_modes(self) -> None:
+        # 08h-fix: цвет ребра — ровно LEFT_COLOR/RIGHT_COLOR и не зависит ни от одного из
+        # шести флагов глубины. Ребро уведено в пустую область, пиксель берётся в середине
+        # отрезка — вне кисти и HUD.
+        self._write_clear_elbows()
+        index = 2
+        scene = ov.load_scene(
+            self.meta_path, self.tracking, extra_keys=ov.DENSE.extra_keys + ov.FOREARM_KEYS
+        )
+        moment = sync.frame_time(index, scene.meta, scene.header_ns, scene.tracking_end_ns)
+        pose = sync.pose_at_frame(scene.track, moment, scene.time_offset_ns)
+        forearms = ov.project_forearms(pose, scene.intrinsics, scene.track)
+        expected: dict[str, tuple[int, int]] = {}
+        for side in ("left", "right"):
+            forearm = forearms[side]
+            self.assertTrue(forearm.drawable, f"ребро {side} должно рисоваться")
+            u = (forearm.elbow.u + forearm.wrist.u) / 2.0
+            v = (forearm.elbow.v + forearm.wrist.v) / 2.0
+            x0, y0, x1, y1 = ov.hud_rect(scene.eye_size)
+            self.assertFalse(x0 <= u <= x1 and y0 <= v <= y1, "пиксель не должен быть на HUD")
+            expected[side] = (int(round(u)), int(round(v)))
+        modes = {
+            "--depth-color": ["--depth-color"],
+            "--no-depth-color": ["--no-depth-color"],
+            "--depth-relative": ["--depth-relative"],
+            "--no-depth-relative": ["--no-depth-relative"],
+            "--depth-gamma 0.7": ["--depth-gamma", "0.7"],
+            "--no-depth-gamma": ["--no-depth-gamma"],
+        }
+        images: dict[str, np.ndarray] = {}
+        for name, flags in modes.items():
+            out = self.dir / f"modes_{name.lstrip('-').replace(' ', '_').replace('.', '_')}"
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = ov.main(
+                    [
+                        str(self.video), "--stills", str(out), "--frames", str(index),
+                        "--tracking", str(self.tracking), "--meta", str(self.meta_path),
+                        "--forearm", *flags,
+                    ]
+                )
+            self.assertEqual(code, 0)
+            images[name] = cv2.imread(str(out / f"frame_{index:05d}.png"))
+        for name, image in images.items():
+            for side, (u, v) in expected.items():
+                window = image[v - 3 : v + 4, u - 3 : u + 4]
+                colours = {tuple(int(channel) for channel in pixel) for pixel in window.reshape(-1, 3)}
+                self.assertIn(
+                    ov.COLORS[side], colours,
+                    f"{name}: у ({u}, {v}) нет пикселя ребра ровно базового цвета {ov.COLORS[side]}",
+                )
+        # флаги глубины действительно применены (кисть в этих режимах разная) — иначе
+        # утверждение о независимости цвета ничего бы не проверяло
+        self.assertFalse(np.array_equal(images["--depth-color"], images["--no-depth-color"]))
+
     def test_render_stats_and_hud_marker(self) -> None:
         stats = ov.render_video(
             self.video, self.out, self._scene(), start=0, end=4,
@@ -527,6 +603,145 @@ class ForearmFlatSkeletonTest(unittest.TestCase):
             counts = ov.draw_forearms(image, forearms, ov.style_for(1080))
         self.assertEqual(counts, (2, 0, 0))
         self.assertTrue(image.any())
+
+
+@unittest.skipUnless(DATA is not None and META_PATH.is_file(), NO_DATA)
+@unittest.skipIf(cv2 is None, NO_CV2)
+@unittest.skipIf(VIDEO is None, "нет data/CameraRecord_*.mp4 (видео не коммитится)")
+class ForearmColourRealDataTest(unittest.TestCase):
+    """08h-fix: на 5 кадрах 07a цвет ребра точно равен базовому во всех 6 режимах глубины.
+
+    Путь тот же, что у ``--stills`` (``sync.frame_time`` → ``sync.pose_at_frame`` →
+    ``project_forearms`` → ``_draw_pose``), а PNG пишется без потерь — поэтому цвет пикселя
+    массива и есть цвет пикселя PNG. Пиксель выбирается на видимой части ребра: не ближе
+    20 px к любому суставу густого скелета (обе руки) и вне панели HUD, то есть вне обводки
+    и пересечений с кистью. Где видимого куска ребра нет (локоть за кадром, на 07a это
+    левый на k = 1800/3600/5400), пара пропускается; видимых пар 6 из 10.
+    """
+
+    #: Шесть режимов = шесть значений флагов глубины; значения уже разрешены так же, как в
+    #: ``render_stills`` (авто: alpha и относительность включены для густого скелета).
+    MODES = {
+        "--depth-color": dict(
+            depth_shading=True, depth_alpha=True, depth_relative=True, depth_gamma=0.7
+        ),
+        "--no-depth-color": dict(
+            depth_shading=False, depth_alpha=False, depth_relative=False, depth_gamma=1.0
+        ),
+        "--depth-relative": dict(
+            depth_shading=True, depth_alpha=True, depth_relative=True, depth_gamma=0.7
+        ),
+        "--no-depth-relative": dict(
+            depth_shading=True, depth_alpha=True, depth_relative=False, depth_gamma=1.0
+        ),
+        "--depth-gamma 0.7": dict(
+            depth_shading=True, depth_alpha=True, depth_relative=True, depth_gamma=0.7
+        ),
+        "--no-depth-gamma": dict(
+            depth_shading=True, depth_alpha=True, depth_relative=True, depth_gamma=1.0
+        ),
+    }
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.scene = ov.load_scene(
+            META_PATH, DATA, extra_keys=ov.DENSE.extra_keys + ov.FOREARM_KEYS
+        )
+        cls.style = ov.style_for(cls.scene.eye_size[0])
+
+    @staticmethod
+    def _blocked_joints(pose: sync.Pose, scene: ov.Scene) -> list[tuple[float, float]]:
+        """Пиксели всех суставов густого скелета (обе руки) — «не пересекаться с кистью»."""
+        pixels = ov.project_skeleton(pose, scene.intrinsics, ov.DENSE, track=scene.track)
+        blocked: list[tuple[float, float]] = []
+        for hand in pixels.values():
+            for point in hand.values():
+                if point.visible and math.isfinite(point.u) and math.isfinite(point.v):
+                    blocked.append((point.u, point.v))
+        return blocked
+
+    def _find_pixel(
+        self,
+        image: np.ndarray,
+        reference: np.ndarray,
+        forearm: ov.Forearm,
+        blocked: list[tuple[float, float]],
+        colour: tuple[int, int, int],
+    ) -> tuple[int, int] | None:
+        """Пиксель на ребре ровно цвета ``colour``, которого нет на кадре без ребра."""
+        height, width = image.shape[:2]
+        x0, y0, x1, y1 = ov.hud_rect((width, height))
+        for step in range(15, 86, 2):
+            t = step / 100.0
+            u = forearm.elbow.u + (forearm.wrist.u - forearm.elbow.u) * t
+            v = forearm.elbow.v + (forearm.wrist.v - forearm.elbow.v) * t
+            if not (10.0 <= u <= width - 11.0 and 10.0 <= v <= height - 11.0):
+                continue
+            if x0 <= u <= x1 and y0 <= v <= y1:
+                continue
+            if any(math.hypot(u - joint_u, v - joint_v) < 20.0 for joint_u, joint_v in blocked):
+                continue
+            for du in range(-2, 3):
+                for dv in range(-2, 3):
+                    x, y = int(round(u)) + du, int(round(v)) + dv
+                    if tuple(int(channel) for channel in image[y, x]) == colour and tuple(
+                        int(channel) for channel in reference[y, x]
+                    ) != colour:
+                        return x, y
+        return None
+
+    def test_forearm_pixel_is_base_colour_in_all_six_modes(self) -> None:
+        capture = cv2.VideoCapture(str(VIDEO))
+        self.assertTrue(capture.isOpened())
+        checked = 0
+        try:
+            for frame_index in ov.DEBUG_FRAMES:
+                self.assertTrue(capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index))
+                ok, raw = capture.read()
+                self.assertTrue(ok and raw is not None, f"не читается кадр {frame_index}")
+                view = ov._eye_view(raw, self.scene)
+                moment = sync.frame_time(
+                    frame_index, self.scene.meta, self.scene.header_ns, self.scene.tracking_end_ns
+                )
+                pose = sync.pose_at_frame(self.scene.track, moment, self.scene.time_offset_ns)
+                forearms = ov.project_forearms(pose, self.scene.intrinsics, self.scene.track)
+                blocked = self._blocked_joints(pose, self.scene)
+                images: dict[str, np.ndarray] = {}
+                for name, kwargs in self.MODES.items():
+                    image = view.copy()
+                    ov._draw_pose(
+                        image, pose, self.scene, self.style, ov.DENSE,
+                        forearms=forearms, **kwargs,
+                    )
+                    images[name] = image
+                reference = view.copy()
+                ov._draw_pose(
+                    reference, pose, self.scene, self.style, ov.DENSE, forearms=None
+                )
+                for side in ("left", "right"):
+                    forearm = forearms[side]
+                    if not forearm.drawable:
+                        continue
+                    colour = ov.COLORS[side]
+                    found = self._find_pixel(
+                        images["--depth-color"], reference, forearm, blocked, colour
+                    )
+                    if found is None:
+                        continue
+                    checked += 1
+                    x, y = found
+                    for name, image in images.items():
+                        self.assertEqual(
+                            tuple(int(channel) for channel in image[y, x]),
+                            colour,
+                            f"кадр {frame_index}, {side}, {name}: ребро не базового цвета "
+                            f"в ({x}, {y})",
+                        )
+        finally:
+            capture.release()
+        self.assertGreaterEqual(
+            checked, 5, "на 5 кадрах 07a должно найтись не меньше 5 видимых рёбер"
+        )
 
 
 if __name__ == "__main__":
