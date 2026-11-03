@@ -148,7 +148,7 @@ HUD — `forearm: fixed` / `forearm: n/a`; цвет — ровно базовы�
 → 08g-fix4 → 08h → 08h-fix → 08h-fix2** — пользователь.
 В репозитории есть
 `src/{parse_tracking,sync,camera_model,calib_frames,calib_bones,calib_search,config,overlay_video,
-drift_diag,plot_trajectory}.py`, `tests/` и
+drift_diag,plot_trajectory,sync_viewer}.py`, `tests/` и
 `docs/{intrinsics,projection_notes,overlay}.md`. Каждая выполненная задача сопровождается записью в
 `docs/NOTES.md` — см. **раздел 13**.
 
@@ -533,8 +533,9 @@ python -c "import cv2;c=cv2.VideoCapture('data/CameraRecord_20260505_165740.mp4'
 
 - `CLAUDE.md` — этот файл (контекст для агентов).
 - `README.md` — черновик публичного README: данные, подход, допущения, наблюдения, сложности,
-  команды запуска. Задачи 08a/08b и 10a–10c дополняют его примерами результата (скриншот,
-  `overlay.mp4`, ссылка на `trajectory.html`).
+  команды запуска. 10a привёл технические разделы к фактическому коду (sync_viewer, таблица
+  констант `config.py`, структура, свежие числа прогонов); 10c добавляет пример результата
+  (скриншот, `overlay.mp4`, ссылка на `trajectory.html`) и снимает «Статус: черновик».
 - `docs/NOTES.md` — рабочий журнал: по записи на каждую выполненную задачу (правила — раздел 13).
   Это же — черновик для разделов «Наблюдения» и «Сложности» в README (задача 10b).
 - `docs/intrinsics.md` — обоснование порядка `[cx, cy, fx, fy]`, per-eye модель SBS и допущения
