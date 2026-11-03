@@ -22,6 +22,17 @@
   не перекрывает ни одной размеченной кисти (:func:`hud_rect`). Подписи латиницей, потому
   что ``cv2.putText`` с Hershey-шрифтами кириллицу не рисует.
 
+Задача 08f рисует **густой скелет** вместо 5 точек: список рёбер задан явно в коде
+(:data:`DENSE_BONES` для 17 суставов по умолчанию, :data:`FULL_BONES` — все 26 джойнтов
+OpenXR с пястными костями). Политика разрывов та же, что у 5-точечного варианта: кость
+рисуется, только если **оба** её конца видны; ``NaN`` («нет данных», правило 04b) и точка
+за камерой дают ``visible = False``, поэтому через дырку линия не проводится и не
+интерполируется. Пять опорных суставов берутся из :class:`sync.Pose` (как в 08a), остальные —
+через :meth:`sync.PoseTrack.joint_at` с той же интерполяцией и тем же моментом времени
+(:func:`src.calib_bones` использует этот путь с 08e). CLI: по умолчанию густой скелет,
+``--all-joints`` — все 26 суставов, ``--five-points`` — прежний 5-точечный кадр 08a
+(для сравнений «до/после»).
+
 Поза головы = поза камеры (камера в голове, ``T_head_cam`` из ``config.py``), поэтому
 отдельного маркера головы в кадре нет — о ней говорит HUD (время и номер кадра).
 
@@ -68,10 +79,13 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src import camera_model, sync
-from src.parse_tracking import HAND_JOINTS, read_header, timestamp_range
+from src.parse_tracking import HAND_JOINTS, HAND_JOINTS_FULL, read_header, timestamp_range
 
 #: Имена 5 суставов на руку в порядке отрисовки (те же, что в ``tracking.csv``).
 JOINTS = tuple(name for name, _ in HAND_JOINTS)
+
+#: Имена всех 26 джойнтов OpenXR на руку (порядок и индексы — ``parse_tracking.HAND_JOINTS_FULL``).
+FULL_JOINTS = tuple(name for name, _ in HAND_JOINTS_FULL)
 
 #: Кости скелета: ладонь → запястье и три «пальцевые» точки (ТЗ: 3–5 точек на руку).
 HAND_CHAINS = (
@@ -80,6 +94,167 @@ HAND_CHAINS = (
     ("palm", "index"),
     ("palm", "middle"),
 )
+
+# --- 08f: густой скелет ---------------------------------------------------------------
+
+#: Суставы густого скелета по умолчанию (17 на руку). Указательный и средний пальцы —
+#: целиком, большой — без пястной кости, безымянный и мизинец — проксимальная фаланга и
+#: кончик (иначе не уложиться в бюджет карточки «15–18 точек»). Пястные кости в кадре
+#: лежат внутри силуэта ладони, поэтому в наборе по умолчанию их нет; ``--all-joints``
+#: рисует все 26 суставов и полные цепочки.
+DENSE_JOINTS = (
+    "palm",
+    "wrist",
+    "thumb_proximal",
+    "thumb_distal",
+    "thumb",
+    "index_proximal",
+    "index_intermediate",
+    "index_distal",
+    "index",
+    "middle_proximal",
+    "middle_intermediate",
+    "middle_distal",
+    "middle",
+    "ring_proximal",
+    "ring",
+    "little_proximal",
+    "little",
+)
+
+#: Рёбра густого скелета — та же структура, что :data:`HAND_CHAINS`: (начало, конец).
+#: У безымянного и мизинца в наборе по умолчанию нет промежуточной и дистальной фаланг,
+#: поэтому ребро «проксимальная → кончик» — прямая через согнутый палец: это осознанное
+#: упрощение ради бюджета точек, а не точная кость (полные цепочки — :data:`FULL_BONES`).
+DENSE_BONES = (
+    ("palm", "wrist"),
+    ("palm", "thumb_proximal"),
+    ("thumb_proximal", "thumb_distal"),
+    ("thumb_distal", "thumb"),
+    ("palm", "index_proximal"),
+    ("index_proximal", "index_intermediate"),
+    ("index_intermediate", "index_distal"),
+    ("index_distal", "index"),
+    ("palm", "middle_proximal"),
+    ("middle_proximal", "middle_intermediate"),
+    ("middle_intermediate", "middle_distal"),
+    ("middle_distal", "middle"),
+    ("palm", "ring_proximal"),
+    ("ring_proximal", "ring"),
+    ("palm", "little_proximal"),
+    ("little_proximal", "little"),
+)
+
+#: Рёбра полного скелета 26 джойнтов OpenXR: запястье → ладонь, ладонь → пястная кость
+#: каждого пальца, дальше цепочка фаланг до кончика (у большого пальца нет промежуточной).
+FULL_BONES = (
+    ("palm", "wrist"),
+    ("palm", "thumb_metacarpal"),
+    ("thumb_metacarpal", "thumb_proximal"),
+    ("thumb_proximal", "thumb_distal"),
+    ("thumb_distal", "thumb"),
+    ("palm", "index_metacarpal"),
+    ("index_metacarpal", "index_proximal"),
+    ("index_proximal", "index_intermediate"),
+    ("index_intermediate", "index_distal"),
+    ("index_distal", "index"),
+    ("palm", "middle_metacarpal"),
+    ("middle_metacarpal", "middle_proximal"),
+    ("middle_proximal", "middle_intermediate"),
+    ("middle_intermediate", "middle_distal"),
+    ("middle_distal", "middle"),
+    ("palm", "ring_metacarpal"),
+    ("ring_metacarpal", "ring_proximal"),
+    ("ring_proximal", "ring_intermediate"),
+    ("ring_intermediate", "ring_distal"),
+    ("ring_distal", "ring"),
+    ("palm", "little_metacarpal"),
+    ("little_metacarpal", "little_proximal"),
+    ("little_proximal", "little_intermediate"),
+    ("little_intermediate", "little_distal"),
+    ("little_distal", "little"),
+)
+
+
+@dataclass(frozen=True)
+class Skeleton:
+    """Набор суставов и рёбер одной руки, который рисует :func:`draw_skeleton`.
+
+    Проверки в :meth:`__post_init__` — не формальность: список рёбер задан руками, и
+    опечатка в имени сустава иначе проявилась бы молчаливым ``KeyError`` на середине
+    рендера 7279 кадров. Ошибка здесь падает сразу при импорте модуля.
+    """
+
+    #: Короткое имя для CLI и статистики: ``five``, ``dense``, ``all``.
+    name: str
+    #: Человекочитаемое описание для логов: «густой (17 суставов)».
+    title: str
+    #: Имена суставов (без префикса руки) в порядке отрисовки точек.
+    joints: tuple[str, ...]
+    #: Рёбра ``(начало, конец)`` — тоже без префикса руки.
+    bones: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError(f"Skeleton.name: ожидалось непустое имя, получено {self.name!r}")
+        if not isinstance(self.title, str) or not self.title:
+            raise ValueError(f"Skeleton.title: ожидалось непустое описание, получено {self.title!r}")
+        if not self.joints:
+            raise ValueError(f"Skeleton {self.name!r}: пустой список суставов")
+        seen: set[str] = set()
+        for joint in self.joints:
+            if joint not in FULL_JOINTS:
+                raise ValueError(f"Skeleton {self.name!r}: неизвестный сустав {joint!r}")
+            if joint in seen:
+                raise ValueError(f"Skeleton {self.name!r}: сустав {joint!r} повторяется")
+            seen.add(joint)
+        used: set[frozenset[str]] = set()
+        for bone in self.bones:
+            if not isinstance(bone, tuple) or len(bone) != 2:
+                raise ValueError(f"Skeleton {self.name!r}: ребро {bone!r} — не пара суставов")
+            start, end = bone
+            for joint in (start, end):
+                if joint not in seen:
+                    raise ValueError(
+                        f"Skeleton {self.name!r}: ребро {start!r}→{end!r} ссылается на "
+                        f"сустав {joint!r}, которого нет в наборе"
+                    )
+            if start == end:
+                raise ValueError(f"Skeleton {self.name!r}: ребро {start!r}→{end!r} вырождено")
+            key = frozenset(bone)
+            if key in used:
+                raise ValueError(f"Skeleton {self.name!r}: ребро {start!r}→{end!r} повторяется")
+            used.add(key)
+
+    @property
+    def extra_keys(self) -> tuple[str, ...]:
+        """Ключи ``sync.PoseTrack.extra_keys`` для этого скелета (для обеих рук).
+
+        Пять опорных суставов уже лежат в :class:`sync.Pose`; остальные нужно догрузить
+        в трек: ``sync.load_poses(tracking, extra_keys=skeleton.extra_keys)`` (или
+        ``load_scene(..., extra_keys=...)``), иначе :meth:`sync.PoseTrack.joint_at`
+        не найдёт колонку.
+        """
+        names = tuple(joint for joint in self.joints if joint not in JOINTS)
+        return tuple(f"{side}_{joint}" for side in ("left", "right") for joint in names)
+
+
+#: Прежний 5-точечный скелет 08a (значения по умолчанию у функций рисования).
+FIVE_POINT = Skeleton("five", "5 точек", JOINTS, HAND_CHAINS)
+
+#: Густой скелет по умолчанию: 17 суставов на руку (задача 08f).
+DENSE = Skeleton("dense", "густой (17 суставов)", DENSE_JOINTS, DENSE_BONES)
+
+#: Полный скелет: все 26 джойнтов OpenXR на руку (``--all-joints``).
+ALL_JOINTS = Skeleton("all", "все 26 суставов", FULL_JOINTS, FULL_BONES)
+
+#: Все скелеты по имени (для CLI и тестов).
+SKELETONS: Mapping[str, Skeleton] = {
+    skeleton.name: skeleton for skeleton in (FIVE_POINT, DENSE, ALL_JOINTS)
+}
+
+#: Скелет, который рисует CLI без флагов (задача 08f).
+DEFAULT_SKELETON = DENSE
 
 #: Ширина кадра глаза, к которой отнесены радиус и толщина по умолчанию.
 REFERENCE_WIDTH = 1080
@@ -267,6 +442,7 @@ def load_scene(
     tracking_path: str | Path | None = None,
     *,
     data_dir: str | Path = "data",
+    extra_keys: Sequence[str] = (),
 ) -> Scene:
     """Прочитать метаданные видео и трекинг, проверить согласованность.
 
@@ -274,7 +450,13 @@ def load_scene(
     молча выбрать один из нескольких файлов значило бы отрендерить не ту запись).
     Размер кадра из ``video_meta.json`` передаётся в :meth:`Intrinsics.from_header`, поэтому
     расхождение интринсиков с видео (не тот файл, другая раскладка) падает сразу.
+
+    ``extra_keys`` (08f) — дополнительные суставы густого скелета
+    (``skeleton.extra_keys``, ``None`` не принимается): без них рисуется только 5-точечный
+    скелет, а густой упадёт с понятной ошибкой до первого кадра, а не на середине рендера.
     """
+    if extra_keys is None:
+        raise ValueError("extra_keys: ожидался список ключей, получено None")
     meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
     if not isinstance(meta, dict):
         raise ValueError(f"{meta_path}: ожидался JSON-объект video_meta")
@@ -300,7 +482,7 @@ def load_scene(
         meta=meta,
         header_ns=int(header["timeStampNs"]),
         tracking_end_ns=int(timestamp_range(tracking)[1]),
-        track=sync.load_poses(tracking),
+        track=sync.load_poses(tracking, extra_keys=extra_keys),
         intrinsics=intrinsics,
         time_offset_ns=sync.video_time_offset_ns(),
     )
@@ -346,6 +528,69 @@ def project_hands(
     return result
 
 
+def _require_skeleton_track(track: sync.PoseTrack | None, skeleton: Skeleton) -> None:
+    """Проверить, что в треке есть дополнительные суставы скелета (08f).
+
+    Ошибка до первого кадра: иначе :meth:`sync.PoseTrack.joint_at` упал бы на середине
+    рендера 7279 кадров, уже записав часть файла.
+    """
+    if not isinstance(skeleton, Skeleton):
+        raise ValueError(f"skeleton: ожидался Skeleton, получено {skeleton!r}")
+    extra = skeleton.extra_keys
+    if not extra:
+        return
+    if track is None:
+        raise ValueError(
+            f"скелет {skeleton.name!r}: нужны дополнительные суставы {extra[:3]}… — "
+            "передайте track с extra_keys"
+        )
+    missing = [key for key in extra if key not in track.extra_keys]
+    if missing:
+        raise ValueError(
+            f"скелет {skeleton.name!r}: в треке нет {len(missing)} ключей (например "
+            f"{missing[0]!r}); загрузите сцену с load_scene(..., "
+            f"extra_keys=SKELETONS[{skeleton.name!r}].extra_keys)"
+        )
+
+
+def project_skeleton(
+    pose: sync.Pose,
+    intrinsics: camera_model.Intrinsics,
+    skeleton: Skeleton = DENSE,
+    *,
+    track: sync.PoseTrack | None = None,
+    side: str = "left",
+) -> dict[str, dict[str, camera_model.ProjectedPoint]]:
+    """Пиксели выбранного скелета на кадре: ``side → joint → ProjectedPoint`` (08f).
+
+    Пять опорных суставов берутся из позы (:class:`sync.Pose`, интерполяция 04b/04c),
+    остальные — ``track.joint_at(pose.ts_ns, key)``: та же интерполяция, тот же момент
+    времени (этим же путём пользуется метрика 08e). Матрица ``мир → камера`` считается
+    один раз на кадр. ``NaN`` («нет данных») и точка за камерой дают ``visible = False`` —
+    :func:`draw_skeleton` не рисует такую точку и не проводит кости к ней.
+    """
+    _require_skeleton_track(track, skeleton)
+    eye = camera_model.eye_intrinsics(intrinsics, side)
+    matrix = camera_model.world_to_camera_matrix(pose)
+    result: dict[str, dict[str, camera_model.ProjectedPoint]] = {}
+    for hand in ("left", "right"):
+        pixels: dict[str, camera_model.ProjectedPoint] = {}
+        for joint in skeleton.joints:
+            key = f"{hand}_{joint}"
+            if key in pose.hands:
+                world = pose.hands[key]
+            else:
+                world = track.joint_at(pose.ts_ns, key)  # type: ignore[union-attr]
+            if not all(math.isfinite(value) for value in world):
+                pixels[joint] = camera_model.ProjectedPoint(math.nan, math.nan, False)
+                continue
+            pixels[joint] = camera_model.project(
+                camera_model.transform_point(matrix, world), eye
+            )
+        result[hand] = pixels
+    return result
+
+
 def _coord(value: float) -> int:
     """Координата для cv2: целое, ограниченное :data:`COORD_LIMIT` (защита от int32)."""
     if not math.isfinite(value):
@@ -359,11 +604,15 @@ def draw_skeleton(
     style: Style,
     *,
     colors: Mapping[str, tuple[int, int, int]] = COLORS,
+    joints: Sequence[str] = JOINTS,
+    bones: Sequence[tuple[str, str]] = HAND_CHAINS,
 ) -> int:
     """Нарисовать скелет на кадре (in place) и вернуть число видимых точек.
 
-    Порядок: сначала линии (под точками), потом точки. Пара, в которой хотя бы одна точка
-    невидима, линией не соединяется — иначе отрезок «прибил» бы руку к точке за камерой.
+    ``joints``/``bones`` (08f) — набор суставов и рёбер одной руки; по умолчанию прежний
+    5-точечный скелет 08a. Порядок: сначала линии (под точками), потом точки. Пара, в
+    которой хотя бы одна точка невидима, линией не соединяется — иначе отрезок «прибил» бы
+    руку к точке за камерой, а ``NaN`` («нет данных», 04b) дал бы линию через дырку.
     Точки, вышедшие за край кадра, всё равно рисуются: cv2 обрежет круг/отрезок по границе,
     и видимая часть кисти останется на месте.
     """
@@ -373,14 +622,28 @@ def draw_skeleton(
         raise ValueError(f"style: ожидался Style, получено {style!r}")
     if image is None or getattr(image, "ndim", 0) != 3:
         raise ValueError("image: ожидался BGR-кадр (H×W×3)")
+    names = tuple(joints)
+    if not names:
+        raise ValueError("joints: пустой список суставов")
+    pairs = tuple(bones)
+    for start, end in pairs:
+        for joint in (start, end):
+            if joint not in names:
+                raise ValueError(
+                    f"bones: ребро {start!r}→{end!r} ссылается на сустав {joint!r}, "
+                    "которого нет в joints"
+                )
     drawn = 0
     for side in ("left", "right"):
         color = colors[side]
-        joints = pixels.get(side)
-        if joints is None:
+        hand = pixels.get(side)
+        if hand is None:
             raise ValueError(f"pixels: нет руки {side!r}")
-        for start, end in HAND_CHAINS:
-            first, second = joints[start], joints[end]
+        missing = [joint for joint in names if joint not in hand]
+        if missing:
+            raise ValueError(f"pixels[{side!r}]: нет суставов {missing}")
+        for start, end in pairs:
+            first, second = hand[start], hand[end]
             if not (first.visible and second.visible):
                 continue
             cv2.line(
@@ -391,8 +654,8 @@ def draw_skeleton(
                 style.line_thickness,
                 cv2.LINE_AA,
             )
-        for joint in JOINTS:
-            point = joints[joint]
+        for joint in names:
+            point = hand[joint]
             if not point.visible:
                 continue
             center = (_coord(point.u), _coord(point.v))
@@ -723,9 +986,14 @@ def _eye_view(image: Any, scene: Scene) -> Any:
     return image[:eye_height, :eye_width].copy()
 
 
-def _draw_pose(image: Any, pose: sync.Pose, scene: Scene, style: Style) -> int:
-    """Спроецировать кисти кадра и нарисовать их на уже обрезанном кадре глаза."""
-    return draw_skeleton(image, project_hands(pose, scene.intrinsics), style)
+def _draw_pose(
+    image: Any, pose: sync.Pose, scene: Scene, style: Style, skeleton: Skeleton = FIVE_POINT
+) -> int:
+    """Спроецировать скелет кадра и нарисовать его на уже обрезанном кадре глаза."""
+    pixels = project_skeleton(pose, scene.intrinsics, skeleton, track=scene.track)
+    return draw_skeleton(
+        image, pixels, style, joints=skeleton.joints, bones=skeleton.bones
+    )
 
 
 def _codec_name(path: Path) -> str:
@@ -802,6 +1070,9 @@ class RenderStats:
     trail_segments: int = 0
     #: 08b: рисовался ли HUD.
     hud: bool = True
+    #: 08f: имя скелета (``five``/``dense``/``all``) и число суставов на руку в нём.
+    skeleton: str = "five"
+    joints_per_hand: int = 5
 
     @property
     def frames(self) -> int:
@@ -852,6 +1123,7 @@ def render_video(
     trail: bool = True,
     hud: bool = True,
     trail_seconds: float = TRAIL_SECONDS,
+    skeleton: Skeleton = FIVE_POINT,
     log: Callable[[str], None] = print,
 ) -> RenderStats:
     """Отрендерить диапазон кадров ``start…end`` в ``out`` и вернуть :class:`RenderStats`.
@@ -863,6 +1135,10 @@ def render_video(
     ``trail``/``hud`` — элементы 08b (след и панель состояния); ``trail_seconds`` — окно
     следа в секундах (выборка по времени, не по кадрам). Порядок отрисовки: след под
     скелетом, HUD поверх всего — так подписи остаются читаемыми.
+
+    ``skeleton`` (08f) — какой скелет рисовать: по умолчанию прежний 5-точечный (08a);
+    CLI передаёт :data:`DENSE` или :data:`ALL_JOINTS`. Для густого скелета сцена должна
+    быть загружена с ``extra_keys=skeleton.extra_keys`` — иначе ``ValueError`` до записи.
     """
     import cv2  # noqa: PLC0415
 
@@ -873,6 +1149,7 @@ def render_video(
     for name, value in (("trail", trail), ("hud", hud)):
         if not isinstance(value, bool):
             raise ValueError(f"{name}: ожидалось bool, получено {value!r}")
+    _require_skeleton_track(scene.track, skeleton)
     if trail:
         _trail_window(trail_seconds, TRAIL_STEP_S)  # проверка окна до открытия файлов
     video = Path(video)
@@ -911,7 +1188,7 @@ def render_video(
                     trail_segments += draw_trail(
                         view, pose, scene.track, scene.intrinsics, style, seconds=trail_seconds
                     )
-                joints += _draw_pose(view, pose, scene, style)
+                joints += _draw_pose(view, pose, scene, style, skeleton)
                 if hud:
                     draw_hud(
                         view,
@@ -960,6 +1237,8 @@ def render_video(
         trail_seconds=float(trail_seconds) if trail else 0.0,
         trail_segments=trail_segments,
         hud=hud,
+        skeleton=skeleton.name,
+        joints_per_hand=len(skeleton.joints),
     )
 
 
@@ -973,6 +1252,7 @@ def render_stills(
     trail: bool = True,
     hud: bool = True,
     trail_seconds: float = TRAIL_SECONDS,
+    skeleton: Skeleton = FIVE_POINT,
     log: Callable[[str], None] = print,
 ) -> list[Path]:
     """Сохранить PNG-кадры с наложением (по умолчанию 5 отладочных кадров 07a).
@@ -982,7 +1262,8 @@ def render_stills(
     ``.gitignore``), поэтому коммитится не он, а выводы о проверке.
 
     ``trail``/``hud`` — как у :func:`render_video`: ``--no-trail --no-hud`` даёт кадр «как в
-    08a», он идёт в сравнение «до/после» (``docs/overlay.md``).
+    08a», он идёт в сравнение «до/после» (``docs/overlay.md``). ``skeleton`` — как у
+    :func:`render_video`: по умолчанию 5 точек, CLI передаёт густой скелет.
     """
     import cv2  # noqa: PLC0415
 
@@ -991,6 +1272,7 @@ def render_stills(
         raise FileNotFoundError(f"нет видео: {video}")
     indices = sorted(set(frames))
     style = style_for(scene.eye_size[0], scale)
+    _require_skeleton_track(scene.track, skeleton)
     if trail:
         _trail_window(trail_seconds, TRAIL_STEP_S)
     out = Path(out_dir)
@@ -1015,7 +1297,7 @@ def render_stills(
                 segments = draw_trail(
                     view, pose, scene.track, scene.intrinsics, style, seconds=trail_seconds
                 )
-            drawn = _draw_pose(view, pose, scene, style)
+            drawn = _draw_pose(view, pose, scene, style, skeleton)
             if hud:
                 draw_hud(
                     view,
@@ -1032,7 +1314,8 @@ def render_stills(
             written.append(path)
             trail_note = f", сегментов следа {segments}" if trail else ""
             log(
-                f"  кадр {k:5d} (t = {moment.t_rel_s:9.3f} с): точек {drawn}/10{trail_note} → {path}"
+                f"  кадр {k:5d} (t = {moment.t_rel_s:9.3f} с): точек "
+                f"{drawn}/{2 * len(skeleton.joints)}{trail_note} → {path}"
             )
     finally:
         capture.release()
@@ -1054,6 +1337,7 @@ def _format_stats(stats: RenderStats) -> str:
         f"{stats.size[0]}×{stats.size[1]}, {stats.fps:.4f} fps → {stats.duration_s:.3f} с",
         f"  кодек: {stats.codec}; файл {megabytes:.1f} МиБ; "
         f"поправка времени {stats.time_offset_ms:+.0f} мс",
+        f"  скелет: {stats.skeleton} ({stats.joints_per_hand} суставов на руку)",
         f"  рендер: {stats.elapsed_s:.1f} с, {stats.frames_per_s:.1f} кадр/с "
         f"(видимых суставов {stats.joints_drawn})",
         f"  {trail}",
@@ -1065,7 +1349,7 @@ def _format_stats(stats: RenderStats) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI: полный рендер, фрагмент (``--start/--end``) или PNG-проверка (``--stills``)."""
     parser = argparse.ArgumentParser(
-        description="Рендер видео с наложением скелета кистей, следа и HUD (задачи 08a/08b)."
+        description="Рендер видео с наложением скелета кистей, следа и HUD (08a/08b/08f)."
     )
     parser.add_argument("video", type=Path, help="data/CameraRecord_*.mp4 (полный SBS-кадр)")
     parser.add_argument(
@@ -1102,10 +1386,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="не рисовать HUD (панель времени/кадра/состояния рук)")
     parser.add_argument("--trail-seconds", type=float, default=TRAIL_SECONDS,
                         help=f"окно следа в секундах (по умолчанию {TRAIL_SECONDS:g})")
+    skeleton_group = parser.add_mutually_exclusive_group()
+    skeleton_group.add_argument(
+        "--all-joints",
+        action="store_true",
+        help="рисовать все 26 суставов OpenXR на руку (по умолчанию густой скелет из 17)",
+    )
+    skeleton_group.add_argument(
+        "--five-points",
+        action="store_true",
+        help="рисовать прежний 5-точечный скелет 08a (для сравнений «до/после»)",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
+    skeleton = ALL_JOINTS if args.all_joints else FIVE_POINT if args.five_points else DEFAULT_SKELETON
     try:
-        scene = load_scene(args.meta, args.tracking)
+        scene = load_scene(args.meta, args.tracking, extra_keys=skeleton.extra_keys)
         if args.time_offset_ms is not None:
             scene = replace(
                 scene,
@@ -1121,6 +1417,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"+{(scene.tracking_end_ns - scene.header_ns) / 1e9:.3f} с от header; "
             f"поправка времени {scene.time_offset_ns / 1e6:+.0f} мс"
         )
+        print(
+            f"скелет: {skeleton.name} — {skeleton.title}, "
+            f"рёбер {len(skeleton.bones)} на руку (--all-joints — 26 суставов, "
+            f"--five-points — 5 точек)"
+        )
         trail = not args.no_trail
         hud = not args.no_hud
         if args.stills is not None:
@@ -1133,6 +1434,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 trail=trail,
                 hud=hud,
                 trail_seconds=args.trail_seconds,
+                skeleton=skeleton,
             )
             print(f"PNG с наложением: {len(paths)} файлов в {args.stills}")
             return 0
@@ -1149,6 +1451,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             trail=trail,
             hud=hud,
             trail_seconds=args.trail_seconds,
+            skeleton=skeleton,
         )
     except (OSError, ValueError) as exc:
         print(f"ошибка: {exc}", file=sys.stderr)

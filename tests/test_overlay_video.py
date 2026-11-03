@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
 import numpy as np  # noqa: E402
 
 from src import calib_frames, camera_model, config, overlay_video as ov, sync  # noqa: E402
+from src.parse_tracking import HAND_JOINTS_FULL  # noqa: E402
 
 try:  # pragma: no cover — проверка окружения, а не логики
     import cv2
@@ -539,8 +540,12 @@ class DrawSkeletonTest(unittest.TestCase):
 
 
 @unittest.skipIf(cv2 is None, NO_CV2)
-class SyntheticRenderTest(unittest.TestCase):
-    """Рендер на синтетическом SBS-видео: те же файлы, что у реальной записи, но 6 кадров."""
+class SyntheticVideoCase(unittest.TestCase):
+    """Общая заготовка: 6-кадровое SBS-видео и файл трекинга формата 03a.
+
+    Отдельный класс без тестов, чтобы ``SyntheticRenderTest`` и ``DenseRenderTest`` (08f)
+    не наследовали тесты друг друга.
+    """
 
     FRAMES = 6
     FPS = 30.0
@@ -592,6 +597,10 @@ class SyntheticRenderTest(unittest.TestCase):
 
     def _scene(self) -> ov.Scene:
         return ov.load_scene(self.meta_path, self.tracking)
+
+
+class SyntheticRenderTest(SyntheticVideoCase):
+    """Рендер на синтетическом SBS-видео: те же файлы, что у реальной записи, но 6 кадров."""
 
     def test_scene_reads_time_offset_from_config(self) -> None:
         with mock.patch.object(config, "VIDEO_TIME_OFFSET_MS", -40.0):
@@ -936,6 +945,436 @@ class RealDataTest(unittest.TestCase):
                         continue
                     checked += 1
             self.assertGreaterEqual(checked, 5)
+
+
+
+# --- 08f: густой скелет ---------------------------------------------------------------
+
+
+#: Укладка суставов густого скелета на 1080×810: пальцы вверх, большой палец влево.
+#: Точки и середины рёбер разнесены, чтобы проверять отдельные кости по пикселям.
+DENSE_PIXELS = {
+    "palm": (500, 400),
+    "wrist": (500, 480),
+    "thumb_proximal": (430, 390),
+    "thumb_distal": (390, 350),
+    "thumb": (360, 310),
+    "index_proximal": (455, 330),
+    "index_intermediate": (450, 270),
+    "index_distal": (445, 220),
+    "index": (440, 180),
+    "middle_proximal": (500, 320),
+    "middle_intermediate": (500, 260),
+    "middle_distal": (500, 210),
+    "middle": (500, 170),
+    "ring_proximal": (545, 330),
+    "ring": (565, 190),
+    "little_proximal": (585, 345),
+    "little": (615, 215),
+}
+
+#: Середины рёбер, которые проверяются по цвету (см. :data:`DENSE_PIXELS`).
+BONE_MIDPOINTS = {
+    ("palm", "wrist"): (500, 440),
+    ("index_proximal", "index_intermediate"): (452.5, 300),
+    ("index_intermediate", "index_distal"): (447.5, 245),
+    ("middle_proximal", "middle_intermediate"): (500, 290),
+    ("middle_intermediate", "middle_distal"): (500, 235),
+}
+
+
+def _dense_pixels(visible: bool = True) -> dict:
+    """Пиксели густого скелета для обеих рук: правая сдвинута на 400 px вправо."""
+    return {
+        side: {
+            joint: camera_model.ProjectedPoint(float(x) + offset, float(y), visible)
+            for joint, (x, y) in DENSE_PIXELS.items()
+        }
+        for side, offset in (("left", 0.0), ("right", 400.0))
+    }
+
+
+def _dense_track(extra_keys=(), values=None) -> sync.PoseTrack:
+    """Трек из двух сэмплов: 5 точек как :data:`LEFT_POINTS`, остальные — из ``values``.
+
+    ``values`` — ``{ключ: (x0, x1)}`` для нужных осей: так тест задаёт позицию
+    дополнительного сустава в двух сэмплах и проверяет, что рендер читает трек,
+    а не берёт сустав из позы.
+    """
+    ts = [BASE_NS, BASE_NS + 33_000_000]
+    fields = {name: [0.0, 0.0] for name in (*sync.POSITION_FIELDS, *sync.QUAT_FIELDS)}
+    fields["head_qw"] = [1.0, 1.0]
+    for side, points in (("left", LEFT_POINTS), ("right", RIGHT_POINTS)):
+        for joint, position in points.items():
+            for axis, value in zip(sync.AXES, position):
+                fields[f"{side}_{joint}_{axis}"] = [value, value]
+    for key in extra_keys:
+        for axis in sync.AXES:
+            fields.setdefault(f"{key}_{axis}", [0.0, 0.0])
+    for name, pair in (values or {}).items():
+        if name not in fields:
+            raise ValueError(f"нет колонки {name}")
+        fields[name] = [float(pair[0]), float(pair[1])]
+    active = {"left": [True, True], "right": [True, True]}
+    return sync.PoseTrack(ts, fields, active, extra_keys=extra_keys)
+
+
+class SkeletonDefinitionTest(unittest.TestCase):
+    """Скелеты 08f: имена/индексы OpenXR, полнота цепочек, бюджет точек карточки."""
+
+    def test_full_skeleton_matches_openxr_table(self) -> None:
+        self.assertEqual(ov.FULL_JOINTS, tuple(name for name, _ in HAND_JOINTS_FULL))
+        self.assertEqual(len(ov.ALL_JOINTS.joints), 26)
+        self.assertEqual(len(ov.ALL_JOINTS.bones), 25)
+
+    def test_default_skeleton_fits_card_budget(self) -> None:
+        self.assertIs(ov.DEFAULT_SKELETON, ov.DENSE)
+        self.assertTrue(15 <= len(ov.DENSE.joints) <= 18)
+        self.assertEqual(ov.SKELETONS["dense"], ov.DENSE)
+
+    def test_finger_chains_are_complete(self) -> None:
+        chains = (
+            ("thumb_metacarpal", "thumb_proximal", "thumb_distal", "thumb"),
+            ("index_metacarpal", "index_proximal", "index_intermediate", "index_distal", "index"),
+            ("middle_metacarpal", "middle_proximal", "middle_intermediate", "middle_distal", "middle"),
+            ("ring_metacarpal", "ring_proximal", "ring_intermediate", "ring_distal", "ring"),
+            ("little_metacarpal", "little_proximal", "little_intermediate", "little_distal", "little"),
+        )
+        for chain in chains:
+            for start, end in zip(chain, chain[1:]):
+                self.assertIn((start, end), ov.FULL_BONES)
+            self.assertIn(("palm", chain[0]), ov.FULL_BONES)
+        self.assertIn(("palm", "wrist"), ov.FULL_BONES)
+
+    def test_every_bone_endpoint_belongs_to_joint_set(self) -> None:
+        for skeleton in ov.SKELETONS.values():
+            with self.subTest(skeleton=skeleton.name):
+                for start, end in skeleton.bones:
+                    self.assertIn(start, skeleton.joints)
+                    self.assertIn(end, skeleton.joints)
+                self.assertEqual(
+                    len({frozenset(bone) for bone in skeleton.bones}), len(skeleton.bones)
+                )
+
+    def test_extra_keys_exclude_render_points(self) -> None:
+        self.assertEqual(ov.FIVE_POINT.extra_keys, ())
+        dense = ov.DENSE.extra_keys
+        self.assertEqual(len(dense), 2 * (len(ov.DENSE.joints) - len(ov.JOINTS)))
+        for key in dense:
+            self.assertNotIn(key, sync.POINT_KEYS)
+        self.assertEqual(len(ov.ALL_JOINTS.extra_keys), 2 * 21)
+        self.assertIn("left_index_metacarpal", ov.ALL_JOINTS.extra_keys)
+
+    def test_validation_rejects_bad_definitions(self) -> None:
+        with self.assertRaises(ValueError):
+            ov.Skeleton("x", "x", ("palm", "nope"), (("palm", "nope"),))
+        with self.assertRaises(ValueError):
+            ov.Skeleton("x", "x", ("palm", "palm"), ())
+        with self.assertRaises(ValueError):
+            ov.Skeleton("x", "x", ("palm", "wrist"), (("palm", "thumb"),))
+        with self.assertRaises(ValueError):
+            ov.Skeleton("x", "x", ("palm", "wrist"), (("palm", "wrist"), ("wrist", "palm")))
+        with self.assertRaises(ValueError):
+            ov.Skeleton("x", "x", ("palm", "wrist"), (("palm", "wrist"), ("palm", "wrist")))
+        with self.assertRaises(ValueError):
+            ov.Skeleton("x", "x", (), ())
+
+
+@unittest.skipIf(cv2 is None, NO_CV2)
+class DenseDrawingTest(unittest.TestCase):
+    """``draw_skeleton`` на густом скелете: точки, рёбра и разрывы на невидимом конце."""
+
+    def setUp(self) -> None:
+        self.image = np.zeros((810, 1080, 3), np.uint8)
+        self.style = ov.style_for(1080)
+        self.pixels = _dense_pixels()
+
+    def _draw(self, pixels=None) -> int:
+        return ov.draw_skeleton(
+            self.image,
+            self.pixels if pixels is None else pixels,
+            self.style,
+            joints=ov.DENSE.joints,
+            bones=ov.DENSE.bones,
+        )
+
+    def test_draws_all_dense_points(self) -> None:
+        self.assertEqual(self._draw(), 2 * len(ov.DENSE.joints))
+        # цвета рук те же, что у 5-точечного скелета (BGR)
+        self.assertEqual(tuple(int(c) for c in self.image[400, 500]), ov.COLORS["left"])
+        self.assertEqual(tuple(int(c) for c in self.image[400, 900]), ov.COLORS["right"])
+
+    def test_all_dense_bones_are_drawn(self) -> None:
+        self._draw()
+        for (start, end), (x, y) in BONE_MIDPOINTS.items():
+            with self.subTest(bone=f"{start}→{end}"):
+                for offset in (0, 400):
+                    pixel = self.image[int(round(y)), int(round(x)) + offset]
+                    self.assertGreater(int(pixel.max()), 0, "середина ребра не закрашена")
+
+    def test_invisible_endpoint_skips_both_touching_bones(self) -> None:
+        self.pixels["left"]["index_intermediate"] = camera_model.ProjectedPoint(
+            math.nan, math.nan, False
+        )
+        self.assertEqual(self._draw(), 2 * len(ov.DENSE.joints) - 1)
+        x0 = DENSE_PIXELS["index_proximal"][0]
+        x1 = DENSE_PIXELS["index_intermediate"][0]
+        y = DENSE_PIXELS["index_intermediate"][1]
+        self.assertEqual(int(self.image[y, int((x0 + x1) / 2)].max()), 0)
+        # соседнее ребро до дистальной фаланги тоже не нарисовано (второй конец — тот же)
+        self.assertEqual(int(self.image[245, 447].max()), 0)
+        # остальные кости пальца на месте
+        self.assertGreater(int(self.image[200, 442].max()), 0)
+
+    def test_bone_to_off_frame_point_is_clipped_not_dropped(self) -> None:
+        self.pixels["left"]["little"] = camera_model.ProjectedPoint(5000.0, 215.0, True)
+        self.assertEqual(self._draw(), 2 * len(ov.DENSE.joints))
+        self.assertGreater(int(self.image[:, 1070].max()), 0, "ребро обрезано краем кадра")
+
+    def test_missing_joint_or_bad_bone_raises(self) -> None:
+        pixels = _dense_pixels()
+        del pixels["right"]["little"]
+        with self.assertRaises(ValueError) as ctx:
+            ov.draw_skeleton(
+                self.image, pixels, self.style, joints=ov.DENSE.joints, bones=ov.DENSE.bones
+            )
+        self.assertIn("little", str(ctx.exception))
+        with self.assertRaises(ValueError):
+            ov.draw_skeleton(
+                self.image,
+                _dense_pixels(),
+                self.style,
+                joints=("palm", "wrist"),
+                bones=(("palm", "thumb"),),
+            )
+        with self.assertRaises(ValueError):
+            ov.draw_skeleton(self.image, _dense_pixels(), self.style, joints=())
+
+
+class DenseProjectionTest(unittest.TestCase):
+    """``project_skeleton``: 5 точек из позы, остальные — из трека с ``extra_keys``."""
+
+    def test_extra_joints_are_read_from_track(self) -> None:
+        track = _dense_track(
+            ov.DENSE.extra_keys,
+            values={
+                "left_index_proximal_x": (0.30, 0.30),
+                "left_index_proximal_y": (0.40, 0.40),
+                "left_index_proximal_z": (-1.00, -1.00),
+            },
+        )
+        pose = track.pose_at(BASE_NS)
+        pixels = ov.project_skeleton(pose, EYE, ov.DENSE, track=track)
+        self.assertEqual(set(pixels["left"]), set(ov.DENSE.joints))
+        expected = camera_model.project(
+            camera_model.transform_point(
+                camera_model.world_to_camera_matrix(pose), (0.30, 0.40, -1.00)
+            ),
+            camera_model.eye_intrinsics(EYE, "left"),
+        )
+        got = pixels["left"]["index_proximal"]
+        self.assertAlmostEqual(got.u, expected.u, places=9)
+        self.assertAlmostEqual(got.v, expected.v, places=9)
+        self.assertTrue(got.visible)
+
+    def test_five_points_match_project_hands(self) -> None:
+        track = _dense_track(ov.DENSE.extra_keys)
+        pose = track.pose_at(BASE_NS)
+        dense = ov.project_skeleton(pose, EYE, ov.DENSE, track=track)
+        five = ov.project_hands(pose, EYE)
+        for side in ("left", "right"):
+            for joint in ov.JOINTS:
+                self.assertAlmostEqual(dense[side][joint].u, five[side][joint].u, places=9)
+                self.assertAlmostEqual(dense[side][joint].v, five[side][joint].v, places=9)
+                self.assertEqual(dense[side][joint].visible, five[side][joint].visible)
+
+    def test_nan_extra_joint_is_invisible(self) -> None:
+        track = _dense_track(
+            ov.DENSE.extra_keys,
+            values={
+                "right_middle_proximal_x": (0.20, 0.20),
+                "right_middle_proximal_y": (0.10, 0.10),
+                "right_middle_proximal_z": (-1.00, -1.00),
+                "right_middle_intermediate_x": (math.nan, math.nan),
+                "right_middle_intermediate_y": (math.nan, math.nan),
+                "right_middle_intermediate_z": (math.nan, math.nan),
+            },
+        )
+        pixels = ov.project_skeleton(track.pose_at(BASE_NS), EYE, ov.DENSE, track=track)
+        self.assertFalse(pixels["right"]["middle_intermediate"].visible)
+        # NaN в треке не портит соседние суставы
+        self.assertTrue(pixels["right"]["middle_proximal"].visible)
+
+    def test_track_without_extras_raises(self) -> None:
+        track = _dense_track(())
+        with self.assertRaises(ValueError) as ctx:
+            ov.project_skeleton(track.pose_at(BASE_NS), EYE, ov.DENSE, track=track)
+        self.assertIn("extra_keys", str(ctx.exception))
+        with self.assertRaises(ValueError):
+            ov.project_skeleton(track.pose_at(BASE_NS), EYE, ov.DENSE, track=None)
+
+    def test_five_point_skeleton_needs_no_extras(self) -> None:
+        pixels = ov.project_skeleton(_pose(), EYE, ov.FIVE_POINT)
+        self.assertEqual(set(pixels["left"]), set(ov.JOINTS))
+
+
+class DenseRenderTest(SyntheticVideoCase):
+    """Рендер густого скелета на синтетическом видео (та же заготовка, что у 08a)."""
+
+    def _dense_scene(self, skeleton: ov.Skeleton = ov.DENSE) -> ov.Scene:
+        return ov.load_scene(self.meta_path, self.tracking, extra_keys=skeleton.extra_keys)
+
+    def test_dense_render_draws_more_joints(self) -> None:
+        stats = ov.render_video(
+            self.video,
+            self.out,
+            self._dense_scene(),
+            progress_every=0,
+            log=lambda _: None,
+            skeleton=ov.DENSE,
+        )
+        self.assertEqual(stats.skeleton, "dense")
+        self.assertEqual(stats.joints_per_hand, len(ov.DENSE.joints))
+        self.assertEqual(stats.joints_drawn, 6 * 2 * len(ov.DENSE.joints))
+
+    def test_all_joints_render_has_26_per_hand(self) -> None:
+        stats = ov.render_video(
+            self.video,
+            self.out,
+            self._dense_scene(ov.ALL_JOINTS),
+            start=0,
+            end=2,
+            progress_every=0,
+            log=lambda _: None,
+            skeleton=ov.ALL_JOINTS,
+        )
+        self.assertEqual(stats.skeleton, "all")
+        self.assertEqual(stats.joints_per_hand, 26)
+        self.assertGreater(stats.joints_drawn, 3 * 2 * len(ov.DENSE.joints))
+
+    def test_dense_render_without_extra_keys_fails_before_writing(self) -> None:
+        scene = self._scene()  # трек без extra_keys
+        with self.assertRaises(ValueError) as ctx:
+            ov.render_video(
+                self.video, self.out, scene, progress_every=0, log=lambda _: None,
+                skeleton=ov.DENSE,
+            )
+        self.assertIn("extra_keys", str(ctx.exception))
+        self.assertFalse(self.out.exists(), "файл не должен появляться до проверки скелета")
+
+    def test_cli_selects_skeleton_mode(self) -> None:
+        import contextlib
+        import io
+
+        out = self.dir / "cli_dense"
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = ov.main(
+                [
+                    str(self.video), "--stills", str(out), "--frames", "5",
+                    "--tracking", str(self.tracking), "--meta", str(self.meta_path),
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.assertTrue((out / "frame_00005.png").is_file())
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = ov.main(
+                [
+                    str(self.video), "--stills", str(self.dir / "cli_five"), "--frames", "5",
+                    "--tracking", str(self.tracking), "--meta", str(self.meta_path),
+                    "--five-points",
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.assertTrue((self.dir / "cli_five" / "frame_00005.png").is_file())
+
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit) as ctx,
+        ):
+            ov.main(
+                [
+                    str(self.video), "--stills", str(self.dir / "cli_bad"), "--frames", "5",
+                    "--tracking", str(self.tracking), "--meta", str(self.meta_path),
+                    "--five-points", "--all-joints",
+                ]
+            )
+        self.assertEqual(ctx.exception.code, 2)
+
+
+@unittest.skipUnless(DATA is not None and META_PATH.is_file(), NO_DATA)
+class DenseRealDataTest(unittest.TestCase):
+    """Реальные 5 кадров 07a: густой скелет не сдвигает 5 опорных точек."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.scene = ov.load_scene(META_PATH, DATA, extra_keys=ov.DENSE.extra_keys)
+
+    def _pixels(self, k: int, skeleton: ov.Skeleton) -> dict:
+        moment = sync.frame_time(k, self.scene.meta, self.scene.header_ns, self.scene.tracking_end_ns)
+        pose = sync.pose_at_frame(self.scene.track, moment, self.scene.time_offset_ns)
+        return ov.project_skeleton(pose, self.scene.intrinsics, skeleton, track=self.scene.track)
+
+    def test_dense_keeps_five_point_projection(self) -> None:
+        for k in ov.DEBUG_FRAMES:
+            with self.subTest(frame=k):
+                five = self._pixels(k, ov.FIVE_POINT)
+                dense = self._pixels(k, ov.DENSE)
+                for side in ("left", "right"):
+                    for joint in ov.JOINTS:
+                        self.assertAlmostEqual(dense[side][joint].u, five[side][joint].u, places=9)
+                        self.assertAlmostEqual(dense[side][joint].v, five[side][joint].v, places=9)
+                        self.assertEqual(dense[side][joint].visible, five[side][joint].visible)
+
+    def test_dense_projection_covers_debug_frames(self) -> None:
+        for k in ov.DEBUG_FRAMES:
+            with self.subTest(frame=k):
+                pixels = self._pixels(k, ov.DENSE)
+                for side in ("left", "right"):
+                    self.assertEqual(set(pixels[side]), set(ov.DENSE.joints))
+                    self.assertGreater(
+                        sum(1 for joint in ov.DENSE.joints if pixels[side][joint].visible),
+                        sum(1 for joint in ov.JOINTS if pixels[side][joint].visible),
+                    )
+
+    def test_dense_joints_do_not_enter_hud(self) -> None:
+        """Густой скелет не рисуется поверх панели HUD (проверка 08b расширена на 17 точек)."""
+        x0, y0, x1, y1 = ov.hud_rect(self.scene.eye_size)
+        for k in ov.DEBUG_FRAMES:
+            pixels = self._pixels(k, ov.DENSE)
+            for side in ("left", "right"):
+                for joint in ov.DENSE.joints:
+                    point = pixels[side][joint]
+                    if not point.visible:
+                        continue
+                    self.assertFalse(
+                        x0 <= point.u < x1 and y0 <= point.v < y1,
+                        f"сустав {side} {joint} попал в HUD на кадре {k}",
+                    )
+
+    @unittest.skipIf(cv2 is None or VIDEO is None, f"{NO_CV2} или {NO_VIDEO}")
+    def test_dense_still_has_more_skeleton_pixels(self) -> None:
+        """На реальном кадре густой скелет закрашивает больше пикселей, чем 5-точечный."""
+        with tempfile.TemporaryDirectory() as tmp:
+            five = ov.render_stills(
+                VIDEO, self.scene, Path(tmp) / "five", frames=(1800,),
+                skeleton=ov.FIVE_POINT, log=lambda _: None,
+            )
+            dense = ov.render_stills(
+                VIDEO, self.scene, Path(tmp) / "dense", frames=(1800,),
+                skeleton=ov.DENSE, log=lambda _: None,
+            )
+            image_five = cv2.imread(str(five[0]))
+            image_dense = cv2.imread(str(dense[0]))
+
+        def overlay_pixels(image) -> int:
+            # левая рука цвета COLORS["left"] = BGR (255, 140, 0): PNG без потерь кодека
+            blue = (image[..., 0] > 235) & (image[..., 1] > 120) & (image[..., 2] < 40)
+            red = (image[..., 2] > 235) & (image[..., 1] < 30) & (image[..., 0] < 40)
+            return int(blue.sum() + red.sum())
+
+        self.assertGreater(overlay_pixels(image_dense), overlay_pixels(image_five))
 
 
 if __name__ == "__main__":
