@@ -164,11 +164,23 @@ max угол между ориентациями 79.3°, измеренная д
 просьбе пользователя **восстановлен** (revert коммита f0de8c6): `src/sync_viewer.py` и его
 30 тестов на месте. Тесты
 **688/688**; 10-с фрагмент — 301 кадр, 4.0 МиБ, 4.1 с, 73.4 кадр/с. `docs/preview.png` — кадр 4285
-из финального клипа (не побайтовая копия: PNG, а GIF пересобран из кадров 4300–4390). Осталось
-`todo`: 11, 12; мерж **08d → … → 08h-fix2**, затем **10a → 10b → 10c** — пользователь.
+из финального клипа (не побайтовая копия: PNG, а GIF пересобран из кадров 4300–4390).
+**11 — `in_review`** (ветка `VTR-11`, от `VTR-10c`): прогон «с нуля» тремя чистыми клонами
+(новый venv, Python 3.13.3, `pip install -r requirements.txt`) вскрыл два разрыва README —
+(1) в блоке запуска не было `src/video_meta.py`, без `output/video_meta.json` рендер падал с
+`No such file or directory: 'output/video_meta.json'`; (2) каталога `data/` в клоне нет (git не
+хранит пустые каталоги) — добавлены `mkdir -p data` и пояснение. `requirements.txt` закреплён
+точными версиями `opencv-python==5.0.0.93`, `numpy==2.5.4`, `pandas==3.1.0`, `plotly==7.1.0`
+(Python ≥ 3.12 из-за numpy/pandas); в README записаны тайминги (метаданные 21 с, парсинг 18 с,
+рендер 80–103 с, графики 0.8 с, вьюер 0.4 с, тесты 88–90 с) и побайтовое совпадение пяти
+артефактов с эталоном: `tracking.csv` `b5942563…eabe523`, `overlay.mp4` `80b64695…eb5c4bc`,
+`trajectory.html` `348e3dde…cd2c565`, `sync_viewer.html` `e2388797…bebd6f`, `video_meta.json`.
+Индекс: 56 файлов, максимум 4 197 565 байт (`docs/media/overlay_10s.mp4`), > 5 МиБ нет; тесты
+**688/688**; запись — `docs/NOTES.md`, 03.11. Осталось `todo`: 12; мерж **08d → … → 08h-fix2**,
+затем **10a → 10b → 10c → 11** — пользователь.
 В репозитории есть
-`src/{parse_tracking,sync,camera_model,calib_frames,calib_bones,calib_search,config,overlay_video,
-drift_diag,plot_trajectory,sync_viewer}.py`, `tests/` и
+`src/{parse_tracking,video_meta,sync,camera_model,calib_frames,calib_bones,calib_search,config,
+overlay_video,drift_diag,plot_trajectory,sync_viewer}.py`, `tests/` и
 `docs/{intrinsics,projection_notes,overlay}.md`. Каждая выполненная задача сопровождается записью в
 `docs/NOTES.md` — см. **раздел 13**.
 
