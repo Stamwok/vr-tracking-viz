@@ -125,7 +125,13 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src import camera_model, sync
-from src.parse_tracking import HAND_JOINTS, HAND_JOINTS_FULL, read_header, timestamp_range
+from src.parse_tracking import (
+    ELBOW_KEYS,
+    HAND_JOINTS,
+    HAND_JOINTS_FULL,
+    read_header,
+    timestamp_range,
+)
 
 #: Имена 5 суставов на руку в порядке отрисовки (те же, что в ``tracking.csv``).
 JOINTS = tuple(name for name, _ in HAND_JOINTS)
@@ -304,6 +310,261 @@ DEFAULT_SKELETON = DENSE
 
 #: Скелет, кадр которого должен воспроизводиться без новых эффектов (задача 08a).
 FLAT_SKELETON = FIVE_POINT
+
+
+# --- 08h: предплечье (elbow из Body → Hand.wrist) --------------------------------------
+
+#: Ключи локтей в ``sync.PoseTrack.extra_keys``: ``left_elbow``/``right_elbow``.
+#: Локти лежат в ``Body.joints[18/19]`` (в Hand локтя нет) и грузятся в трек тем же
+#: путём, что дополнительные суставы скелета 08f (``extra_keys`` + ``joint_at``).
+FOREARM_KEYS = ELBOW_KEYS
+
+#: Допустимая длина ребра ``elbow → wrist``, метры. Вне этого диапазона ребро не рисуется:
+#: локоть Body — IK-оценка, и «улетевший» локоть (длина предплечья 0.2…0.38 м вместо
+#: физических ~0.25 м) дал бы линию через пол-кадра. Замер по записи: 0.192…0.376 м,
+#: p50 0.230/0.303 м; окно 0.15…0.40 м с запасом покрывает валидные значения и отсекает
+#: выбросы. Константы — часть защиты, а не калибровки: они не меняют проекцию.
+FOREARM_MIN_LENGTH_M = 0.15
+FOREARM_MAX_LENGTH_M = 0.40
+
+#: Множитель цвета ребра-оценки: линия тоньше и бледнее измеренных костей кисти, поэтому
+#: в кадре читается как «приблизительно». Цвет руки сохраняется (умножаются все каналы),
+#: глубина 08g-fix4 уменьшает его дальше; итог всегда ≤ 0.70 от цвета руки.
+FOREARM_COLOR_FACTOR = 0.60
+
+#: Толщина ребра-оценки на кадре 1080×810, px (у костей кисти 2, с глубиной 3): ребро
+#: визуально тоньше и не спорит с измеренным скелетом.
+FOREARM_LINE_THICKNESS_PX = 2
+
+#: Кандидаты в дополнительные рёбра, которые **сознательно не рисуются** (08h).
+#: ``shoulder → elbow`` (Body.joints[16/17] → [18/19]) выглядит осмысленно, но замер по
+#: всем 21 787 сэмплам даёт длину ровно 0.2290 м слева и 0.2307 м справа со std 0.0000 м
+#: во всех кадрах: это зашитая константа скелета Body, а не измерение позы. Рисовать её
+#: значило бы выдавать константу за данные, поэтому список пуст, а плечо остаётся
+#: невидимым. Если появится валидное измеренное ребро, его место — здесь.
+OPTIONAL_BONES: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class Forearm:
+    """Ребро «локоть → запястье» одной руки на кадре (задача 08h).
+
+    ``elbow``/``wrist`` — пиксели глаза (``ProjectedPoint``: видимость уже посчитана),
+    ``elbow_depth``/``wrist_depth`` — ``z`` в системе камеры для шкалы глубины 08g-fix4,
+    ``length`` — длина ребра **в мире** (метры). Концом ребра служит точный ``Hand.wrist``,
+    а не ``Body.wrist``: Body-запястье лишь аппроксимирует его (медиана 0.9/7.2 мм, max
+    16/60 мм), и подмена внесла бы второй источник координат.
+    """
+
+    side: str
+    elbow: camera_model.ProjectedPoint
+    wrist: camera_model.ProjectedPoint
+    elbow_depth: float
+    wrist_depth: float
+    length: float
+
+    @property
+    def out_of_range(self) -> bool:
+        """Локоть «улетел»: конечная длина ребра вне 0.15…0.40 м (``NaN`` — не выброс)."""
+        if not math.isfinite(self.length):
+            return False
+        return not (FOREARM_MIN_LENGTH_M <= self.length <= FOREARM_MAX_LENGTH_M)
+
+    @property
+    def drawable(self) -> bool:
+        """Ребро можно рисовать: оба конца видимы и длина в допустимом диапазоне."""
+        return (
+            self.elbow.visible
+            and self.wrist.visible
+            and math.isfinite(self.length)
+            and not self.out_of_range
+        )
+
+    @property
+    def status(self) -> str:
+        """Короткий маркер для HUD: ``IK`` (нарисовано) или ``n/a`` (пропущено)."""
+        return "IK" if self.drawable else "n/a"
+
+
+def forearm_length(
+    elbow: Sequence[float], wrist: Sequence[float]
+) -> float:
+    """Длина ребра ``elbow → wrist`` в метрах; ``NaN``, если координаты не конечны (08h).
+
+    Считается в мировых координатах (те же единицы — метры), поэтому порог 0.15…0.40 м
+    не зависит от проекции и от калибровки. Валидация не бросает исключение: у неактивной
+    руки координаты — ``NaN``, и это штатное «нет данных», а не ошибка формата.
+    """
+    if len(elbow) != 3 or len(wrist) != 3:
+        raise ValueError(f"forearm_length: ожидались 3+3 координаты, получено {elbow!r}, {wrist!r}")
+    values = (*elbow, *wrist)
+    if not all(math.isfinite(float(value)) for value in values):
+        return math.nan
+    dx = float(elbow[0]) - float(wrist[0])
+    dy = float(elbow[1]) - float(wrist[1])
+    dz = float(elbow[2]) - float(wrist[2])
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
+
+
+def _require_forearm_track(track: sync.PoseTrack | None) -> None:
+    """Проверить, что в треке есть локти (08h): ошибка до первого кадра, а не в середине."""
+    if track is None:
+        raise ValueError("предплечье: нужны локти Body — передайте track с extra_keys")
+    missing = [key for key in FOREARM_KEYS if key not in track.extra_keys]
+    if missing:
+        raise ValueError(
+            f"предплечье: в треке нет {missing!r}; загрузите сцену с "
+            "load_scene(..., extra_keys=... + FOREARM_KEYS)"
+        )
+
+
+def project_forearms(
+    pose: sync.Pose,
+    intrinsics: camera_model.Intrinsics,
+    track: sync.PoseTrack | None,
+    side: str = "left",
+) -> dict[str, Forearm]:
+    """Пиксели рёбер ``elbow → Hand.wrist`` обеих рук на кадре (08h).
+
+    Локоть берётся через ``track.joint_at(pose.ts_ns, f"{hand}_elbow")`` — та же линейная
+    интерполяция и тот же момент времени, что у дополнительных суставов скелета 08f;
+    запястье — из :class:`sync.Pose` (точный ``Hand.wrist``). Матрица ``мир → камера``
+    считается один раз на кадр, калибровка не меняется. Точка за камерой/``NaN`` даёт
+    ``visible = False``, длина вне 0.15…0.40 м — ``drawable = False``: оба случая рвут
+    ребро, но не роняют кадр.
+    """
+    _require_forearm_track(track)
+    if not isinstance(pose, sync.Pose):
+        raise ValueError(f"pose: ожидался sync.Pose, получено {type(pose).__name__}")
+    matrix = camera_model.world_to_camera_matrix(pose)
+    eye = camera_model.eye_intrinsics(intrinsics, side)
+    result: dict[str, Forearm] = {}
+    for hand in ("left", "right"):
+        elbow_world = track.joint_at(pose.ts_ns, f"{hand}_elbow")  # type: ignore[union-attr]
+        wrist_world = pose.hands[f"{hand}_wrist"]
+        length = forearm_length(elbow_world, wrist_world)
+        if not (all(math.isfinite(value) for value in elbow_world) and all(
+            math.isfinite(value) for value in wrist_world
+        )):
+            result[hand] = Forearm(
+                side=hand,
+                elbow=camera_model.ProjectedPoint(math.nan, math.nan, False),
+                wrist=camera_model.ProjectedPoint(math.nan, math.nan, False),
+                elbow_depth=math.nan,
+                wrist_depth=math.nan,
+                length=length,
+            )
+            continue
+        elbow_cam = camera_model.transform_point(matrix, elbow_world)
+        wrist_cam = camera_model.transform_point(matrix, wrist_world)
+        result[hand] = Forearm(
+            side=hand,
+            elbow=camera_model.project(elbow_cam, eye),
+            wrist=camera_model.project(wrist_cam, eye),
+            elbow_depth=elbow_cam[2],
+            wrist_depth=wrist_cam[2],
+            length=length,
+        )
+    return result
+
+
+def forearm_style(style: Style) -> Style:
+    """Стиль ребра-оценки: та же точка, толщина :data:`FOREARM_LINE_THICKNESS_PX` (08h).
+
+    Толщина масштабируется вместе с кадром и ``--scale`` так же, как у костей: отношение
+    к базовой :data:`LINE_THICKNESS_PX` сохраняется, но ребро остаётся тоньше измеренных
+    костей кисти (в режиме глубины у них :data:`DEPTH_LINE_THICKNESS_PX`).
+    """
+    if not isinstance(style, Style):
+        raise ValueError(f"style: ожидался Style, получено {style!r}")
+    factor = FOREARM_LINE_THICKNESS_PX / LINE_THICKNESS_PX
+    return Style(
+        point_radius=style.point_radius,
+        line_thickness=max(1, int(round(style.line_thickness * factor))),
+    )
+
+
+def draw_forearms(
+    image: Any,
+    forearms: Mapping[str, Forearm],
+    style: Style,
+    *,
+    colors: Mapping[str, tuple[int, int, int]] | None = None,
+    depths: Mapping[str, Mapping[str, float]] | None = None,
+    joints: Sequence[str] = JOINTS,
+    shade: bool = False,
+    alpha: bool = False,
+    relative: bool = False,
+    gamma: float = 1.0,
+) -> tuple[int, int, int]:
+    """Нарисовать рёбра-оценки (in place) и вернуть счётчики ``(drawn, skipped, out_of_range)``.
+
+    Ребро рисуется **до** скелета кисти, поэтому измеренные точки и кости ложатся поверх
+    оценки и не перекрываются ею. Стиль: цвет руки × :data:`FOREARM_COLOR_FACTOR`, толщина
+    :data:`FOREARM_LINE_THICKNESS_PX`; ``shade``/``alpha``/``relative``/``gamma`` —
+    та же шкала 08g-fix4, что у скелета (глубина по концам ребра, ``z_ref`` своей руки по
+    видимым суставам кисти из ``depths``). Глубина хотя бы одного конца неизвестна или
+    точка за камерой или длина вне 0.15…0.40 м — ребро пропускается и попадает в счётчик;
+    ``out_of_range`` — отдельный счётчик именно «улетевшего» локтя.
+    """
+    if not isinstance(style, Style):
+        raise ValueError(f"style: ожидался Style, получено {style!r}")
+    if image is None or getattr(image, "ndim", 0) != 3:
+        raise ValueError("image: ожидался BGR-кадр (H×W×3)")
+    for name, value in (("shade", shade), ("alpha", alpha), ("relative", relative)):
+        if not isinstance(value, bool):
+            raise ValueError(f"{name}: ожидалось bool, получено {value!r}")
+    _check_gamma(gamma)
+    if relative and depths is None:
+        raise ValueError("relative: относительная шкала предплечья невозможна без depths")
+    for side in ("left", "right"):
+        if side not in forearms:
+            raise ValueError(f"forearms: нет руки {side!r}")
+    palette = COLORS if colors is None else colors
+    draw_style = forearm_style(style)
+    base_colors = {
+        side: shade_color(palette[side], FOREARM_COLOR_FACTOR) for side in ("left", "right")
+    }
+    if relative and depths is not None:
+        scale_near, scale_far = relative_depth_window(gamma)
+    else:
+        scale_near, scale_far = (DEPTH_NEAR_M, DEPTH_FAR_M)
+    drawn = skipped = out_of_range = 0
+    for side in ("left", "right"):
+        forearm = forearms[side]
+        if not isinstance(forearm, Forearm):
+            raise ValueError(f"forearms[{side!r}]: ожидался Forearm, получено {forearm!r}")
+        if not forearm.drawable:
+            skipped += 1
+            if forearm.out_of_range:
+                out_of_range += 1
+            continue
+        z_ref = 0.0
+        if relative and depths is not None:
+            reference = depth_reference(
+                depths[side].get(joint, math.nan) for joint in joints
+            )
+            z_ref = 0.0 if reference is None else reference
+        depth_start = forearm.elbow_depth if (shade or alpha) else None
+        depth_end = forearm.wrist_depth if (shade or alpha) else None
+        _paint_bone(
+            image,
+            forearm.elbow,
+            forearm.wrist,
+            base_colors[side],
+            draw_style,
+            depth_start,
+            depth_end,
+            shade=shade,
+            alpha=alpha,
+            z_ref=z_ref,
+            near=scale_near,
+            far=scale_far,
+            gamma=gamma,
+        )
+        drawn += 1
+    return drawn, skipped, out_of_range
+
 
 
 def resolve_depth_shading(value: bool | None, skeleton: Skeleton) -> bool:
@@ -2016,8 +2277,15 @@ def hud_items(
     frame_count: int,
     *,
     trail_seconds: float | None = TRAIL_SECONDS,
+    forearm: Mapping[str, bool] | None = None,
 ) -> list[tuple[str, tuple[int, int, int]]]:
-    """Строки HUD: время, кадр, состояние рук, след. Подписи латиницей (см. модуль)."""
+    """Строки HUD: время, кадр, состояние рук, след. Подписи латиницей (см. модуль).
+
+    ``forearm`` (08h) — состояние ребра-оценки на кадре: ``side → True`` для ``IK``
+    (ребро нарисовано) и ``False`` для ``n/a`` (локоть невалиден или длина вне диапазона).
+    ``None`` — режим без предплечья: строки рук остаются ровно прежними (кадр 08g-fix4
+    побайтово), поэтому маркер не появляется, когда флаг ``--forearm`` выключен.
+    """
     if not isinstance(moment, sync.FrameTime):
         raise ValueError(f"moment: ожидался sync.FrameTime, получено {type(moment).__name__}")
     if not isinstance(pose, sync.Pose):
@@ -2026,10 +2294,20 @@ def hud_items(
         raise ValueError(f"frame_count: ожидалось целое > 0, получено {frame_count!r}")
     if not 0 <= moment.index < frame_count:
         raise ValueError(f"кадр {moment.index} вне 0…{frame_count - 1}")
+    if forearm is not None:
+        if not isinstance(forearm, Mapping):
+            raise ValueError(f"forearm: ожидался Mapping side → bool, получено {forearm!r}")
+        for side in ("left", "right"):
+            if side not in forearm:
+                raise ValueError(f"forearm: нет состояния руки {side!r}")
+            if not isinstance(forearm[side], bool):
+                raise ValueError(f"forearm[{side!r}]: ожидалось bool, получено {forearm[side]!r}")
 
     def hand_row(side: str) -> tuple[str, tuple[int, int, int]]:
         active = pose.active.get(side)
         text = f"{side}: {'OK' if active else 'NO DATA'}"
+        if forearm is not None:
+            text += f" | forearm: {'IK' if forearm[side] else 'n/a'}"
         return text, HUD_TEXT_COLOR if active else HUD_WARNING_COLOR
 
     rows = [
@@ -2056,11 +2334,13 @@ def draw_hud(
     frame_count: int,
     *,
     trail_seconds: float | None = TRAIL_SECONDS,
+    forearm: Mapping[str, bool] | None = None,
 ) -> tuple[int, int, int, int]:
     """Нарисовать HUD (in place) и вернуть его прямоугольник.
 
     Панель полупрозрачная и стоит в левом верхнем углу; текст проверяется на вписывание в
-    панель до отрисовки, чтобы длинная строка не вылезала за её край.
+    панель до отрисовки, чтобы длинная строка не вылезала за её край. ``forearm`` (08h) —
+    маркер ``IK``/``n/a`` в строках рук; ``None`` — прежние строки без маркера.
     """
     import cv2  # noqa: PLC0415
     import numpy as np  # noqa: PLC0415
@@ -2074,7 +2354,7 @@ def draw_hud(
     thickness = max(1, int(round(factor)))
     step = int(round(HUD_LINE_STEP_PX * factor))
     pad = int(round(HUD_PADDING_PX * factor))
-    rows = hud_items(moment, pose, frame_count, trail_seconds=trail_seconds)
+    rows = hud_items(moment, pose, frame_count, trail_seconds=trail_seconds, forearm=forearm)
 
     if pad * 2 + len(rows) * step > y1 - y0:
         raise ValueError(f"HUD: {len(rows)} строк не влезают в панель {x1 - x0}×{y1 - y0}")
@@ -2121,6 +2401,16 @@ def _eye_view(image: Any, scene: Scene) -> Any:
     return image[:eye_height, :eye_width].copy()
 
 
+@dataclass(frozen=True)
+class PoseDraw:
+    """Что нарисовано на кадре: суставы скелета и счётчики рёбер-оценок (08h)."""
+
+    joints: int
+    forearm_drawn: int = 0
+    forearm_skipped: int = 0
+    forearm_out_of_range: int = 0
+
+
 def _draw_pose(
     image: Any,
     pose: sync.Pose,
@@ -2132,7 +2422,8 @@ def _draw_pose(
     depth_alpha: bool = False,
     depth_relative: bool = False,
     depth_gamma: float = 1.0,
-) -> int:
+    forearms: Mapping[str, Forearm] | None = None,
+) -> PoseDraw:
     """Спроецировать скелет кадра и нарисовать его на уже обрезанном кадре глаза.
 
     ``depth_shading`` (08g) — красить ли по глубине: тогда вместе с пикселями считается
@@ -2149,6 +2440,11 @@ def _draw_pose(
 
     ``depth_gamma`` (08g-fix4) — степень нелинейной шкалы (только вместе с ``depth_shading``),
     см. :func:`draw_skeleton`; 1.0 — прежняя линейная шкала 08g-fix3.
+
+    ``forearms`` (08h) — рёбра ``elbow → wrist`` обеих рук (:func:`project_forearms`).
+    ``None`` — режим без предплечья (кадр побайтово прежний). Иначе рёбра-оценки рисуются
+    **до** скелета кисти: измеренные точки и кости ложатся поверх, ребро их не перекрывает.
+    Возврат — :class:`PoseDraw`: число суставов (как раньше) и счётчики рёбер.
     """
     if depth_shading:
         pixels, depths = project_skeleton_depth(
@@ -2158,13 +2454,26 @@ def _draw_pose(
         pixels, depths = project_skeleton(
             pose, scene.intrinsics, skeleton, track=scene.track
         ), None
+    forearm_counts = (0, 0, 0)
+    if forearms is not None:
+        forearm_counts = draw_forearms(
+            image,
+            forearms,
+            style,
+            depths=depths,
+            joints=skeleton.joints,
+            shade=depth_shading,
+            alpha=depth_shading and depth_alpha,
+            relative=depth_shading and depth_relative,
+            gamma=depth_gamma if depth_shading else 1.0,
+        )
     draw_style = style
     if depth_shading and skeleton.name != FLAT_SKELETON.name:
         # градиент вдоль кости виден только на линии потолще; 5-точечный кадр 08a не трогаем
         target = max(1, int(round(DEPTH_LINE_THICKNESS_PX * scene.eye_size[0] / REFERENCE_WIDTH)))
         if target > style.line_thickness:
             draw_style = Style(point_radius=style.point_radius, line_thickness=target)
-    return draw_skeleton(
+    joints = draw_skeleton(
         image,
         pixels,
         draw_style,
@@ -2174,6 +2483,12 @@ def _draw_pose(
         alpha=depth_shading and depth_alpha,
         relative=depth_shading and depth_relative,
         gamma=depth_gamma if depth_shading else 1.0,
+    )
+    return PoseDraw(
+        joints=joints,
+        forearm_drawn=forearm_counts[0],
+        forearm_skipped=forearm_counts[1],
+        forearm_out_of_range=forearm_counts[2],
     )
 
 
@@ -2262,6 +2577,23 @@ class RenderStats:
     depth_relative: bool = False
     #: 08g-fix4: степень нелинейной шкалы (1.0 — линейная, 08g-fix3 побайтово).
     depth_gamma: float = 1.0
+    #: 08h: рисовались ли рёбра-оценки предплечья и сколько их нарисовано/пропущено.
+    forearm: bool = False
+    forearm_drawn: int = 0
+    forearm_skipped: int = 0
+    #: 08h: из пропущенных — сколько именно из-за длины вне 0.15…0.40 м («улетевший» локоть).
+    forearm_out_of_range: int = 0
+
+    @property
+    def forearm_total(self) -> int:
+        """Сколько рёбер-оценок обработано (нарисовано + пропущено)."""
+        return self.forearm_drawn + self.forearm_skipped
+
+    @property
+    def forearm_drawn_share(self) -> float:
+        """Доля нарисованных рёбер среди обработанных (0…1); 0, если рёбер не было."""
+        total = self.forearm_total
+        return self.forearm_drawn / total if total else 0.0
 
     @property
     def frames(self) -> int:
@@ -2317,6 +2649,7 @@ def render_video(
     depth_alpha: bool | None = None,
     depth_relative: bool | None = None,
     depth_gamma: float | None = None,
+    forearm: bool = False,
     log: Callable[[str], None] = print,
 ) -> RenderStats:
     """Отрендерить диапазон кадров ``start…end`` в ``out`` и вернуть :class:`RenderStats`.
@@ -2350,6 +2683,10 @@ def render_video(
     ``depth_gamma`` (08g-fix4) — степень нелинейной шкалы: ``None`` — авторежим
     (:func:`resolve_depth_gamma`: 0.7 для густого/26, 1.0 для 5 точек), ``1.0`` — линейная
     шкала 08g-fix3 побайтово, 0 < γ < 1 — нелинейная. Без ``depth_shading`` не действует.
+
+    ``forearm`` (08h) — рисовать ли ребро-оценку ``elbow → wrist`` (по умолчанию выключено,
+    поэтому прежний кадр воспроизводится побайтово). Для него сцена должна быть загружена с
+    ``extra_keys``, включающими :data:`FOREARM_KEYS`; иначе ``ValueError`` до записи.
     """
     import cv2  # noqa: PLC0415
 
@@ -2357,10 +2694,12 @@ def render_video(
         raise ValueError(f"progress_every: ожидалось целое число, получено {progress_every!r}")
     if progress_every < 0:
         raise ValueError(f"progress_every: должно быть ≥ 0, получено {progress_every!r}")
-    for name, value in (("trail", trail), ("hud", hud)):
+    for name, value in (("trail", trail), ("hud", hud), ("forearm", forearm)):
         if not isinstance(value, bool):
             raise ValueError(f"{name}: ожидалось bool, получено {value!r}")
     _require_skeleton_track(scene.track, skeleton)
+    if forearm:
+        _require_forearm_track(scene.track)
     shading = resolve_depth_shading(depth_shading, skeleton)
     transparency = shading and resolve_depth_alpha(depth_alpha, skeleton)
     relative = shading and resolve_depth_relative(depth_relative, skeleton)
@@ -2396,6 +2735,9 @@ def render_video(
         joints = 0
         trail_segments = 0
         after_tracking = 0
+        forearm_drawn = 0
+        forearm_skipped = 0
+        forearm_out_of_range = 0
         completed = False
         try:
             for k in range(first, last + 1):
@@ -2409,7 +2751,10 @@ def render_video(
                     trail_segments += draw_trail(
                         view, pose, scene.track, scene.intrinsics, style, seconds=trail_seconds
                     )
-                joints += _draw_pose(
+                forearms = (
+                    project_forearms(pose, scene.intrinsics, scene.track) if forearm else None
+                )
+                drawn_pose = _draw_pose(
                     view,
                     pose,
                     scene,
@@ -2419,7 +2764,12 @@ def render_video(
                     depth_alpha=transparency,
                     depth_relative=relative,
                     depth_gamma=gamma,
+                    forearms=forearms,
                 )
+                joints += drawn_pose.joints
+                forearm_drawn += drawn_pose.forearm_drawn
+                forearm_skipped += drawn_pose.forearm_skipped
+                forearm_out_of_range += drawn_pose.forearm_out_of_range
                 if hud:
                     draw_hud(
                         view,
@@ -2427,6 +2777,11 @@ def render_video(
                         pose,
                         scene.frame_count,
                         trail_seconds=trail_seconds if trail else None,
+                        forearm=(
+                            {side: item.drawable for side, item in forearms.items()}
+                            if forearms is not None
+                            else None
+                        ),
                     )
                 if not moment.in_tracking:
                     after_tracking += 1
@@ -2474,6 +2829,10 @@ def render_video(
         depth_alpha=transparency,
         depth_relative=relative,
         depth_gamma=gamma,
+        forearm=forearm,
+        forearm_drawn=forearm_drawn,
+        forearm_skipped=forearm_skipped,
+        forearm_out_of_range=forearm_out_of_range,
     )
 
 
@@ -2492,6 +2851,7 @@ def render_stills(
     depth_alpha: bool | None = None,
     depth_relative: bool | None = None,
     depth_gamma: float | None = None,
+    forearm: bool = False,
     log: Callable[[str], None] = print,
 ) -> list[Path]:
     """Сохранить PNG-кадры с наложением (по умолчанию 5 отладочных кадров 07a).
@@ -2513,15 +2873,20 @@ def render_stills(
 
     ``depth_gamma`` (08g-fix4) — как у :func:`render_video`: степень нелинейной шкалы
     (авторежим 0.7 для густого/26, 1.0 для 5 точек; явное значение — из ``--depth-gamma``).
+    ``forearm`` (08h) — рисовать ли ребро-оценку предплечья; по умолчанию выключено.
     """
     import cv2  # noqa: PLC0415
 
     video = Path(video)
     if not video.is_file():
         raise FileNotFoundError(f"нет видео: {video}")
+    if not isinstance(forearm, bool):
+        raise ValueError(f"forearm: ожидалось bool, получено {forearm!r}")
     indices = sorted(set(frames))
     style = style_for(scene.eye_size[0], scale)
     _require_skeleton_track(scene.track, skeleton)
+    if forearm:
+        _require_forearm_track(scene.track)
     shading = resolve_depth_shading(depth_shading, skeleton)
     transparency = shading and resolve_depth_alpha(depth_alpha, skeleton)
     relative = shading and resolve_depth_relative(depth_relative, skeleton)
@@ -2554,7 +2919,10 @@ def render_stills(
                 segments = draw_trail(
                     view, pose, scene.track, scene.intrinsics, style, seconds=trail_seconds
                 )
-            drawn = _draw_pose(
+            forearms = (
+                project_forearms(pose, scene.intrinsics, scene.track) if forearm else None
+            )
+            drawn_pose = _draw_pose(
                 view,
                 pose,
                 scene,
@@ -2564,7 +2932,9 @@ def render_stills(
                 depth_alpha=transparency,
                 depth_relative=relative,
                 depth_gamma=gamma,
+                forearms=forearms,
             )
+            drawn = drawn_pose.joints
             if hud:
                 draw_hud(
                     view,
@@ -2572,6 +2942,11 @@ def render_stills(
                     pose,
                     scene.frame_count,
                     trail_seconds=trail_seconds if trail else None,
+                    forearm=(
+                        {side: item.drawable for side, item in forearms.items()}
+                        if forearms is not None
+                        else None
+                    ),
                 )
             if not moment.in_tracking:
                 log(f"  кадр {k:5d}: трекинга уже нет — поза заморожена (по 04a)")
@@ -2580,9 +2955,15 @@ def render_stills(
                 raise ValueError(f"не удалось записать {path}")
             written.append(path)
             trail_note = f", сегментов следа {segments}" if trail else ""
+            forearm_note = (
+                f", рёбер предплечья {drawn_pose.forearm_drawn} (пропущено "
+                f"{drawn_pose.forearm_skipped})"
+                if forearms is not None
+                else ""
+            )
             log(
                 f"  кадр {k:5d} (t = {moment.t_rel_s:9.3f} с): точек "
-                f"{drawn}/{2 * len(skeleton.joints)}{trail_note} → {path}"
+                f"{drawn}/{2 * len(skeleton.joints)}{trail_note}{forearm_note} → {path}"
             )
     finally:
         capture.release()
@@ -2621,6 +3002,15 @@ def _format_stats(stats: RenderStats) -> str:
             shading_line += "; только яркость, без alpha (кадр 08g-fix)"
     else:
         shading_line = "нет (плоские цвета рук)"
+    if stats.forearm:
+        forearm_line = (
+            f"да (цвет × {FOREARM_COLOR_FACTOR:g}, толщина {FOREARM_LINE_THICKNESS_PX} px, "
+            f"0.15…0.40 м): нарисовано {stats.forearm_drawn}, пропущено "
+            f"{stats.forearm_skipped} (из них длина вне диапазона "
+            f"{stats.forearm_out_of_range})"
+        )
+    else:
+        forearm_line = "нет (по умолчанию; флаг --forearm)"
     lines = [
         f"записано: {stats.out}",
         f"  кадры: {stats.first_frame}…{stats.last_frame} ({stats.frames}), "
@@ -2629,6 +3019,7 @@ def _format_stats(stats: RenderStats) -> str:
         f"поправка времени {stats.time_offset_ms:+.0f} мс",
         f"  скелет: {stats.skeleton} ({stats.joints_per_hand} суставов на руку)",
         f"  глубина → цвет: {shading_line}",
+        f"  предплечье (оценка): {forearm_line}",
         f"  рендер: {stats.elapsed_s:.1f} с, {stats.frames_per_s:.1f} кадр/с "
         f"(видимых суставов {stats.joints_drawn})",
         f"  {trail}",
@@ -2750,6 +3141,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         const=1.0,
         help="γ = 1.0: линейная шкала 08g-fix3 (побайтово), окно 0.155 м",
     )
+    forearm_group = parser.add_mutually_exclusive_group()
+    forearm_group.add_argument(
+        "--forearm",
+        dest="forearm",
+        action="store_true",
+        default=False,
+        help="дорисовать ребро-оценку «локоть (Body) → запястье (Hand)»; по умолчанию выключено",
+    )
+    forearm_group.add_argument(
+        "--no-forearm",
+        dest="forearm",
+        action="store_false",
+        help="не рисовать предплечье (кадр по умолчанию, побайтово прежний)",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     try:
@@ -2758,6 +3163,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             else FIVE_POINT if args.five_points
             else DEFAULT_SKELETON
         )
+        forearm = bool(args.forearm)
         depth_shading = resolve_depth_shading(args.depth_shading, skeleton)
         if args.depth_alpha is True and args.depth_shading is not False:
             # alpha считается из глубин: явный --depth-alpha включает и яркость (кроме
@@ -2790,7 +3196,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"ошибка: {exc}", file=sys.stderr)
         return 1
     try:
-        scene = load_scene(args.meta, args.tracking, extra_keys=skeleton.extra_keys)
+        extra_keys = tuple(skeleton.extra_keys) + (FOREARM_KEYS if forearm else ())
+        scene = load_scene(args.meta, args.tracking, extra_keys=extra_keys)
         if args.time_offset_ms is not None:
             scene = replace(
                 scene,
@@ -2835,6 +3242,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"глубина → alpha: {'да' if depth_alpha else 'нет'}"
             + (f" (пол {DEPTH_MIN_ALPHA:g}, дальние раньше ближних)" if depth_alpha else "")
         )
+        print(
+            "предплечье (оценка): "
+            + (
+                f"да — Body.joints[18/19] → Hand.wrist, цвет × {FOREARM_COLOR_FACTOR:g}, "
+                f"толщина {FOREARM_LINE_THICKNESS_PX} px, ребро только при длине "
+                f"{FOREARM_MIN_LENGTH_M:g}…{FOREARM_MAX_LENGTH_M:g} м"
+                if forearm
+                else "нет (по умолчанию; включить — --forearm)"
+            )
+        )
         trail = not args.no_trail
         hud = not args.no_hud
         if args.stills is not None:
@@ -2852,6 +3269,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 depth_alpha=depth_alpha,
                 depth_relative=depth_relative,
                 depth_gamma=depth_gamma,
+                forearm=forearm,
             )
             print(f"PNG с наложением: {len(paths)} файлов в {args.stills}")
             return 0
@@ -2873,6 +3291,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             depth_alpha=depth_alpha,
             depth_relative=depth_relative,
             depth_gamma=depth_gamma,
+            forearm=forearm,
         )
     except (OSError, ValueError) as exc:
         print(f"ошибка: {exc}", file=sys.stderr)

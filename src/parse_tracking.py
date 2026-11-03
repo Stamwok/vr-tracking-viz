@@ -78,6 +78,17 @@ HAND_JOINTS_FULL = (
 #: ``sync.POINT_KEYS`` не меняются при расширении данных до 26 джойнтов (08d).
 HAND_JOINTS = (("palm", 0), ("wrist", 1), ("thumb", 5), ("index", 10), ("middle", 15))
 
+#: Локти из ``Body.joints`` (задача 08h): 18 — левый, 19 — правый. В Hand локтя нет
+#: (26 джойнтов — запястье и пальцы), поэтому единственный источник локтя — Body.
+#: Запястья Body (20/21) в данные **не** добавляются: концом ребра служит точный
+#: ``Hand.wrist`` (Body.wrist — его же аппроксимация, см. ``docs/NOTES.md``, 08h).
+#: ``CSV_COLUMNS`` от этого не меняется: elbow живёт только в пути рендера, иначе
+#: поехали бы sha256-эталоны 08d/08g.
+BODY_ELBOW_JOINTS = (("left_elbow", 18), ("right_elbow", 19))
+
+#: Плоские ключи локтей: ``left_elbow``/``right_elbow`` (для ``sync.extra_keys``).
+ELBOW_KEYS = tuple(name for name, _ in BODY_ELBOW_JOINTS)
+
 #: Колонки tracking.csv: время, поза головы, по 26 джойнтов на руку, флаги активности.
 CSV_COLUMNS = (
     "t_ns",
@@ -283,7 +294,57 @@ def _joint_xyz(
     return (pose[0], pose[1], pose[2])
 
 
-def extract_sample(sample: dict, where: str | None = None) -> dict:
+def _body_joint_xyz(
+    joints: list[dict], index: int, where: str | None
+) -> tuple[float, float, float]:
+    """Позиция сустава ``Body.joints[index]`` или NaN×3, если её нет/она невалидна (08h).
+
+    У суставов Body **нет** флагов валидности (в отличие от ``HandJointLocations.s``):
+    в файле каждый джойнт — ``{p, t, va, wva}``, где ``p`` — позиция и кватернион, ``t`` —
+    метка времени. Поэтому валидность определяется по данным: конечность трёх координат и
+    защита от «все нули» (нулевая позиция — признак незаполненного джойнта, а не позы).
+    """
+    if not 0 <= index < len(joints):
+        return (math.nan, math.nan, math.nan)
+    joint = joints[index]
+    if not isinstance(joint, dict) or "p" not in joint:
+        return (math.nan, math.nan, math.nan)
+    pose = parse_pose(joint["p"], where=where)
+    if len(pose) < 3:
+        return (math.nan, math.nan, math.nan)
+    x, y, z = pose[0], pose[1], pose[2]
+    if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+        return (math.nan, math.nan, math.nan)
+    if x == 0.0 and y == 0.0 and z == 0.0:
+        # «все нули» — незаполненный джойнт; рисовать ребро от мировой точки (0, 0, 0) нельзя
+        return (math.nan, math.nan, math.nan)
+    return (x, y, z)
+
+
+def extract_forearm(sample: dict, where: str | None = None) -> dict[str, float]:
+    """Локти из ``Body.joints[18/19]``: ``{left,right}_elbow_{x,y,z}`` (задача 08h).
+
+    Возвращает только 6 координат — без запястий Body (20/21) и без остальных 24 джойнтов.
+    Невалидный/отсутствующий локоть — ``NaN`` (те же правила, что у рук: не рисовать, а не
+    подставлять ноль). Валидность Body-джойнта считается по значениям
+    (:func:`_body_joint_xyz`): флагов ``s`` у Body нет.
+    """
+    body = sample.get("Body")
+    joints = body.get("joints") if isinstance(body, dict) else None
+    joints = joints if isinstance(joints, list) else []
+    record: dict[str, float] = {}
+    for name, index in BODY_ELBOW_JOINTS:
+        joint_where = f"{where}, Body.joints[{index}]" if where else f"Body.joints[{index}]"
+        x, y, z = _body_joint_xyz(joints, index, joint_where)
+        record[f"{name}_x"] = x
+        record[f"{name}_y"] = y
+        record[f"{name}_z"] = z
+    return record
+
+
+def extract_sample(
+    sample: dict, where: str | None = None, *, include_forearm: bool = False
+) -> dict:
     """Плоская запись сэмпла: поза головы (3+4) + все 26 джойнтов на руку (x, y, z) + isActive.
 
     Невалидные точки (``isActive == 0`` у руки или ``s == 0`` у сустава) — NaN, а не нули:
@@ -293,6 +354,11 @@ def extract_sample(sample: dict, where: str | None = None) -> dict:
     Набор джойнтов — :data:`HAND_JOINTS_FULL` (26 на руку, индексы OpenXR 0…25); рендер
     использует его 5-точечное подмножество :data:`HAND_JOINTS`, но колонки с теми же
     именами в плоской записи совпадают.
+
+    ``include_forearm`` (08h) добавляет к записи 6 координат локтей из ``Body.joints[18/19]``
+    (:func:`extract_forearm`). По умолчанию **выключено**, поэтому ``tracking.csv`` (08d) и
+    его sha256 не меняются: локти нужны только пути рендера, а ``sync.load_poses`` включает
+    их, когда среди ``extra_keys`` есть :data:`ELBOW_KEYS`.
     """
     head = sample["Head"]
     head_where = f"{where}, Head.pose" if where else "Head.pose"
@@ -301,6 +367,8 @@ def extract_sample(sample: dict, where: str | None = None) -> dict:
     record: dict[str, float | int] = {"timeStampNs": int(sample["timeStampNs"])}
     for key, value in zip(("x", "y", "z", "qx", "qy", "qz", "qw"), pose):
         record[f"head_{key}"] = value
+    if include_forearm:
+        record.update(extract_forearm(sample, where=where))
 
     for side, hand_key in (("left", "leftHand"), ("right", "rightHand")):
         hand = sample["Hand"].get(hand_key, {})

@@ -91,11 +91,17 @@ def _hand(points: dict) -> dict:
 
 
 def _write_tracking(
-    path: Path, times_ns, head_pos=(0.0, 0.0, 0.0), left_series=None
+    path: Path,
+    times_ns,
+    head_pos=(0.0, 0.0, 0.0),
+    left_series=None,
+    body_elbows: dict | None = None,
 ) -> None:
     """Файл формата 03a: header + по одному JSON на сэмпл.
 
     ``left_series`` — по одному набору точек левой руки на сэмпл (для кадров с движением).
+    ``body_elbows`` (08h) — ``{side: (x, y, z)}``: если задано, добавляет ``Body`` с 24
+    джойнтами и позициями локтей 18/19 (остальные джойнты — нули, парсер их не читает).
     """
     lines = [json.dumps(HEADER)]
     for index, ts_ns in enumerate(times_ns):
@@ -106,6 +112,21 @@ def _write_tracking(
             "Head": {"pose": _pose_string([*head_pos, 0.0, 0.0, 0.0, 1.0]), "status": 3},
             "Hand": {"leftHand": _hand(left), "rightHand": _hand(RIGHT_POINTS)},
         }
+        if body_elbows is not None:
+            joints = [
+                {"p": _pose_string([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]), "t": 0,
+                 "va": "0,0,0,0,0,0", "wva": "0,0,0,0,0,0"}
+                for _ in range(24)
+            ]
+            for side, elbow_index in (("left", 18), ("right", 19)):
+                x, y, z = body_elbows[side]
+                joints[elbow_index] = {
+                    "p": _pose_string([x, y, z, 0.0, 0.0, 0.0, 1.0]),
+                    "t": 0,
+                    "va": "0,0,0,0,0,0",
+                    "wva": "0,0,0,0,0,0",
+                }
+            sample["Body"] = {"joints": joints}
         lines.append(json.dumps(sample))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

@@ -57,6 +57,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.parse_tracking import (  # noqa: E402
+    ELBOW_KEYS,
     HAND_JOINTS,
     extract_sample,
     iter_samples,
@@ -640,15 +641,21 @@ def load_poses(tracking_path: str | Path, extra_keys: Sequence[str] = ()) -> Pos
     читаются теми же колонками и доступны через :meth:`PoseTrack.joint_at`, но в
     :class:`Pose` не попадают. Неизвестное имя сустава — ``ValueError`` на первом сэмпле
     (а не ``KeyError`` из середины разбора).
+
+    Локти (08h, :data:`src.parse_tracking.ELBOW_KEYS`) лежат не в ``Hand``, а в ``Body``,
+    поэтому парсер включает их в запись только когда они запрошены: ``include_forearm``
+    передаётся, если среди ``extra_keys`` есть ``left_elbow``/``right_elbow``. Так
+    ``tracking.csv`` и путь без предплечья остаются ровно прежними.
     """
     extra = _extra_keys(extra_keys)
     fields = (*POSITION_FIELDS, *QUAT_FIELDS, *_extra_fields(extra))
     ts = array("q")
     values: dict[str, array] = {name: array("d") for name in fields}
     active: dict[str, array] = {"left": array("b"), "right": array("b")}
+    include_forearm = any(key in ELBOW_KEYS for key in extra)
     checked = False
     for sample in iter_samples(tracking_path):
-        record = extract_sample(sample)
+        record = extract_sample(sample, include_forearm=include_forearm)
         if not checked:
             missing = [name for name in _extra_fields(extra) if name not in record]
             if missing:
