@@ -8,7 +8,7 @@
 (``px = fx·0.10/z``, мировая длина 0.10 м на любой глубине), направление
 ``normalize(elbow_px − wrist_px)``, вырожденное направление (< 1 px) — стиль (тоньше костей
 кисти, но **ровно базовым цветом руки**, 08h-fix), разрывы, HUD-маркер ``fixed``/``n/a``,
-CLI-флаги ``--forearm``/``--no-forearm``, дефолт выключен и детерминизм. Отдельно — цвет
+CLI-флаги ``--forearm``/``--no-forearm``, дефолт включён (10c) и детерминизм. Отдельно — цвет
 указателя: точное равенство ``LEFT_COLOR``/``RIGHT_COLOR`` и независимость от шести флагов
 глубины (``--depth-color``/``--no-depth-color``/``--depth-relative``/``--no-depth-relative``/
 ``--depth-gamma``/``--no-depth-gamma``). Рендер-тесты используют синтетическое видео из
@@ -453,7 +453,7 @@ class ForearmHudTest(unittest.TestCase):
 
 @unittest.skipIf(cv2 is None, "OpenCV недоступен")
 class ForearmRenderTest(SyntheticVideoCase):
-    """08h-fix2: CLI-флаги, дефолт выключен, побайтовость дефолта и детерминизм."""
+    """08h-fix2/10c: CLI-флаги, дефолт включён, побайтовость явных режимов и детерминизм."""
 
     FRAMES = 5
     FPS = 30.0
@@ -494,22 +494,14 @@ class ForearmRenderTest(SyntheticVideoCase):
         self.assertEqual(code, 0)
         return [cv2.imread(str(out / f"frame_{k:05d}.png")) for k in range(frames)]
 
-    def test_default_is_off_and_byte_identical(self) -> None:
+    def test_default_is_on_and_matches_explicit_flag(self) -> None:
+        """10c: указатель включён по умолчанию; ``--no-forearm`` возвращает прежний кадр."""
         default_cli = self._stills("default")
+        explicit_on = self._stills("on", "--forearm")
         explicit_off = self._stills("off", "--no-forearm")
-        direct_scene = ov.load_scene(
-            self.meta_path, self.tracking, extra_keys=ov.DENSE.extra_keys
-        )
-        direct = self.dir / "direct"
-        ov.render_stills(
-            self.video, direct_scene, direct, frames=range(5),
-            skeleton=ov.DENSE, forearm=False, log=lambda _: None,
-        )
         for index in range(5):
-            self.assertTrue(np.array_equal(default_cli[index], explicit_off[index]))
-            self.assertTrue(
-                np.array_equal(default_cli[index], cv2.imread(str(direct / f"frame_{index:05d}.png")))
-            )
+            self.assertTrue(np.array_equal(default_cli[index], explicit_on[index]))
+            self.assertFalse(np.array_equal(default_cli[index], explicit_off[index]))
 
     def test_forearm_changes_frame_and_is_deterministic(self) -> None:
         with_arm = self._stills("on", "--forearm")

@@ -1,7 +1,10 @@
 # Стек визуализации VR-трекинга: чтение видео и рендер (OpenCV), данные (numpy/pandas),
 # интерактивные графики (plotly).
-# Версии — известные стабильные минимумы; точные версии уточним при первом запуске (задача 11).
-opencv-python>=4.8
-numpy>=1.24
-pandas>=2.0
-plotly>=5.0
+# Точные версии зафиксированы прогоном задачи 11 (03.11.2026, Python 3.13.3): с ними чистый
+# клон → venv → `pip install -r requirements.txt` даёт побайтово те же tracking.csv, overlay.mp4,
+# trajectory.html и sync_viewer.html, и проходят все 688 тестов.
+# numpy 2.5 и pandas 3.1 требуют Python ≥ 3.12 — на более старом pip эти версии не поставит.
+opencv-python==5.0.0.93
+numpy==2.5.4
+pandas==3.1.0
+plotly==7.1.0
