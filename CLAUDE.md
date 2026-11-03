@@ -160,14 +160,15 @@ max угол между ориентациями 79.3°, измеренная д
 По просьбе пользователя (03.11. 18:40) **изменены умолчания CLI**: рендер без флагов =
 все 26 джойнтов (`--dense` — 17), указатель на локоть включён (`--no-forearm` — выключить),
 след выключен (`--trail` — включить); этим режимом пересобран полный клип `output/overlay.mp4`
-(7279 кадров, **98.6 МиБ**, 103 359 014 байт). **`src/sync_viewer.py` и `tests/test_sync_viewer.py`
-удалены** (видео + 3D-вьюер не нужен; графики `trajectory.html` остались). Тесты
-**658/658**; 10-с фрагмент — 301 кадр, 4.0 МиБ, 4.1 с, 73.4 кадр/с. `docs/preview.png` — кадр 4285
+(7279 кадров, **98.6 МиБ**, 103 359 014 байт). `sync_viewer` в процессе удалялся, но по
+просьбе пользователя **восстановлен** (revert коммита f0de8c6): `src/sync_viewer.py` и его
+30 тестов на месте. Тесты
+**688/688**; 10-с фрагмент — 301 кадр, 4.0 МиБ, 4.1 с, 73.4 кадр/с. `docs/preview.png` — кадр 4285
 из финального клипа (не побайтовая копия: PNG, а GIF пересобран из кадров 4300–4390). Осталось
 `todo`: 11, 12; мерж **08d → … → 08h-fix2**, затем **10a → 10b → 10c** — пользователь.
 В репозитории есть
 `src/{parse_tracking,sync,camera_model,calib_frames,calib_bones,calib_search,config,overlay_video,
-drift_diag,plot_trajectory}.py`, `tests/` и
+drift_diag,plot_trajectory,sync_viewer}.py`, `tests/` и
 `docs/{intrinsics,projection_notes,overlay}.md`. Каждая выполненная задача сопровождается записью в
 `docs/NOTES.md` — см. **раздел 13**.
 
@@ -424,7 +425,7 @@ pose = pose_at(t_frame_k)   # позиция — линейно, кватерн�
 4. Работаем с левой половиной SBS-кадра (моно); правая — опционально для проверки стерео.
 5. Один подход, маленькое законченное решение; «приблизительность» наложения допустима и объясняется.
 6. Структура: `data/`, `src/{parse_tracking,video_meta,sync,camera_model,calib_frames,calib_search,
-   config,overlay_video,drift_diag,plot_trajectory}.py`, `output/`, `docs/`, `requirements.txt`, `README.md`,
+   config,overlay_video,drift_diag,plot_trajectory,sync_viewer}.py`, `output/`, `docs/`, `requirements.txt`, `README.md`,
    `.gitignore`. `src/calib_frames.py` — эталон калибровки (07a), `src/calib_search.py` — подбор
    конвенции осей и `T_head_cam` по этому эталону (07b, см. раздел 12).
    `src/config.py` — единственный источник калибровочных констант (07c): `AXIS_CONVENTION`
@@ -559,7 +560,7 @@ python -c "import cv2;c=cv2.VideoCapture('data/CameraRecord_20260505_165740.mp4'
   технические разделы к фактическому коду (таблица констант `config.py`, структура, свежие
   числа прогонов); 10b переписал «Наблюдения» (9 пунктов с пересчитанными числами и измеренной
   диспаратностью SBS) и «Сложности» (8 пунктов «проблема → как решено»); 10c снял «Статус:
-  черновик», обновил умолчания CLI и убрал `sync_viewer`.
+  черновик», обновил умолчания CLI; `sync_viewer` сохранён.
 - `docs/NOTES.md` — рабочий журнал: по записи на каждую выполненную задачу (правила — раздел 13).
   Черновик для разделов «Наблюдения» и «Сложности» в README; 10b перенёс их в README по
   пересчитанным числам (запись 03.11).

@@ -48,6 +48,9 @@
    [`docs/overlay.md`](docs/overlay.md).
 5. Строит `output/trajectory.html` — интерактивные Plotly-графики: 3D-траектории с метками
    «старт»/«финиш», x(t)/y(t)/z(t), скорости и высота кистей относительно головы.
+6. Строит `output/sync_viewer.html` — видео и 3D-сцена рядом: траектории головы и ладоней
+   дорисовываются по мере проигрывания, маркер «сейчас» идёт за кадром, клик по сцене
+   перематывает видео.
 
 ## Входные данные
 
@@ -144,6 +147,10 @@ def parse_pose(s):
    [`docs/overlay.md`](docs/overlay.md).
 5. **Графики** (`src/plot_trajectory.py`): Plotly — 3D-траектории головы и рук, x(t)/y(t)/z(t),
    скорость, высота рук относительно головы — всё в один self-contained HTML.
+6. **Синхронный просмотр** (`src/sync_viewer.py`): `output/sync_viewer.html` — `<video>` с
+   `overlay.mp4` и 3D-сцена Plotly, где траектории дорисовываются до `video.currentTime`
+   (restyle видимого префикса 10 раз в секунду), маркер «сейчас», клик по сцене перематывает
+   видео, hover показывает время и координаты; plotly.js встроен, внешних CDN нет.
 
 ## Допущения (важно для интерпретации результата)
 
@@ -401,8 +408,12 @@ python src/overlay_video.py data/CameraRecord_20260505_165740.mp4 \
                             --tracking data/trackingData_20260505_165740.txt \
                             --out output/overlay.mp4
 python src/plot_trajectory.py --tracking output/tracking.csv -o output/trajectory.html
+python src/sync_viewer.py --tracking output/tracking.csv -o output/sync_viewer.html
 
-# тесты (658, ≈1.5 мин; часть помечена skip, если нет data/ и output/):
+# sync_viewer.html открывается только через сервер (file:// блокирует <video>):
+python -m http.server -d output 8000     # → http://localhost:8000/sync_viewer.html
+
+# тесты (688, ≈1.5 мин; часть помечена skip, если нет data/ и output/):
 python -m unittest discover -s tests -t .
 ```
 
@@ -452,8 +463,19 @@ data/CameraRecord_*.mp4 --stills output/debug/overlay`.
 (`--max-points`, `0` — без прореживания), а блок «Сводка» и все числа считаются по полным
 21 787 строкам CSV.
 
+Синхронный просмотр `output/sync_viewer.html` (**4.79 МиБ**, plotly.js внутри) собирается за
+**≈1 с**: вверху видео `overlay.mp4`, под ним 3D-сцена, где траектории головы и ладоней
+дорисовываются по ходу проигрывания (10 раз в секунду), маркер «сейчас» показывает текущие
+позиции, клик по точке сцены перематывает видео, hover — время и координаты. Показанные трассы
+прорежены до 2000 точек на серию (`--max-points`), концы и пики скорости сохранены. Открывать
+только через сервер: `python -m http.server -d output 8000` →
+`http://localhost:8000/sync_viewer.html`. Такой сервер не поддерживает Range-запросы, поэтому
+Chrome запрещает перемотку; вьюер это замечает и один раз загружает видео в память (blob),
+после чего клик и перемотка работают (на сервере с Range этого не требуется). Ссылка
+`sync_viewer.html?t=60` открывает страницу сразу на нужной секунде.
+
 Результаты: `output/tracking.csv`, `output/overlay.mp4`, `output/trajectory.html`
-(открывается в браузере без сервера).
+(открывается в браузере без сервера), `output/sync_viewer.html` (через `http.server`).
 
 ## Структура репозитория
 
@@ -471,9 +493,11 @@ vr-tracking-viz/
 │   ├── calib_search.py      # подбор конвенции осей и T_head_cam, проверка --verify-config
 │   ├── overlay_video.py     # наложение скелета, указателя на локоть и HUD на видео
 │   ├── drift_diag.py        # диагностика слёта скелета и подбор поправки времени
-│   └── plot_trajectory.py   # Plotly: 3D-траектории, x/y/z(t), скорость, высота кистей
+│   ├── plot_trajectory.py   # Plotly: 3D-траектории, x/y/z(t), скорость, высота кистей
+│   └── sync_viewer.py       # видео + 3D-траектории, синхронные с video.currentTime
 ├── tests/                   # unittest: парсер, синхронизация, камера, рендер, графики
-├── output/                  # tracking.csv, overlay.mp4, trajectory.html (не коммитятся)
+├── output/                  # tracking.csv, overlay.mp4, trajectory.html, sync_viewer.html
+│                            # (не коммитятся)
 ├── docs/                    # intrinsics.md, projection_notes.md, overlay.md, NOTES.md,
 │                            # images/ (картинки для README), preview.png/gif,
 │                            # preview_trajectory.png, media/overlay_10s.mp4
@@ -533,6 +557,9 @@ vr-tracking-viz/
   абсолютную яркость 08g-fix, а `--no-depth-color` — плоские цвета 08f; `--no-depth-gamma`
   возвращает линейную шкалу 08g-fix3 (окно 0.155 м); 5-точечный кадр плоский по умолчанию и
   побайтово совпадает с 08f.
+- `sync_viewer.html` требует сервера: `python -m http.server` не поддерживает Range, поэтому
+  браузер не даёт перематывать видео; вьюер сам разово догружает его в память. На сервере
+  с Range (nginx и т. п.) перемотка работает без этой загрузки.
 - Запись содержит только жест-трекинг (контроллеры не писались).
 
 ## Лицензия
