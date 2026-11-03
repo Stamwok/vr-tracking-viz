@@ -106,13 +106,14 @@ bbox) и `_blend_bone_gradient` (смешивание всей кости оди
 кадр побайтово = `VTR-08g-fix4` 5/5, `--five-points` = `VTR-08f` 5/5). Парсер читает только
 локти (`extract_forearm`, `ELBOW_KEYS`), `tracking.csv` не изменился (167 колонок,
 43 561 813 байт, sha256 b5942563…eabe523); локти грузятся через `sync.load_poses(extra_keys=…)`
-и `joint_at` с тем же моментом; рендер рисует тонкую (2 px) и бледную (цвет × 0.60) линию
-до скелета, глубина/alpha 08g-fix4 (относительный `z_ref`), разрыв на NaN/за камерой/длине вне
-0.15–0.40 м, `RenderStats.forearm_*`; HUD — `forearm: IK` / `forearm: n/a`. Плечо
+и `joint_at` с тем же моментом; рендер рисует тонкую (2 px) и бледную (цвет × 0.60) плоскую
+линию до скелета (глубина/alpha/сортировка к ребру не применяются — локоть не измерен), разрыв
+на NaN/за камерой/длине вне 0.15–0.40 м, `RenderStats.forearm_*`; HUD — `forearm: IK` /
+`forearm: n/a`. Плечо
 `shoulder → elbow` не рисуется: длина 0.2290/0.2307 м постоянна (std 0.0000) — константа
 скелета, кандидат отклонён в `OPTIONAL_BONES`. Локти Body почти всегда за кадром (правый —
 7 кадров из 7279, левый — 0), на 07a ребро клипуется краем. Регрессии: **40/40**, 0 px,
-кости **10/48, 60.9 px**, drift **34.6 px**; тесты **685/685**; 10-с фрагмент
+кости **10/48, 60.9 px**, drift **34.6 px**; тесты **684/684**; 10-с фрагмент
 `output/overlay_10s_forearm.mp4` — 301 кадр, 4.03 МиБ, 602 ребра. Запись — `docs/NOTES.md`,
 `docs/overlay.md`, README; мерж **08d → … → 08g-fix4 → 08h** — пользователь.
 Осталось `todo`: 10a–10c, 11, 12; мерж **08d → 08e → 08f → 08g → 08g-fix → 08g-fix2 → 08g-fix3
@@ -634,10 +635,11 @@ python -c "import cv2;c=cv2.VideoCapture('data/CameraRecord_20260505_165740.mp4'
   γ = 1.0 и 0…0.18 м при γ < 1; `resolve_depth_gamma` (авто 0.7/1.0),
   `RenderStats.depth_gamma`, CLI `--depth-gamma`/`--no-depth-gamma`; авто-γ включается только
   вместе с относительной шкалой (абсолютная остаётся линейной — 08g-fix/08g-fix2 побайтово).
-  08h — предплечье: `FOREARM_KEYS`, `Forearm` (elbow/wrist пиксели + глубины + мировая длина),
+  08h — предплечье: `FOREARM_KEYS`, `Forearm` (elbow/wrist пиксели + мировая длина),
   `forearm_length`, `project_forearms` (Body elbow через `joint_at` + точный Hand.wrist),
-  `forearm_style` (2 px) и `draw_forearms` (цвет × 0.60, рисуется до скелета, глубина/alpha
-  08g-fix4 с `z_ref` руки, разрыв при NaN/за камерой/длине вне 0.15–0.40 м, счётчики
+  `forearm_style` (2 px) и `draw_forearms` (плоский цвет × 0.60, рисуется до скелета;
+  глубина/alpha/сортировка к ребру не применяются, разрыв при NaN/за камерой/длине вне
+  0.15–0.40 м, счётчики
   `(drawn, skipped, out_of_range)`); `_draw_pose` возвращает `PoseDraw`, CLI
   `--forearm`/`--no-forearm` (по умолчанию выключено), HUD-маркер `forearm: IK`/`n/a`,
   `RenderStats.forearm*`; `OPTIONAL_BONES` пуст — плечо (константа 0.2290/0.2307 м) не рисуется.

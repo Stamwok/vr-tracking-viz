@@ -329,7 +329,8 @@ FOREARM_MAX_LENGTH_M = 0.40
 
 #: Множитель цвета ребра-оценки: линия тоньше и бледнее измеренных костей кисти, поэтому
 #: в кадре читается как «приблизительно». Цвет руки сохраняется (умножаются все каналы),
-#: глубина 08g-fix4 уменьшает его дальше; итог всегда ≤ 0.70 от цвета руки.
+#: но глубина ребро **не красит**: она не измерена (Body-локоть — IK-оценка), поэтому ребро
+#: всегда плоское — ровно :data:`FOREARM_COLOR_FACTOR` от цвета руки.
 FOREARM_COLOR_FACTOR = 0.60
 
 #: Толщина ребра-оценки на кадре 1080×810, px (у костей кисти 2, с глубиной 3): ребро
@@ -350,17 +351,16 @@ class Forearm:
     """Ребро «локоть → запястье» одной руки на кадре (задача 08h).
 
     ``elbow``/``wrist`` — пиксели глаза (``ProjectedPoint``: видимость уже посчитана),
-    ``elbow_depth``/``wrist_depth`` — ``z`` в системе камеры для шкалы глубины 08g-fix4,
-    ``length`` — длина ребра **в мире** (метры). Концом ребра служит точный ``Hand.wrist``,
-    а не ``Body.wrist``: Body-запястье лишь аппроксимирует его (медиана 0.9/7.2 мм, max
-    16/60 мм), и подмена внесла бы второй источник координат.
+    ``length`` — длина ребра **в мире** (метры). Глубины здесь нет намеренно: ребро —
+    IK-оценка, и красить его глубиной значило бы выдать оценку за измерение; в кадре оно
+    всегда плоское (цвет руки × :data:`FOREARM_COLOR_FACTOR`). Концом ребра служит точный
+    ``Hand.wrist``, а не ``Body.wrist``: Body-запястье лишь аппроксимирует его (медиана
+    0.9/7.2 мм, max 16/60 мм), и подмена внесла бы второй источник координат.
     """
 
     side: str
     elbow: camera_model.ProjectedPoint
     wrist: camera_model.ProjectedPoint
-    elbow_depth: float
-    wrist_depth: float
     length: float
 
     @property
@@ -450,8 +450,6 @@ def project_forearms(
                 side=hand,
                 elbow=camera_model.ProjectedPoint(math.nan, math.nan, False),
                 wrist=camera_model.ProjectedPoint(math.nan, math.nan, False),
-                elbow_depth=math.nan,
-                wrist_depth=math.nan,
                 length=length,
             )
             continue
@@ -461,8 +459,6 @@ def project_forearms(
             side=hand,
             elbow=camera_model.project(elbow_cam, eye),
             wrist=camera_model.project(wrist_cam, eye),
-            elbow_depth=elbow_cam[2],
-            wrist_depth=wrist_cam[2],
             length=length,
         )
     return result
@@ -490,33 +486,21 @@ def draw_forearms(
     style: Style,
     *,
     colors: Mapping[str, tuple[int, int, int]] | None = None,
-    depths: Mapping[str, Mapping[str, float]] | None = None,
-    joints: Sequence[str] = JOINTS,
-    shade: bool = False,
-    alpha: bool = False,
-    relative: bool = False,
-    gamma: float = 1.0,
 ) -> tuple[int, int, int]:
     """Нарисовать рёбра-оценки (in place) и вернуть счётчики ``(drawn, skipped, out_of_range)``.
 
-    Ребро рисуется **до** скелета кисти, поэтому измеренные точки и кости ложатся поверх
-    оценки и не перекрываются ею. Стиль: цвет руки × :data:`FOREARM_COLOR_FACTOR`, толщина
-    :data:`FOREARM_LINE_THICKNESS_PX`; ``shade``/``alpha``/``relative``/``gamma`` —
-    та же шкала 08g-fix4, что у скелета (глубина по концам ребра, ``z_ref`` своей руки по
-    видимым суставам кисти из ``depths``). Глубина хотя бы одного конца неизвестна или
-    точка за камерой или длина вне 0.15…0.40 м — ребро пропускается и попадает в счётчик;
+    Ребро **плоское**: глубина, alpha и градиент к нему не применяются, потому что локоть
+    Body — IK-оценка, а не измерение; красить оценку глубиной значило бы выдать её за факт.
+    Цвет — рука × :data:`FOREARM_COLOR_FACTOR`, толщина — :data:`FOREARM_LINE_THICKNESS_PX`.
+    Ребро рисуется **до** скелета кисти, поэтому всегда лежит под измеренными точками и
+    костями и не участвует в сортировке по глубине (она есть только у кисти). Точка за
+    камерой/``NaN`` или длина вне 0.15…0.40 м — ребро пропускается и попадает в счётчик;
     ``out_of_range`` — отдельный счётчик именно «улетевшего» локтя.
     """
     if not isinstance(style, Style):
         raise ValueError(f"style: ожидался Style, получено {style!r}")
     if image is None or getattr(image, "ndim", 0) != 3:
         raise ValueError("image: ожидался BGR-кадр (H×W×3)")
-    for name, value in (("shade", shade), ("alpha", alpha), ("relative", relative)):
-        if not isinstance(value, bool):
-            raise ValueError(f"{name}: ожидалось bool, получено {value!r}")
-    _check_gamma(gamma)
-    if relative and depths is None:
-        raise ValueError("relative: относительная шкала предплечья невозможна без depths")
     for side in ("left", "right"):
         if side not in forearms:
             raise ValueError(f"forearms: нет руки {side!r}")
@@ -525,10 +509,6 @@ def draw_forearms(
     base_colors = {
         side: shade_color(palette[side], FOREARM_COLOR_FACTOR) for side in ("left", "right")
     }
-    if relative and depths is not None:
-        scale_near, scale_far = relative_depth_window(gamma)
-    else:
-        scale_near, scale_far = (DEPTH_NEAR_M, DEPTH_FAR_M)
     drawn = skipped = out_of_range = 0
     for side in ("left", "right"):
         forearm = forearms[side]
@@ -539,32 +519,9 @@ def draw_forearms(
             if forearm.out_of_range:
                 out_of_range += 1
             continue
-        z_ref = 0.0
-        if relative and depths is not None:
-            reference = depth_reference(
-                depths[side].get(joint, math.nan) for joint in joints
-            )
-            z_ref = 0.0 if reference is None else reference
-        depth_start = forearm.elbow_depth if (shade or alpha) else None
-        depth_end = forearm.wrist_depth if (shade or alpha) else None
-        _paint_bone(
-            image,
-            forearm.elbow,
-            forearm.wrist,
-            base_colors[side],
-            draw_style,
-            depth_start,
-            depth_end,
-            shade=shade,
-            alpha=alpha,
-            z_ref=z_ref,
-            near=scale_near,
-            far=scale_far,
-            gamma=gamma,
-        )
+        _paint_bone(image, forearm.elbow, forearm.wrist, base_colors[side], draw_style)
         drawn += 1
     return drawn, skipped, out_of_range
-
 
 
 def resolve_depth_shading(value: bool | None, skeleton: Skeleton) -> bool:
@@ -2443,8 +2400,9 @@ def _draw_pose(
 
     ``forearms`` (08h) — рёбра ``elbow → wrist`` обеих рук (:func:`project_forearms`).
     ``None`` — режим без предплечья (кадр побайтово прежний). Иначе рёбра-оценки рисуются
-    **до** скелета кисти: измеренные точки и кости ложатся поверх, ребро их не перекрывает.
-    Возврат — :class:`PoseDraw`: число суставов (как раньше) и счётчики рёбер.
+    **до** скелета кисти плоским цветом руки (без глубины, alpha и сортировки): измеренные
+    точки и кости ложатся поверх, ребро всегда под кистью. Возврат — :class:`PoseDraw`:
+    число суставов (как раньше) и счётчики рёбер.
     """
     if depth_shading:
         pixels, depths = project_skeleton_depth(
@@ -2456,17 +2414,7 @@ def _draw_pose(
         ), None
     forearm_counts = (0, 0, 0)
     if forearms is not None:
-        forearm_counts = draw_forearms(
-            image,
-            forearms,
-            style,
-            depths=depths,
-            joints=skeleton.joints,
-            shade=depth_shading,
-            alpha=depth_shading and depth_alpha,
-            relative=depth_shading and depth_relative,
-            gamma=depth_gamma if depth_shading else 1.0,
-        )
+        forearm_counts = draw_forearms(image, forearms, style)
     draw_style = style
     if depth_shading and skeleton.name != FLAT_SKELETON.name:
         # градиент вдоль кости виден только на линии потолще; 5-точечный кадр 08a не трогаем

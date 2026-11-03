@@ -270,7 +270,6 @@ class ForearmGeometryTest(unittest.TestCase):
         self.assertAlmostEqual(forearms["left"].length, 0.22, places=12)
         self.assertEqual(forearms["left"].status, "IK")
         self.assertFalse(forearms["left"].out_of_range)
-        self.assertNotEqual(forearms["left"].elbow_depth, math.nan)
         # локоть улетел: длина 0.5 м → ребра нет, но это не «нет данных»
         far = _forearm_track((0.11, 0.0, -0.5), (0.21, 0.1, -0.78))
         forearms = ov.project_forearms(_forearm_pose(far), EYE, far)
@@ -327,8 +326,6 @@ class ForearmDrawTest(unittest.TestCase):
             side=side,
             elbow=camera_model.ProjectedPoint(elbow[0], elbow[1], visible),
             wrist=camera_model.ProjectedPoint(wrist[0], wrist[1], visible),
-            elbow_depth=0.30,
-            wrist_depth=0.35,
             length=length,
         )
 
@@ -352,24 +349,16 @@ class ForearmDrawTest(unittest.TestCase):
         self.assertEqual(counts, (0, 2, 1))
         self.assertFalse(image.any(), "пропущенное ребро не должно оставлять пикселей")
 
-    def test_depth_shading_uses_relative_reference(self) -> None:
+    def test_flat_colour_does_not_depend_on_depth(self) -> None:
+        # глубина/alpha к ребру не применяются: цвет постоянен вдоль всей линии, а не
+        # градиентом по z (Body-локоть — IK-оценка, глубина не измерена)
         image = self._image()
-        forearms = {
-            "left": self._forearm(),
-            "right": self._forearm("right", elbow=(600.0, 100.0), wrist=(800.0, 100.0)),
-        }
-        depths = {"left": {"palm": 0.30, "wrist": 0.30}, "right": {"palm": 0.30, "wrist": 0.30}}
-        counts = ov.draw_forearms(
-            image, forearms, ov.style_for(1080), depths=depths, joints=("palm", "wrist"),
-            shade=True, alpha=True, relative=True, gamma=0.7,
-        )
+        forearms = {"left": self._forearm(), "right": self._forearm("right", elbow=(600, 100), wrist=(800, 100))}
+        counts = ov.draw_forearms(image, forearms, ov.style_for(1080))
         self.assertEqual(counts, (2, 0, 0))
-        self.assertTrue(image.any())
-
-    def test_requires_relative_depths(self) -> None:
-        with self.assertRaises(ValueError):
-            ov.draw_forearms(self._image(), {"left": self._forearm(), "right": self._forearm("right")},
-                             ov.style_for(1080), relative=True)
+        expected = ov.shade_color(ov.COLORS["left"], ov.FOREARM_COLOR_FACTOR)
+        for u in (120, 150, 200, 250, 280):
+            self.assertEqual(tuple(int(v) for v in image[100, u]), expected)
 
 
 class ForearmHudTest(unittest.TestCase):
@@ -526,16 +515,12 @@ class ForearmFlatSkeletonTest(unittest.TestCase):
                     side="left",
                     elbow=camera_model.ProjectedPoint(100.0, 100.0, True),
                     wrist=camera_model.ProjectedPoint(300.0, 100.0, True),
-                    elbow_depth=math.nan,
-                    wrist_depth=math.nan,
                     length=0.22,
                 ),
                 "right": ov.Forearm(
                     side="right",
                     elbow=camera_model.ProjectedPoint(600.0, 100.0, True),
                     wrist=camera_model.ProjectedPoint(800.0, 100.0, True),
-                    elbow_depth=math.nan,
-                    wrist_depth=math.nan,
                     length=0.22,
                 ),
             }
