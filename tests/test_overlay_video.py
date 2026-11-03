@@ -1413,7 +1413,7 @@ class DepthFactorTest(unittest.TestCase):
         colour = ov.COLORS["left"]
         self.assertEqual(ov.shade_color(colour, 1.0), colour)
         dimmed = ov.shade_color(colour, ov.DEPTH_MIN_FACTOR)
-        self.assertEqual(dimmed, (115, 63, 0))
+        self.assertEqual(dimmed, (76, 42, 0))
         # оттенок тот же: отношение каналов сохраняется (допуск — округление до int)
         self.assertAlmostEqual(colour[0] / colour[1], dimmed[0] / dimmed[1], delta=0.02)
         # зажим сверху и снизу
@@ -1526,9 +1526,62 @@ class DepthProjectionTest(unittest.TestCase):
         self.assertEqual(first, second)
 
 
+class BoneGradientTest(unittest.TestCase):
+    """08g: градиент вдоль кости — число отрезков, монотонность, зажим, NaN-фолбэк."""
+
+    COLOR = ov.COLORS["left"]   # BGR (255, 140, 0)
+
+    def test_segment_count_and_monotone_along_bone(self) -> None:
+        colors = ov.bone_gradient_colors(self.COLOR, 0.24, 0.44)
+        self.assertEqual(len(colors), ov.DEPTH_BONE_SEGMENTS)
+        lum = [sum(color) for color in colors]
+        for previous, current in zip(lum, lum[1:]):
+            self.assertGreater(previous, current)
+        # первый отрезок ближе и заметно ярче последнего
+        self.assertGreater(lum[0] - lum[-1], 20)
+
+    def test_segment_colors_match_midpoint_factors(self) -> None:
+        colors = ov.bone_gradient_colors(self.COLOR, 0.24, 0.44)
+        start = ov.depth_factor(0.24)
+        step = ov.depth_factor(0.44) - start
+        for index, color in enumerate(colors):
+            expected = ov.shade_color(self.COLOR, start + step * ((index + 0.5) / len(colors)))
+            self.assertEqual(color, expected)
+
+    def test_gradient_direction_follows_depth(self) -> None:
+        # оба конца в окне: ближний конец (z меньше) ярче, дальний — темнее
+        forward = ov.bone_gradient_colors(self.COLOR, 0.24, 0.44)
+        backward = ov.bone_gradient_colors(self.COLOR, 0.44, 0.24)
+        self.assertEqual(forward, tuple(reversed(backward)))
+
+    def test_clamped_depths_give_uniform_colour(self) -> None:
+        deep = ov.bone_gradient_colors(self.COLOR, 0.70, 0.90)
+        floor = ov.shade_color(self.COLOR, ov.DEPTH_MIN_FACTOR)
+        self.assertEqual(set(deep), {floor})
+        shallow = ov.bone_gradient_colors(self.COLOR, 0.10, 0.18)
+        self.assertEqual(set(shallow), {self.COLOR})
+
+    def test_unknown_depth_falls_back_to_full_colour(self) -> None:
+        for start, end in ((math.nan, 0.44), (0.24, math.nan), (math.inf, -math.inf)):
+            with self.subTest(start=start, end=end):
+                colors = ov.bone_gradient_colors(self.COLOR, start, end)
+                self.assertEqual(set(colors), {self.COLOR})
+
+    def test_typical_span_meets_intra_hand_target(self) -> None:
+        """Целевой ориентир доработки: дальняя кость ≤ 0.6 × ближней на разбросе 0.10 м."""
+        for near, far in ((0.34, 0.44), (0.36, 0.46)):
+            with self.subTest(near=near, far=far):
+                self.assertGreaterEqual(ov.depth_factor(near) / ov.depth_factor(far), 1.6)
+
+    def test_segments_validation(self) -> None:
+        for segments in (0, -1, 2.5, True, "5"):
+            with self.subTest(segments=segments), self.assertRaises(ValueError):
+                ov.bone_gradient_colors(self.COLOR, 0.24, 0.44, segments=segments)
+
+
 @unittest.skipIf(cv2 is None, NO_CV2)
 class DepthShadingDrawTest(unittest.TestCase):
-    """08g: ``draw_skeleton`` гасит дальние кости/точки, плоский режим — прежний кадр."""
+    """08g: ``draw_skeleton`` гасит дальние кости/точки, градиент вдоль кости, плоский фолбэк."""
 
     def setUp(self) -> None:
         self.style = ov.style_for(1080)
@@ -1569,11 +1622,20 @@ class DepthShadingDrawTest(unittest.TestCase):
         self.assertGreater(int(far[0]), int(far[1]))
         self.assertEqual(int(far[2]), 0)
 
-    def test_bone_colour_uses_mean_endpoint_depth(self) -> None:
+    def test_bone_is_shaded_with_a_visible_gradient(self) -> None:
+        """Нарисованная кость идёт от яркого ближнего конца к тёмному дальнему."""
         image = self._draw(self.depths)
-        mean = (ov.DEPTH_FAR_M + ov.DEPTH_NEAR_M) / 2.0
-        expected = ov.shade_color(ov.COLORS["left"], ov.depth_factor(mean))
-        self.assertEqual(tuple(int(v) for v in image[100, 200]), expected)
+        # начало ребра (palm, x=100) — дальняя граница окна, конец (thumb, x=300) — ближняя
+        samples = [int(image[100, x][0]) for x in (120, 160, 200, 240, 280)]
+        for previous, current in zip(samples, samples[1:]):
+            self.assertGreater(current, previous)
+        self.assertGreater(samples[-1] - samples[0], 20)
+        # цвет середины первого отрезка — по множителю его середины, не средний по кости
+        expected = ov.shade_color(
+            ov.COLORS["left"], ov.depth_factor(ov.DEPTH_FAR_M)
+            + (ov.depth_factor(ov.DEPTH_NEAR_M) - ov.depth_factor(ov.DEPTH_FAR_M)) * 0.1
+        )
+        self.assertEqual(tuple(int(v) for v in image[100, 120]), expected)
 
     def test_outline_stays_dark_on_both_depths(self) -> None:
         """Обводка точки остаётся тёмной при любом множителе — контраст на светлом фоне."""
@@ -1595,6 +1657,8 @@ class DepthShadingDrawTest(unittest.TestCase):
         # глубины нет — полный цвет: ровно та же картинка, что без ``depths``
         self.assertTrue(np.array_equal(flat, unknown))
         self.assertEqual(tuple(int(v) for v in flat[100, 100]), ov.COLORS["left"])
+        # кость без глубин — одна линия полного цвета, без градиента
+        self.assertEqual(tuple(int(v) for v in flat[100, 200]), ov.COLORS["left"])
 
     def test_mixed_nan_endpoint_keeps_full_colour(self) -> None:
         depths = {

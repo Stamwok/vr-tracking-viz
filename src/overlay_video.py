@@ -351,15 +351,32 @@ HUD_WARNING_COLOR = (0, 200, 255)
 #: Абсолютное окно глубины (``z`` в системе камеры), м: у ближней границы цвет полный, у
 #: дальней и за ней — приглушённый (не темнее :data:`DEPTH_MIN_FACTOR`). Именно абсолютные
 #: метры, а не min–max по кадру: иначе множитель пересчитывался бы каждый кадр и на паузе
-#: скелет мигал бы. Замер по всей записи (246 619 видимых суставов обеих рук, густой
-#: скелет): ``z = 0.072…0.640`` м, p1 = 0.238, p99 = 0.551 — окно покрывает рабочий диапазон
-#: с запасом, а хвосты (ближе 0.22 м и дальше 0.58 м) упираются в границы множителя.
+#: скелет мигал бы. Дооборудовано в доработке 08g: окно сужено с 0.22…0.58 до 0.22…0.48 м,
+#: а нижняя граница множителя опущена с 0.45 до 0.30 — иначе разброс внутри одной кисти
+#: (p50 0.10 м по суставам) давал контраст ≈1.2× и был неразличим. Замер: 14 507 пар
+#: «кадр × рука», 246 619 видимых суставов; z суставов 0.072…0.640, z средних по костям
+#: 0.224…0.556; кости за 0.48 м упираются в пол 0.30 (около 25 % пар) — дальняя рука тёмная,
+#: но остаётся различимой. Типичные кадры дают контраст ближняя/дальняя кость одной руки
+#: ≥ 1.6× примерно в половине случаев (p50 1.61 по суставам), на крайних кадрах (k = 4285,
+#: рука на вытяжку за 0.5 м) дальняя кисть упирается в пол — там глубина читается как
+#: «вся рука дальше», а не как тонкая градация внутри неё.
 DEPTH_NEAR_M = 0.22
-DEPTH_FAR_M = 0.58
+DEPTH_FAR_M = 0.48
 
 #: Нижняя граница множителя: дальняя кость приглушается, но не исчезает — на тёмном фоне
 #: (корзина, тени) линия остаётся различимой. Верхняя граница — 1.0 (полный цвет руки).
-DEPTH_MIN_FACTOR = 0.45
+DEPTH_MIN_FACTOR = 0.30
+
+#: Сколько отрезков рисуется на одну кость в режиме глубины (градиент вдоль кости, 08g).
+#: 5 — компромисс: градиент читается на линии толщиной 3 px, но не рвёт её на «рябь»;
+#: цвет отрезка берётся по множителю в его середине. При ``depths=None`` кость, как раньше,
+#: рисуется одной линией.
+DEPTH_BONE_SEGMENTS = 5
+
+#: Толщина кости в режиме глубины на кадре 1080×810, px (доработка 08g). Толще обычных
+#: :data:`LINE_THICKNESS_PX`, потому что градиент на линии 2 px почти не читается; только
+#: для густого скелета/всех 26 джойнтов — 5-точечный кадр 08a не трогается.
+DEPTH_LINE_THICKNESS_PX = 3
 
 
 @dataclass(frozen=True)
@@ -737,7 +754,10 @@ def depth_factor(
     if not math.isfinite(depth):
         return 1.0
     t = (float(depth) - near) / (far - near)
-    t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
+    if t <= 0.0:
+        return 1.0
+    if t >= 1.0:
+        return min_factor
     return 1.0 - (1.0 - min_factor) * t
 
 
@@ -763,6 +783,71 @@ def shade_color(color: Sequence[int], factor: float) -> tuple[int, int, int]:
     return tuple(shaded)  # type: ignore[return-value]
 
 
+def bone_gradient_colors(
+    color: Sequence[int],
+    depth_start: float,
+    depth_end: float,
+    *,
+    segments: int = DEPTH_BONE_SEGMENTS,
+) -> tuple[tuple[int, int, int], ...]:
+    """Цвета ``segments`` отрезков кости: множитель плавно идёт от одного конца к другому.
+
+    Порядок цветов — от сустава ``depth_start`` к ``depth_end`` (это начало и конец ребра).
+    Внутри отрезка цвет постоянен и берётся по множителю в его середине, ``t = (i + 0.5)/N``,
+    — так градиент вдоль кости не зависит от длины в пикселях и от толщины линии.
+    Множители концов — :func:`depth_factor` от ``z``: ближний конец ярче, дальний темнее,
+    поэтому на экране видно, каким концом кость смотрит в камеру.
+
+    Глубина хотя бы одного конца неизвестна (``NaN``/``±inf``) — все отрезки получают
+    полный цвет руки: кость выглядит как прежняя плоская линия. Неположительное число
+    отрезков — ``ValueError``.
+    """
+    if isinstance(segments, bool) or not isinstance(segments, int):
+        raise ValueError(f"segments: ожидалось целое число, получено {segments!r}")
+    if segments < 1:
+        raise ValueError(f"segments: должно быть ≥ 1, получено {segments!r}")
+    if not (math.isfinite(depth_start) and math.isfinite(depth_end)):
+        base = shade_color(color, 1.0)
+        return (base,) * segments
+    start_factor = depth_factor(depth_start)
+    end_factor = depth_factor(depth_end)
+    step = end_factor - start_factor
+    return tuple(
+        shade_color(color, start_factor + step * ((index + 0.5) / segments))
+        for index in range(segments)
+    )
+
+
+def _lerp_point(
+    first: camera_model.ProjectedPoint, second: camera_model.ProjectedPoint, t: float
+) -> tuple[int, int]:
+    """Точка на отрезке ``first → second`` в параметре ``t`` (0 — first, 1 — second)."""
+    return (
+        _coord(first.u + (second.u - first.u) * t),
+        _coord(first.v + (second.v - first.v) * t),
+    )
+
+
+def _draw_bone(
+    image: Any,
+    first: camera_model.ProjectedPoint,
+    second: camera_model.ProjectedPoint,
+    color: tuple[int, int, int],
+    style: Style,
+) -> None:
+    """Одна линия ``first → second`` цветом ``color`` (плоский режим и кость в одном множителе)."""
+    import cv2  # noqa: PLC0415
+
+    cv2.line(
+        image,
+        (_coord(first.u), _coord(first.v)),
+        (_coord(second.u), _coord(second.v)),
+        color,
+        style.line_thickness,
+        cv2.LINE_AA,
+    )
+
+
 def draw_skeleton(
     image: Any,
     pixels: Mapping[str, Mapping[str, camera_model.ProjectedPoint]],
@@ -784,10 +869,13 @@ def draw_skeleton(
 
     ``depths`` (08g) — глубина суставов в системе камеры, ``side → joint → z`` (как у
     :func:`project_skeleton_depth`). Если передана, цвет руки умножается на
-    :func:`depth_factor`: у точки — по её глубине, у кости — по средней глубине её концов;
-    ``NaN`` у конца кости или у точки даёт полный цвет (глубина неизвестна). Обводка точки
-    остаётся чёрной при любом множителе — контраст на светлом фоне сохраняется.
-    ``None`` (по умолчанию) — плоские цвета 08a: та же картинка, что до 08g.
+    :func:`depth_factor`: у точки — по её глубине, у кости — **градиентом вдоль кости**:
+    ребро рисуется :data:`DEPTH_BONE_SEGMENTS` отрезками, множитель линейно идёт от
+    множителя начала к множителю конца (:func:`bone_gradient_colors`), поэтому видно,
+    каким концом кость ближе к камере. ``NaN`` у конца кости или у точки даёт полный цвет
+    (глубина неизвестна). Обводка точки остаётся чёрной при любом множителе — контраст на
+    светлом фоне сохраняется. ``None`` (по умолчанию) — плоские цвета 08a: одна линия на
+    кость, та же картинка, что до 08g.
     """
     import cv2  # noqa: PLC0415 — локальный импорт: чистые функции модуля работают без OpenCV
 
@@ -828,22 +916,29 @@ def draw_skeleton(
             first, second = hand[start], hand[end]
             if not (first.visible and second.visible):
                 continue
-            line_color = color
-            if hand_depths is not None:
-                depth_start = hand_depths[start]
-                depth_end = hand_depths[end]
-                if math.isfinite(depth_start) and math.isfinite(depth_end):
-                    line_color = shade_color(
-                        color, depth_factor((depth_start + depth_end) / 2.0)
-                    )
-            cv2.line(
-                image,
-                (_coord(first.u), _coord(first.v)),
-                (_coord(second.u), _coord(second.v)),
-                line_color,
-                style.line_thickness,
-                cv2.LINE_AA,
-            )
+            if hand_depths is None:
+                _draw_bone(image, first, second, color, style)
+                continue
+            depth_start = hand_depths[start]
+            depth_end = hand_depths[end]
+            segment_colors = bone_gradient_colors(color, depth_start, depth_end)
+            if len(set(segment_colors)) == 1:
+                # вся кость в одном множителе (дальний конец упёрся в пол, глубина неизвестна):
+                # одна линия — ровно как в плоском режиме 08f, без швов антиалиасинга
+                _draw_bone(image, first, second, segment_colors[0], style)
+                continue
+            segments = len(segment_colors)
+            for index, segment_color in enumerate(segment_colors):
+                t0 = index / segments
+                t1 = (index + 1) / segments
+                cv2.line(
+                    image,
+                    _lerp_point(first, second, t0),
+                    _lerp_point(first, second, t1),
+                    segment_color,
+                    style.line_thickness,
+                    cv2.LINE_AA,
+                )
         for joint in names:
             point = hand[joint]
             if not point.visible:
@@ -1204,8 +1299,14 @@ def _draw_pose(
         pixels, depths = project_skeleton(
             pose, scene.intrinsics, skeleton, track=scene.track
         ), None
+    draw_style = style
+    if depth_shading and skeleton.name != FLAT_SKELETON.name:
+        # градиент вдоль кости виден только на линии потолще; 5-точечный кадр 08a не трогаем
+        target = max(1, int(round(DEPTH_LINE_THICKNESS_PX * scene.eye_size[0] / REFERENCE_WIDTH)))
+        if target > style.line_thickness:
+            draw_style = Style(point_radius=style.point_radius, line_thickness=target)
     return draw_skeleton(
-        image, pixels, style, joints=skeleton.joints, bones=skeleton.bones, depths=depths
+        image, pixels, draw_style, joints=skeleton.joints, bones=skeleton.bones, depths=depths
     )
 
 
