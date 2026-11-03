@@ -33,6 +33,14 @@ OpenXR с пястными костями). Политика разрывов т
 ``--all-joints`` — все 26 суставов, ``--five-points`` — прежний 5-точечный кадр 08a
 (для сравнений «до/после»).
 
+Задача 08g кодирует **глубину цветом**: множитель к цвету руки зависит от ``z`` сустава
+в системе камеры (``p_cam.z``, а не от мировой координаты и не от min–max по кадру — окно
+абсолютное, :data:`DEPTH_NEAR_M`…:data:`DEPTH_FAR_M`, поэтому яркость не «дышит» и не
+мигает). Ближние кости и точки рисуются полным цветом, дальние — не темнее
+:data:`DEPTH_MIN_FACTOR`; оттенок руки и геометрия не меняются, калибровка и время кадра
+не трогаются. 5-точечный кадр 08a по умолчанию остаётся плоским, режим переключается
+``--depth-color``/``--no-depth-color``.
+
 Поза головы = поза камеры (камера в голове, ``T_head_cam`` из ``config.py``), поэтому
 отдельного маркера головы в кадре нет — о ней говорит HUD (время и номер кадра).
 
@@ -256,6 +264,28 @@ SKELETONS: Mapping[str, Skeleton] = {
 #: Скелет, который рисует CLI без флагов (задача 08f).
 DEFAULT_SKELETON = DENSE
 
+#: Скелет, кадр которого должен воспроизводиться без новых эффектов (задача 08a).
+FLAT_SKELETON = FIVE_POINT
+
+
+def resolve_depth_shading(value: bool | None, skeleton: Skeleton) -> bool:
+    """Включено ли кодирование глубины цветом (08g) для выбранного скелета.
+
+    ``None`` — авторежим: включено для любого скелета, кроме прежнего 5-точечного
+    (:data:`FLAT_SKELETON`). Так густой скелет по умолчанию получает подсказку глубины, а
+    кадр 08a (``--five-points``) остаётся прежним. Явные ``True``/``False`` (CLI
+    ``--depth-color``/``--no-depth-color``) перекрывают авторежим. Сравнение по имени, а не
+    по идентичности объекта: набор ``Skeleton("five", …)``, собранный заново, — тот же кадр.
+    """
+    if not isinstance(skeleton, Skeleton):
+        raise ValueError(f"skeleton: ожидался Skeleton, получено {skeleton!r}")
+    if value is None:
+        return skeleton.name != FLAT_SKELETON.name
+    if not isinstance(value, bool):
+        raise ValueError(f"depth_shading: ожидалось bool или None, получено {value!r}")
+    return value
+
+
 #: Ширина кадра глаза, к которой отнесены радиус и толщина по умолчанию.
 REFERENCE_WIDTH = 1080
 
@@ -314,6 +344,22 @@ HUD_ALPHA = 0.6
 HUD_TEXT_COLOR = (238, 238, 238)
 #: Цвет предупреждения «нет данных» (BGR: оранжево-жёлтый, заметен на панели и на видео).
 HUD_WARNING_COLOR = (0, 200, 255)
+
+
+# --- 08g: глубина → интенсивность цвета -------------------------------------------------
+
+#: Абсолютное окно глубины (``z`` в системе камеры), м: у ближней границы цвет полный, у
+#: дальней и за ней — приглушённый (не темнее :data:`DEPTH_MIN_FACTOR`). Именно абсолютные
+#: метры, а не min–max по кадру: иначе множитель пересчитывался бы каждый кадр и на паузе
+#: скелет мигал бы. Замер по всей записи (246 619 видимых суставов обеих рук, густой
+#: скелет): ``z = 0.072…0.640`` м, p1 = 0.238, p99 = 0.551 — окно покрывает рабочий диапазон
+#: с запасом, а хвосты (ближе 0.22 м и дальше 0.58 м) упираются в границы множителя.
+DEPTH_NEAR_M = 0.22
+DEPTH_FAR_M = 0.58
+
+#: Нижняя граница множителя: дальняя кость приглушается, но не исчезает — на тёмном фоне
+#: (корзина, тени) линия остаётся различимой. Верхняя граница — 1.0 (полный цвет руки).
+DEPTH_MIN_FACTOR = 0.45
 
 
 @dataclass(frozen=True)
@@ -553,6 +599,77 @@ def _require_skeleton_track(track: sync.PoseTrack | None, skeleton: Skeleton) ->
         )
 
 
+def _skeleton_world_points(
+    pose: sync.Pose, skeleton: Skeleton, track: sync.PoseTrack | None
+) -> dict[str, dict[str, tuple[float, float, float]]]:
+    """Мировые координаты суставов скелета кадра: ``side → joint → (x, y, z)``.
+
+    Пять опорных суставов лежат в :class:`sync.Pose` (интерполяция 04b/04c), остальные
+    берутся из ``track.joint_at(pose.ts_ns, key)`` — та же интерполяция и тот же момент
+    времени. Вынесено из :func:`project_skeleton`, чтобы глубина (08g) считалась по тем же
+    самым точкам, что и пиксели, — иначе два прохода могли бы разойтись.
+    """
+    _require_skeleton_track(track, skeleton)
+    result: dict[str, dict[str, tuple[float, float, float]]] = {}
+    for hand in ("left", "right"):
+        joints: dict[str, tuple[float, float, float]] = {}
+        for joint in skeleton.joints:
+            key = f"{hand}_{joint}"
+            if key in pose.hands:
+                world = pose.hands[key]
+            else:
+                world = track.joint_at(pose.ts_ns, key)  # type: ignore[union-attr]
+            joints[joint] = (world[0], world[1], world[2])
+        result[hand] = joints
+    return result
+
+
+def project_skeleton_depth(
+    pose: sync.Pose,
+    intrinsics: camera_model.Intrinsics,
+    skeleton: Skeleton = DENSE,
+    *,
+    track: sync.PoseTrack | None = None,
+    side: str = "left",
+) -> tuple[
+    dict[str, dict[str, camera_model.ProjectedPoint]],
+    dict[str, dict[str, float]],
+]:
+    """Пиксели скелета кадра **и** глубина каждого сустава в системе камеры (08g).
+
+    Возвращает ``(pixels, depths)``: ``pixels`` — ровно то же, что у
+    :func:`project_skeleton` (``side → joint → ProjectedPoint``), ``depths`` —
+    ``side → joint → z`` точки камеры в метрах: ``z`` вперёд по взгляду, из той же матрицы
+    ``мир → камера``, что даёт пиксели. Глубина не кладётся в :class:`ProjectedPoint`
+    намеренно: у него контракт «пиксель + видимость» (тест 05c), а рендеру 08a глубина не
+    нужна. ``NaN`` вместо глубины — «нет данных» у сустава (как ``visible = False`` у
+    пикселя): у неактивной руки и невалидных джойнтов ``NaN`` в данных, у точки за камерой
+    ``z`` бывает конечным, но она невидима и не рисуется.
+
+    Калибровка и :func:`camera_model.project` не меняются: глубина — просто ``z`` уже
+    посчитанной точки камеры, а не второй источник проекции.
+    """
+    world = _skeleton_world_points(pose, skeleton, track)
+    eye = camera_model.eye_intrinsics(intrinsics, side)
+    matrix = camera_model.world_to_camera_matrix(pose)
+    pixels: dict[str, dict[str, camera_model.ProjectedPoint]] = {}
+    depths: dict[str, dict[str, float]] = {}
+    for hand, joints in world.items():
+        hand_pixels: dict[str, camera_model.ProjectedPoint] = {}
+        hand_depths: dict[str, float] = {}
+        for joint, point in joints.items():
+            if not all(math.isfinite(value) for value in point):
+                hand_pixels[joint] = camera_model.ProjectedPoint(math.nan, math.nan, False)
+                hand_depths[joint] = math.nan
+                continue
+            p_cam = camera_model.transform_point(matrix, point)
+            hand_pixels[joint] = camera_model.project(p_cam, eye)
+            hand_depths[joint] = p_cam[2]
+        pixels[hand] = hand_pixels
+        depths[hand] = hand_depths
+    return pixels, depths
+
+
 def project_skeleton(
     pose: sync.Pose,
     intrinsics: camera_model.Intrinsics,
@@ -568,27 +685,14 @@ def project_skeleton(
     времени (этим же путём пользуется метрика 08e). Матрица ``мир → камера`` считается
     один раз на кадр. ``NaN`` («нет данных») и точка за камерой дают ``visible = False`` —
     :func:`draw_skeleton` не рисует такую точку и не проводит кости к ней.
+
+    Глубины не возвращает (это :func:`project_skeleton_depth`): путь 08f и его числа
+    остаются ровно прежними.
     """
-    _require_skeleton_track(track, skeleton)
-    eye = camera_model.eye_intrinsics(intrinsics, side)
-    matrix = camera_model.world_to_camera_matrix(pose)
-    result: dict[str, dict[str, camera_model.ProjectedPoint]] = {}
-    for hand in ("left", "right"):
-        pixels: dict[str, camera_model.ProjectedPoint] = {}
-        for joint in skeleton.joints:
-            key = f"{hand}_{joint}"
-            if key in pose.hands:
-                world = pose.hands[key]
-            else:
-                world = track.joint_at(pose.ts_ns, key)  # type: ignore[union-attr]
-            if not all(math.isfinite(value) for value in world):
-                pixels[joint] = camera_model.ProjectedPoint(math.nan, math.nan, False)
-                continue
-            pixels[joint] = camera_model.project(
-                camera_model.transform_point(matrix, world), eye
-            )
-        result[hand] = pixels
-    return result
+    pixels, _depths = project_skeleton_depth(
+        pose, intrinsics, skeleton, track=track, side=side
+    )
+    return pixels
 
 
 def _coord(value: float) -> int:
@@ -596,6 +700,67 @@ def _coord(value: float) -> int:
     if not math.isfinite(value):
         raise ValueError(f"координата: нефинитное значение {value!r}")
     return max(-COORD_LIMIT, min(COORD_LIMIT, int(round(value))))
+
+
+def depth_factor(
+    depth: float,
+    *,
+    near: float = DEPTH_NEAR_M,
+    far: float = DEPTH_FAR_M,
+    min_factor: float = DEPTH_MIN_FACTOR,
+) -> float:
+    """Множитель к цвету руки по глубине: 1.0 ближе ``near``, ``min_factor`` дальше ``far``.
+
+    Линейно по глубине (без гаммы и ступеней) и монотонно не возрастает с ``z``: ближе —
+    ярче и насыщеннее, дальше — приглушённее. Окно **абсолютное**, в метрах системы камеры
+    (:data:`DEPTH_NEAR_M`…:data:`DEPTH_FAR_M` замерены по всей записи), поэтому множитель не
+    зависит от того, что попало в кадр, и не «дышит» от кадра к кадру.
+
+    Неизвестная глубина (``NaN``, ``±inf``) даёт 1.0 — полный цвет: невидимая точка всё
+    равно не рисуется, а выцветать из-за отсутствия данных скелет не должен. Глубина за
+    камерой (``z ≤ 0``) тоже упирается в ближнюю границу окна и даёт 1.0 — такая точка в
+    кадр не попадает, множитель для неё смысла не имеет.
+    """
+    for name, value in (("near", near), ("far", far), ("min_factor", min_factor)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name}: ожидалось число, получено {value!r}")
+        if not math.isfinite(value):
+            raise ValueError(f"{name}: должно быть конечным, получено {value!r}")
+    if near <= 0:
+        raise ValueError(f"near: должно быть > 0, получено {near!r}")
+    if far <= near:
+        raise ValueError(f"far: должно быть больше near ({near!r}), получено {far!r}")
+    if not 0.0 < min_factor <= 1.0:
+        raise ValueError(f"min_factor: ожидалось в (0, 1], получено {min_factor!r}")
+    if isinstance(depth, bool) or not isinstance(depth, (int, float)):
+        raise ValueError(f"depth: ожидалось число, получено {depth!r}")
+    if not math.isfinite(depth):
+        return 1.0
+    t = (float(depth) - near) / (far - near)
+    t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
+    return 1.0 - (1.0 - min_factor) * t
+
+
+def shade_color(color: Sequence[int], factor: float) -> tuple[int, int, int]:
+    """Умножить цвет BGR на ``factor`` (0…1) с округлением и зажимом в 0…255.
+
+    Умножение сохраняет оттенок руки (все каналы масштабируются одинаково) и меняет только
+    яркость/насыщенность — вторая палитра не появляется, левая/правая рука по-прежнему
+    различимы. Множитель обычно приходит из :func:`depth_factor`, где снизу ограничен
+    :data:`DEPTH_MIN_FACTOR`, поэтому дальняя кость не превращается в чёрную.
+    """
+    channels = tuple(color)
+    if len(channels) != 3:
+        raise ValueError(f"color: ожидался BGR из 3 каналов, получено {color!r}")
+    for value in channels:
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 255:
+            raise ValueError(f"color: канал должен быть int 0…255, получено {value!r}")
+    if isinstance(factor, bool) or not isinstance(factor, (int, float)):
+        raise ValueError(f"factor: ожидалось число, получено {factor!r}")
+    if not math.isfinite(factor) or not 0.0 <= factor <= 1.0:
+        raise ValueError(f"factor: ожидалось в 0…1, получено {factor!r}")
+    shaded = (min(255, max(0, int(round(value * factor)))) for value in channels)
+    return tuple(shaded)  # type: ignore[return-value]
 
 
 def draw_skeleton(
@@ -606,6 +771,7 @@ def draw_skeleton(
     colors: Mapping[str, tuple[int, int, int]] = COLORS,
     joints: Sequence[str] = JOINTS,
     bones: Sequence[tuple[str, str]] = HAND_CHAINS,
+    depths: Mapping[str, Mapping[str, float]] | None = None,
 ) -> int:
     """Нарисовать скелет на кадре (in place) и вернуть число видимых точек.
 
@@ -615,6 +781,13 @@ def draw_skeleton(
     руку к точке за камерой, а ``NaN`` («нет данных», 04b) дал бы линию через дырку.
     Точки, вышедшие за край кадра, всё равно рисуются: cv2 обрежет круг/отрезок по границе,
     и видимая часть кисти останется на месте.
+
+    ``depths`` (08g) — глубина суставов в системе камеры, ``side → joint → z`` (как у
+    :func:`project_skeleton_depth`). Если передана, цвет руки умножается на
+    :func:`depth_factor`: у точки — по её глубине, у кости — по средней глубине её концов;
+    ``NaN`` у конца кости или у точки даёт полный цвет (глубина неизвестна). Обводка точки
+    остаётся чёрной при любом множителе — контраст на светлом фоне сохраняется.
+    ``None`` (по умолчанию) — плоские цвета 08a: та же картинка, что до 08g.
     """
     import cv2  # noqa: PLC0415 — локальный импорт: чистые функции модуля работают без OpenCV
 
@@ -633,6 +806,8 @@ def draw_skeleton(
                     f"bones: ребро {start!r}→{end!r} ссылается на сустав {joint!r}, "
                     "которого нет в joints"
                 )
+    if depths is not None and not isinstance(depths, Mapping):
+        raise ValueError(f"depths: ожидался Mapping side → joint → z, получено {depths!r}")
     drawn = 0
     for side in ("left", "right"):
         color = colors[side]
@@ -642,15 +817,30 @@ def draw_skeleton(
         missing = [joint for joint in names if joint not in hand]
         if missing:
             raise ValueError(f"pixels[{side!r}]: нет суставов {missing}")
+        hand_depths = None if depths is None else depths.get(side)
+        if depths is not None:
+            if hand_depths is None:
+                raise ValueError(f"depths: нет руки {side!r}")
+            missing = [joint for joint in names if joint not in hand_depths]
+            if missing:
+                raise ValueError(f"depths[{side!r}]: нет суставов {missing}")
         for start, end in pairs:
             first, second = hand[start], hand[end]
             if not (first.visible and second.visible):
                 continue
+            line_color = color
+            if hand_depths is not None:
+                depth_start = hand_depths[start]
+                depth_end = hand_depths[end]
+                if math.isfinite(depth_start) and math.isfinite(depth_end):
+                    line_color = shade_color(
+                        color, depth_factor((depth_start + depth_end) / 2.0)
+                    )
             cv2.line(
                 image,
                 (_coord(first.u), _coord(first.v)),
                 (_coord(second.u), _coord(second.v)),
-                color,
+                line_color,
                 style.line_thickness,
                 cv2.LINE_AA,
             )
@@ -659,7 +849,12 @@ def draw_skeleton(
             if not point.visible:
                 continue
             center = (_coord(point.u), _coord(point.v))
-            cv2.circle(image, center, style.point_radius, color, -1, cv2.LINE_AA)
+            fill_color = color
+            if hand_depths is not None:
+                depth = hand_depths[joint]
+                if math.isfinite(depth):
+                    fill_color = shade_color(color, depth_factor(depth))
+            cv2.circle(image, center, style.point_radius, fill_color, -1, cv2.LINE_AA)
             cv2.circle(
                 image, center, style.point_radius, OUTLINE_COLOR, OUTLINE_THICKNESS, cv2.LINE_AA
             )
@@ -987,12 +1182,30 @@ def _eye_view(image: Any, scene: Scene) -> Any:
 
 
 def _draw_pose(
-    image: Any, pose: sync.Pose, scene: Scene, style: Style, skeleton: Skeleton = FIVE_POINT
+    image: Any,
+    pose: sync.Pose,
+    scene: Scene,
+    style: Style,
+    skeleton: Skeleton = FIVE_POINT,
+    *,
+    depth_shading: bool = False,
 ) -> int:
-    """Спроецировать скелет кадра и нарисовать его на уже обрезанном кадре глаза."""
-    pixels = project_skeleton(pose, scene.intrinsics, skeleton, track=scene.track)
+    """Спроецировать скелет кадра и нарисовать его на уже обрезанном кадре глаза.
+
+    ``depth_shading`` (08g) — красить ли по глубине: тогда вместе с пикселями считается
+    ``z`` в системе камеры (:func:`project_skeleton_depth`), и цвет кости/точки гаснет с
+    расстоянием. По умолчанию выключено: кадр 08a воспроизводится без изменений.
+    """
+    if depth_shading:
+        pixels, depths = project_skeleton_depth(
+            pose, scene.intrinsics, skeleton, track=scene.track
+        )
+    else:
+        pixels, depths = project_skeleton(
+            pose, scene.intrinsics, skeleton, track=scene.track
+        ), None
     return draw_skeleton(
-        image, pixels, style, joints=skeleton.joints, bones=skeleton.bones
+        image, pixels, style, joints=skeleton.joints, bones=skeleton.bones, depths=depths
     )
 
 
@@ -1073,6 +1286,8 @@ class RenderStats:
     #: 08f: имя скелета (``five``/``dense``/``all``) и число суставов на руку в нём.
     skeleton: str = "five"
     joints_per_hand: int = 5
+    #: 08g: красился ли скелет по глубине (множитель к цвету руки).
+    depth_shading: bool = False
 
     @property
     def frames(self) -> int:
@@ -1124,6 +1339,7 @@ def render_video(
     hud: bool = True,
     trail_seconds: float = TRAIL_SECONDS,
     skeleton: Skeleton = FIVE_POINT,
+    depth_shading: bool | None = None,
     log: Callable[[str], None] = print,
 ) -> RenderStats:
     """Отрендерить диапазон кадров ``start…end`` в ``out`` и вернуть :class:`RenderStats`.
@@ -1139,6 +1355,10 @@ def render_video(
     ``skeleton`` (08f) — какой скелет рисовать: по умолчанию прежний 5-точечный (08a);
     CLI передаёт :data:`DENSE` или :data:`ALL_JOINTS`. Для густого скелета сцена должна
     быть загружена с ``extra_keys=skeleton.extra_keys`` — иначе ``ValueError`` до записи.
+
+    ``depth_shading`` (08g) — кодировать ли глубину цветом: ``None`` — авторежим
+    (:func:`resolve_depth_shading`: да для густого скелета, нет для 5-точечного 08a),
+    ``True``/``False`` — принудительно.
     """
     import cv2  # noqa: PLC0415
 
@@ -1150,6 +1370,7 @@ def render_video(
         if not isinstance(value, bool):
             raise ValueError(f"{name}: ожидалось bool, получено {value!r}")
     _require_skeleton_track(scene.track, skeleton)
+    shading = resolve_depth_shading(depth_shading, skeleton)
     if trail:
         _trail_window(trail_seconds, TRAIL_STEP_S)  # проверка окна до открытия файлов
     video = Path(video)
@@ -1188,7 +1409,9 @@ def render_video(
                     trail_segments += draw_trail(
                         view, pose, scene.track, scene.intrinsics, style, seconds=trail_seconds
                     )
-                joints += _draw_pose(view, pose, scene, style, skeleton)
+                joints += _draw_pose(
+                    view, pose, scene, style, skeleton, depth_shading=shading
+                )
                 if hud:
                     draw_hud(
                         view,
@@ -1239,6 +1462,7 @@ def render_video(
         hud=hud,
         skeleton=skeleton.name,
         joints_per_hand=len(skeleton.joints),
+        depth_shading=shading,
     )
 
 
@@ -1253,6 +1477,7 @@ def render_stills(
     hud: bool = True,
     trail_seconds: float = TRAIL_SECONDS,
     skeleton: Skeleton = FIVE_POINT,
+    depth_shading: bool | None = None,
     log: Callable[[str], None] = print,
 ) -> list[Path]:
     """Сохранить PNG-кадры с наложением (по умолчанию 5 отладочных кадров 07a).
@@ -1264,6 +1489,9 @@ def render_stills(
     ``trail``/``hud`` — как у :func:`render_video`: ``--no-trail --no-hud`` даёт кадр «как в
     08a», он идёт в сравнение «до/после» (``docs/overlay.md``). ``skeleton`` — как у
     :func:`render_video`: по умолчанию 5 точек, CLI передаёт густой скелет.
+    ``depth_shading`` (08g) — как у :func:`render_video`: ``None`` — авторежим (да для густого
+    скелета, нет для 5-точечного 08a), ``True``/``False`` — принудительно; на PNG это
+    видно без кодирования видео, поэтому «до/после» снимается именно ``--stills``.
     """
     import cv2  # noqa: PLC0415
 
@@ -1273,6 +1501,7 @@ def render_stills(
     indices = sorted(set(frames))
     style = style_for(scene.eye_size[0], scale)
     _require_skeleton_track(scene.track, skeleton)
+    shading = resolve_depth_shading(depth_shading, skeleton)
     if trail:
         _trail_window(trail_seconds, TRAIL_STEP_S)
     out = Path(out_dir)
@@ -1297,7 +1526,9 @@ def render_stills(
                 segments = draw_trail(
                     view, pose, scene.track, scene.intrinsics, style, seconds=trail_seconds
                 )
-            drawn = _draw_pose(view, pose, scene, style, skeleton)
+            drawn = _draw_pose(
+                view, pose, scene, style, skeleton, depth_shading=shading
+            )
             if hud:
                 draw_hud(
                     view,
@@ -1331,6 +1562,13 @@ def _format_stats(stats: RenderStats) -> str:
         if stats.trail_seconds > 0
         else f"след выключен; HUD: {'да' if stats.hud else 'нет'}"
     )
+    if stats.depth_shading:
+        shading_line = (
+            f"да (окно {DEPTH_NEAR_M:g}…{DEPTH_FAR_M:g} м, множитель "
+            f"{DEPTH_MIN_FACTOR:g}…1.0)"
+        )
+    else:
+        shading_line = "нет (плоские цвета рук)"
     lines = [
         f"записано: {stats.out}",
         f"  кадры: {stats.first_frame}…{stats.last_frame} ({stats.frames}), "
@@ -1338,6 +1576,7 @@ def _format_stats(stats: RenderStats) -> str:
         f"  кодек: {stats.codec}; файл {megabytes:.1f} МиБ; "
         f"поправка времени {stats.time_offset_ms:+.0f} мс",
         f"  скелет: {stats.skeleton} ({stats.joints_per_hand} суставов на руку)",
+        f"  глубина → цвет: {shading_line}",
         f"  рендер: {stats.elapsed_s:.1f} с, {stats.frames_per_s:.1f} кадр/с "
         f"(видимых суставов {stats.joints_drawn})",
         f"  {trail}",
@@ -1397,9 +1636,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="рисовать прежний 5-точечный скелет 08a (для сравнений «до/после»)",
     )
+    depth_group = parser.add_mutually_exclusive_group()
+    depth_group.add_argument(
+        "--depth-color",
+        dest="depth_shading",
+        action="store_true",
+        default=None,
+        help="кодировать глубину цветом принудительно (по умолчанию — для густого скелета)",
+    )
+    depth_group.add_argument(
+        "--no-depth-color",
+        dest="depth_shading",
+        action="store_false",
+        default=None,
+        help="плоские цвета рук, как в 08f (кадр 5 точек 08a воспроизводится без изменений)",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     skeleton = ALL_JOINTS if args.all_joints else FIVE_POINT if args.five_points else DEFAULT_SKELETON
+    depth_shading = resolve_depth_shading(args.depth_shading, skeleton)
     try:
         scene = load_scene(args.meta, args.tracking, extra_keys=skeleton.extra_keys)
         if args.time_offset_ms is not None:
@@ -1422,6 +1677,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"рёбер {len(skeleton.bones)} на руку (--all-joints — 26 суставов, "
             f"--five-points — 5 точек)"
         )
+        print(
+            f"глубина → цвет: {'да' if depth_shading else 'нет'}"
+            + (
+                f" (окно {DEPTH_NEAR_M:g}…{DEPTH_FAR_M:g} м, множитель "
+                f"{DEPTH_MIN_FACTOR:g}…1.0)"
+                if depth_shading
+                else ""
+            )
+        )
         trail = not args.no_trail
         hud = not args.no_hud
         if args.stills is not None:
@@ -1435,6 +1699,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 hud=hud,
                 trail_seconds=args.trail_seconds,
                 skeleton=skeleton,
+                depth_shading=depth_shading,
             )
             print(f"PNG с наложением: {len(paths)} файлов в {args.stills}")
             return 0
@@ -1452,6 +1717,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             hud=hud,
             trail_seconds=args.trail_seconds,
             skeleton=skeleton,
+            depth_shading=depth_shading,
         )
     except (OSError, ValueError) as exc:
         print(f"ошибка: {exc}", file=sys.stderr)

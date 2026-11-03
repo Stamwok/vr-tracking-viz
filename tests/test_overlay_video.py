@@ -1302,6 +1302,336 @@ class DenseRenderTest(SyntheticVideoCase):
             )
         self.assertEqual(ctx.exception.code, 2)
 
+    def test_render_reports_depth_shading(self) -> None:
+        """08g: авторежим включается для густого скелета и выключен для 5-точечного 08a."""
+        dense = ov.render_video(
+            self.video, self.out, self._dense_scene(), progress_every=0, log=lambda _: None,
+            skeleton=ov.DENSE,
+        )
+        self.assertTrue(dense.depth_shading)
+        five = ov.render_video(
+            self.video, self.out, self._scene(), progress_every=0, log=lambda _: None,
+            skeleton=ov.FIVE_POINT,
+        )
+        self.assertFalse(five.depth_shading)
+        forced_off = ov.render_video(
+            self.video, self.out, self._dense_scene(), progress_every=0, log=lambda _: None,
+            skeleton=ov.DENSE, depth_shading=False,
+        )
+        self.assertFalse(forced_off.depth_shading)
+
+    def test_cli_depth_flag(self) -> None:
+        """08g: ``--depth-color``/``--no-depth-color`` — по умолчанию цвет по глубине."""
+        import contextlib
+        import io
+
+        def still(name: str, *flags: str) -> np.ndarray:
+            out = self.dir / name
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = ov.main(
+                    [
+                        str(self.video), "--stills", str(out), "--frames", "5",
+                        "--tracking", str(self.tracking), "--meta", str(self.meta_path), *flags,
+                    ]
+                )
+            self.assertEqual(code, 0)
+            image = cv2.imread(str(out / "frame_00005.png"))
+            self.assertIsNotNone(image)
+            return image
+
+        dense_auto = still("depth_auto")
+        dense_flat = still("depth_flat", "--no-depth-color")
+        self.assertFalse(np.array_equal(dense_auto, dense_flat))
+        # 5-точечный кадр 08a по умолчанию плоский: флаг ничего не меняет
+        five_auto = still("depth_five", "--five-points")
+        five_flat = still("depth_five_flat", "--five-points", "--no-depth-color")
+        self.assertTrue(np.array_equal(five_auto, five_flat))
+        # явный флаг перекрывает авторежим и для 5 точек
+        five_on = still("depth_five_on", "--five-points", "--depth-color")
+        self.assertFalse(np.array_equal(five_auto, five_on))
+
+
+# --- 08g: глубина → интенсивность цвета --------------------------------------------------
+
+
+class DepthFactorTest(unittest.TestCase):
+    """08g: множитель по глубине — окно, зажим, монотонность, неизвестная глубина."""
+
+    def test_defaults_map_to_full_colour_and_floor(self) -> None:
+        self.assertAlmostEqual(ov.depth_factor(ov.DEPTH_NEAR_M), 1.0, places=12)
+        self.assertAlmostEqual(ov.depth_factor(ov.DEPTH_FAR_M), ov.DEPTH_MIN_FACTOR, places=12)
+        # за границами окна — зажим, а не экстраполяция
+        self.assertAlmostEqual(ov.depth_factor(0.01), 1.0, places=12)
+        self.assertAlmostEqual(ov.depth_factor(5.0), ov.DEPTH_MIN_FACTOR, places=12)
+
+    def test_monotone_non_increasing_with_depth(self) -> None:
+        depths = (0.0, 0.1, ov.DEPTH_NEAR_M, 0.25, 0.30, 0.34, 0.40, 0.45, 0.50,
+                  ov.DEPTH_FAR_M, 0.7, 1.0)
+        factors = [ov.depth_factor(depth) for depth in depths]
+        for previous, current in zip(factors, factors[1:]):
+            self.assertGreaterEqual(previous + 1e-12, current)
+        # внутри окна строго убывает: ближе — ярче
+        self.assertGreater(factors[3], factors[4])
+        self.assertGreater(factors[4], factors[5])
+        # и не выходит из диапазона множителя
+        self.assertTrue(all(ov.DEPTH_MIN_FACTOR - 1e-12 <= f <= 1.0 + 1e-12 for f in factors))
+
+    def test_unknown_depth_keeps_full_colour(self) -> None:
+        # «нет данных» — не повод выцветать: невидимая точка всё равно не рисуется
+        for depth in (math.nan, math.inf, -math.inf):
+            with self.subTest(depth=depth):
+                self.assertEqual(ov.depth_factor(depth), 1.0)
+
+    def test_behind_camera_keeps_full_colour(self) -> None:
+        for depth in (-1.0, -0.001, 0.0):
+            with self.subTest(depth=depth):
+                self.assertEqual(ov.depth_factor(depth), 1.0)
+
+    def test_window_and_factor_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            ov.depth_factor(0.4, near=0.5, far=0.5)
+        with self.assertRaises(ValueError):
+            ov.depth_factor(0.4, near=0.6, far=0.58)
+        with self.assertRaises(ValueError):
+            ov.depth_factor(0.4, near=0.0)
+        with self.assertRaises(ValueError):
+            ov.depth_factor(0.4, near=-0.1)
+        with self.assertRaises(ValueError):
+            ov.depth_factor(0.4, near=math.nan)
+        with self.assertRaises(ValueError):
+            ov.depth_factor(0.4, far="0.58")
+        with self.assertRaises(ValueError):
+            ov.depth_factor(0.4, min_factor=0.0)
+        with self.assertRaises(ValueError):
+            ov.depth_factor(0.4, min_factor=1.5)
+        with self.assertRaises(ValueError):
+            ov.depth_factor(True)
+        with self.assertRaises(ValueError):
+            ov.depth_factor("0.4")
+
+    def test_shade_colour_scales_channels_and_keeps_hue(self) -> None:
+        colour = ov.COLORS["left"]
+        self.assertEqual(ov.shade_color(colour, 1.0), colour)
+        dimmed = ov.shade_color(colour, ov.DEPTH_MIN_FACTOR)
+        self.assertEqual(dimmed, (115, 63, 0))
+        # оттенок тот же: отношение каналов сохраняется (допуск — округление до int)
+        self.assertAlmostEqual(colour[0] / colour[1], dimmed[0] / dimmed[1], delta=0.02)
+        # зажим сверху и снизу
+        self.assertEqual(ov.shade_color((200, 200, 200), 1.0), (200, 200, 200))
+        self.assertEqual(ov.shade_color((255, 255, 255), 1.0), (255, 255, 255))
+        self.assertEqual(ov.shade_color((0, 0, 0), 0.5), (0, 0, 0))
+
+    def test_shade_colour_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            ov.shade_color((255, 140), 0.5)
+        with self.assertRaises(ValueError):
+            ov.shade_color((255, 140, 300), 0.5)
+        with self.assertRaises(ValueError):
+            ov.shade_color((255.0, 140, 0), 0.5)
+        with self.assertRaises(ValueError):
+            ov.shade_color((255, 140, 0), 1.5)
+        with self.assertRaises(ValueError):
+            ov.shade_color((255, 140, 0), -0.1)
+        with self.assertRaises(ValueError):
+            ov.shade_color((255, 140, 0), math.nan)
+        with self.assertRaises(ValueError):
+            ov.shade_color((255, 140, 0), True)
+
+    def test_auto_mode_follows_skeleton(self) -> None:
+        self.assertTrue(ov.resolve_depth_shading(None, ov.DENSE))
+        self.assertTrue(ov.resolve_depth_shading(None, ov.ALL_JOINTS))
+        self.assertFalse(ov.resolve_depth_shading(None, ov.FIVE_POINT))
+        # тот же 5-точечный набор, собранный заново, — тоже плоский кадр
+        clone = ov.Skeleton("five", "5 точек", ov.JOINTS, ov.HAND_CHAINS)
+        self.assertFalse(ov.resolve_depth_shading(None, clone))
+
+    def test_explicit_flag_overrides_auto_mode(self) -> None:
+        self.assertTrue(ov.resolve_depth_shading(True, ov.FIVE_POINT))
+        self.assertFalse(ov.resolve_depth_shading(False, ov.DENSE))
+
+    def test_auto_mode_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            ov.resolve_depth_shading(1, ov.DENSE)  # int, не bool
+        with self.assertRaises(ValueError):
+            ov.resolve_depth_shading("yes", ov.DENSE)
+        with self.assertRaises(ValueError):
+            ov.resolve_depth_shading(None, "dense")
+
+
+class DepthProjectionTest(unittest.TestCase):
+    """08g: глубина — ``z`` точки в системе камеры, а не мировая координата."""
+
+    def test_depth_is_camera_z_matching_the_matrix(self) -> None:
+        pose = _pose()
+        pixels, depths = ov.project_skeleton_depth(pose, EYE, ov.FIVE_POINT)
+        matrix = camera_model.world_to_camera_matrix(pose)
+        eye = camera_model.eye_intrinsics(EYE, "left")
+        for side, joints in (("left", LEFT_POINTS), ("right", RIGHT_POINTS)):
+            for joint, world in joints.items():
+                with self.subTest(side=side, joint=joint):
+                    p_cam = camera_model.transform_point(matrix, world)
+                    self.assertAlmostEqual(depths[side][joint], p_cam[2], places=12)
+                    expected = camera_model.project(p_cam, eye)
+                    self.assertAlmostEqual(pixels[side][joint].u, expected.u, places=12)
+                    self.assertAlmostEqual(pixels[side][joint].v, expected.v, places=12)
+                    self.assertTrue(pixels[side][joint].visible)
+
+    def test_nearer_hand_has_smaller_camera_z(self) -> None:
+        far = dict(LEFT_POINTS)
+        far["palm"] = (0.10, 0.0, -1.0)
+        near = dict(RIGHT_POINTS)
+        near["palm"] = (0.20, 0.10, -0.25)
+        pixels, depths = ov.project_skeleton_depth(
+            _pose({"left": far, "right": near}), EYE, ov.FIVE_POINT
+        )
+        self.assertLess(depths["right"]["palm"], depths["left"]["palm"])
+        self.assertGreater(
+            ov.depth_factor(depths["right"]["palm"]), ov.depth_factor(depths["left"]["palm"])
+        )
+
+    def test_depths_match_project_skeleton(self) -> None:
+        track = _dense_track(ov.DENSE.extra_keys)
+        pose = track.pose_at(BASE_NS)
+        pixels, depths = ov.project_skeleton_depth(pose, EYE, ov.DENSE, track=track)
+        plain = ov.project_skeleton(pose, EYE, ov.DENSE, track=track)
+        for side in ("left", "right"):
+            self.assertEqual(set(depths[side]), set(ov.DENSE.joints))
+            for joint in ov.DENSE.joints:
+                with self.subTest(side=side, joint=joint):
+                    self.assertEqual(pixels[side][joint], plain[side][joint])
+
+    def test_nan_joint_has_nan_depth(self) -> None:
+        points = {"left": LEFT_POINTS, "right": dict(RIGHT_POINTS)}
+        points["right"]["palm"] = (math.nan, math.nan, math.nan)
+        pose = _pose(points)
+        pixels, depths = ov.project_skeleton_depth(pose, EYE, ov.FIVE_POINT)
+        self.assertFalse(pixels["right"]["palm"].visible)
+        self.assertTrue(math.isnan(depths["right"]["palm"]))
+        self.assertTrue(math.isfinite(depths["left"]["palm"]))
+
+    def test_point_behind_camera_has_finite_depth_but_is_invisible(self) -> None:
+        points = {"left": dict(LEFT_POINTS), "right": RIGHT_POINTS}
+        points["left"]["palm"] = (0.10, 0.00, 1.0)  # за головой: вперёд смотрит −z
+        pixels, depths = ov.project_skeleton_depth(_pose(points), EYE, ov.FIVE_POINT)
+        self.assertFalse(pixels["left"]["palm"].visible)
+        self.assertTrue(math.isnan(pixels["left"]["palm"].u))
+        self.assertTrue(math.isfinite(depths["left"]["palm"]))
+        self.assertEqual(ov.depth_factor(depths["left"]["palm"]), 1.0)
+
+    def test_projection_is_deterministic(self) -> None:
+        track = _dense_track(ov.DENSE.extra_keys)
+        pose = track.pose_at(BASE_NS)
+        first = ov.project_skeleton_depth(pose, EYE, ov.DENSE, track=track)
+        second = ov.project_skeleton_depth(pose, EYE, ov.DENSE, track=track)
+        self.assertEqual(first, second)
+
+
+@unittest.skipIf(cv2 is None, NO_CV2)
+class DepthShadingDrawTest(unittest.TestCase):
+    """08g: ``draw_skeleton`` гасит дальние кости/точки, плоский режим — прежний кадр."""
+
+    def setUp(self) -> None:
+        self.style = ov.style_for(1080)
+        self.pixels = {
+            "left": {
+                "palm": camera_model.ProjectedPoint(100.0, 100.0, True),
+                "thumb": camera_model.ProjectedPoint(300.0, 100.0, True),
+            },
+            "right": {
+                "palm": camera_model.ProjectedPoint(600.0, 100.0, True),
+                "thumb": camera_model.ProjectedPoint(800.0, 100.0, True),
+            },
+        }
+        self.joints = ("palm", "thumb")
+        self.bones = (("palm", "thumb"),)
+        # ладонь — на дальней границе окна, кончик большого — на ближней
+        self.depths = {
+            "left": {"palm": ov.DEPTH_FAR_M, "thumb": ov.DEPTH_NEAR_M},
+            "right": {"palm": ov.DEPTH_FAR_M, "thumb": ov.DEPTH_NEAR_M},
+        }
+
+    def _draw(self, depths) -> np.ndarray:
+        image = np.zeros((810, 1080, 3), np.uint8)
+        ov.draw_skeleton(
+            image, self.pixels, self.style, joints=self.joints, bones=self.bones, depths=depths
+        )
+        return image
+
+    def test_nearer_point_is_full_colour_and_farther_is_dimmed(self) -> None:
+        image = self._draw(self.depths)
+        near = image[100, 300]
+        far = image[100, 100]
+        self.assertEqual(tuple(int(v) for v in near), ov.COLORS["left"])
+        self.assertEqual(
+            tuple(int(v) for v in far), ov.shade_color(ov.COLORS["left"], ov.DEPTH_MIN_FACTOR)
+        )
+        # оттенок руки сохранился: синий канал по-прежнему доминирует
+        self.assertGreater(int(far[0]), int(far[1]))
+        self.assertEqual(int(far[2]), 0)
+
+    def test_bone_colour_uses_mean_endpoint_depth(self) -> None:
+        image = self._draw(self.depths)
+        mean = (ov.DEPTH_FAR_M + ov.DEPTH_NEAR_M) / 2.0
+        expected = ov.shade_color(ov.COLORS["left"], ov.depth_factor(mean))
+        self.assertEqual(tuple(int(v) for v in image[100, 200]), expected)
+
+    def test_outline_stays_dark_on_both_depths(self) -> None:
+        """Обводка точки остаётся тёмной при любом множителе — контраст на светлом фоне."""
+        shaded = self._draw(self.depths)
+        for u in (100, 300):
+            with self.subTest(u=u):
+                fill = shaded[100, u].astype(int)  # центр точки — цвет руки (с множителем)
+                ring = shaded[100, u + 4].astype(int)  # ядро чёрной обводки
+                self.assertTrue(all(int(channel) < 60 for channel in ring))
+                for index, channel in enumerate(fill):
+                    if channel:
+                        self.assertLess(ring[index], channel * 0.35)
+
+    def test_flat_mode_reproduces_previous_frame(self) -> None:
+        flat = self._draw(None)
+        unknown = self._draw(
+            {side: {joint: math.nan for joint in self.joints} for side in ("left", "right")}
+        )
+        # глубины нет — полный цвет: ровно та же картинка, что без ``depths``
+        self.assertTrue(np.array_equal(flat, unknown))
+        self.assertEqual(tuple(int(v) for v in flat[100, 100]), ov.COLORS["left"])
+
+    def test_mixed_nan_endpoint_keeps_full_colour(self) -> None:
+        depths = {
+            "left": {"palm": ov.DEPTH_FAR_M, "thumb": math.nan},
+            "right": {"palm": math.nan, "thumb": ov.DEPTH_NEAR_M},
+        }
+        image = self._draw(depths)
+        # линия (100,100)→(300,100): один конец без глубины — полный цвет
+        self.assertEqual(tuple(int(v) for v in image[100, 200]), ov.COLORS["left"])
+        # точка с глубиной всё равно приглушается
+        self.assertEqual(
+            tuple(int(v) for v in image[100, 100]),
+            ov.shade_color(ov.COLORS["left"], ov.DEPTH_MIN_FACTOR),
+        )
+
+    def test_drawing_is_deterministic(self) -> None:
+        first = self._draw(self.depths)
+        second = self._draw(self.depths)
+        self.assertTrue(np.array_equal(first, second))
+
+    def test_depths_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            ov.draw_skeleton(
+                np.zeros((810, 1080, 3), np.uint8), self.pixels, self.style,
+                joints=self.joints, bones=self.bones, depths=["nope"],
+            )
+        with self.assertRaises(ValueError):
+            ov.draw_skeleton(
+                np.zeros((810, 1080, 3), np.uint8), self.pixels, self.style,
+                joints=self.joints, bones=self.bones, depths={"left": self.depths["left"]},
+            )
+        with self.assertRaises(ValueError):
+            ov.draw_skeleton(
+                np.zeros((810, 1080, 3), np.uint8), self.pixels, self.style,
+                joints=self.joints, bones=self.bones, depths={"left": {}, "right": {}},
+            )
+
 
 @unittest.skipUnless(DATA is not None and META_PATH.is_file(), NO_DATA)
 class DenseRealDataTest(unittest.TestCase):
@@ -1315,6 +1645,15 @@ class DenseRealDataTest(unittest.TestCase):
         moment = sync.frame_time(k, self.scene.meta, self.scene.header_ns, self.scene.tracking_end_ns)
         pose = sync.pose_at_frame(self.scene.track, moment, self.scene.time_offset_ns)
         return ov.project_skeleton(pose, self.scene.intrinsics, skeleton, track=self.scene.track)
+
+    def _depth_pixels(self, k: int):
+        moment = sync.frame_time(
+            k, self.scene.meta, self.scene.header_ns, self.scene.tracking_end_ns
+        )
+        pose = sync.pose_at_frame(self.scene.track, moment, self.scene.time_offset_ns)
+        return ov.project_skeleton_depth(
+            pose, self.scene.intrinsics, ov.DENSE, track=self.scene.track
+        )
 
     def test_dense_keeps_five_point_projection(self) -> None:
         for k in ov.DEBUG_FRAMES:
@@ -1353,17 +1692,36 @@ class DenseRealDataTest(unittest.TestCase):
                         f"сустав {side} {joint} попал в HUD на кадре {k}",
                     )
 
+    def test_depth_is_deterministic_and_consistent_on_debug_frames(self) -> None:
+        """08g: на 5 кадрах 07a глубина детерминирована и согласована с видимостью."""
+        for k in ov.DEBUG_FRAMES:
+            with self.subTest(frame=k):
+                first = self._depth_pixels(k)
+                self.assertEqual(first, self._depth_pixels(k))
+                pixels, depths = first
+                for side in ("left", "right"):
+                    self.assertEqual(set(depths[side]), set(ov.DENSE.joints))
+                    for joint in ov.DENSE.joints:
+                        point = pixels[side][joint]
+                        depth = depths[side][joint]
+                        if point.visible:
+                            self.assertTrue(math.isfinite(depth))
+                            self.assertGreater(depth, camera_model.MIN_DEPTH_M)
+                            self.assertGreaterEqual(ov.depth_factor(depth), ov.DEPTH_MIN_FACTOR)
+                        else:
+                            self.assertTrue(math.isnan(depth) or depth <= camera_model.MIN_DEPTH_M)
+
     @unittest.skipIf(cv2 is None or VIDEO is None, f"{NO_CV2} или {NO_VIDEO}")
     def test_dense_still_has_more_skeleton_pixels(self) -> None:
         """На реальном кадре густой скелет закрашивает больше пикселей, чем 5-точечный."""
         with tempfile.TemporaryDirectory() as tmp:
             five = ov.render_stills(
                 VIDEO, self.scene, Path(tmp) / "five", frames=(1800,),
-                skeleton=ov.FIVE_POINT, log=lambda _: None,
+                skeleton=ov.FIVE_POINT, log=lambda _: None, depth_shading=False,
             )
             dense = ov.render_stills(
                 VIDEO, self.scene, Path(tmp) / "dense", frames=(1800,),
-                skeleton=ov.DENSE, log=lambda _: None,
+                skeleton=ov.DENSE, log=lambda _: None, depth_shading=False,
             )
             image_five = cv2.imread(str(five[0]))
             image_dense = cv2.imread(str(dense[0]))
