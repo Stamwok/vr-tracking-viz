@@ -57,6 +57,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.parse_tracking import (  # noqa: E402
+    ELBOW_KEYS,
     HAND_JOINTS,
     extract_sample,
     iter_samples,
@@ -77,6 +78,34 @@ POSITION_FIELDS = (
 
 #: Колонки кватерниона головы (x, y, z, w) — интерполируются через :func:`slerp`.
 QUAT_FIELDS = ("head_qx", "head_qy", "head_qz", "head_qw")
+
+#: Оси позиции сустава в колонках: ``left_index_proximal_x`` и т.д.
+AXES = ("x", "y", "z")
+
+
+def _extra_keys(keys: Sequence[str]) -> tuple[str, ...]:
+    """Проверить список дополнительных ключей суставов (08e): имена ``"left_palm"`` и т.п.
+
+    Ключи из :data:`POINT_KEYS` запрещены: их колонки уже есть, дублировать их в ``values``
+    значило бы завести два источника одной величины.
+    """
+    if isinstance(keys, str):
+        raise ValueError("extra_keys: ожидался список ключей, получена строка")
+    result: list[str] = []
+    for key in keys:
+        if not isinstance(key, str) or not key:
+            raise ValueError(f"extra_keys: ожидалось непустое имя ключа, получено {key!r}")
+        if key in POINT_KEYS:
+            raise ValueError(f"extra_keys: {key!r} уже среди 5 точек рендера (POINT_KEYS)")
+        if key in result:
+            raise ValueError(f"extra_keys: ключ {key!r} повторяется")
+        result.append(key)
+    return tuple(result)
+
+
+def _extra_fields(keys: Sequence[str]) -> tuple[str, ...]:
+    """Имена колонок дополнительных суставов: ``<key>_x/_y/_z``."""
+    return tuple(f"{key}_{axis}" for key in keys for axis in AXES)
 
 #: Порог «малого угла» в SLERP: при ``1 − |dot| < SLERP_EPS`` sin(theta) в формуле
 #: деления уже сопоставим с погрешностью float, поэтому берём нормализованный lerp.
@@ -190,6 +219,21 @@ def video_time_offset_ns() -> int:
     return int(round(float(value) * 1e6))
 
 
+def pose_time_ns(frame: FrameTime, offset_ns: int | None = None) -> int:
+    """Момент, в котором берётся поза кадра: ``frame.ts_ns + offset_ns`` (задача 08e).
+
+    ``offset_ns=None`` — поправка из ``config.VIDEO_TIME_OFFSET_MS`` (``video_time_offset_ns``).
+    Вынесено из :func:`pose_at_frame`, чтобы костная разметка 08e брала дополнительные
+    суставы ровно в тот же момент времени, что и поза головы, — иначе две метрики одной
+    проверки жили бы в разных шкалах.
+    """
+    if offset_ns is None:
+        offset_ns = video_time_offset_ns()
+    if isinstance(offset_ns, bool) or not isinstance(offset_ns, int):
+        raise ValueError(f"offset_ns: ожидалось целое число, получено {offset_ns!r}")
+    return int(frame.ts_ns) + offset_ns
+
+
 def pose_at_frame(track: PoseTrack, frame: FrameTime, offset_ns: int | None = None) -> Pose:
     """Поза на кадр с поправкой на задержку видеотракта: ``t = frame.ts_ns + offset_ns``.
 
@@ -197,11 +241,7 @@ def pose_at_frame(track: PoseTrack, frame: FrameTime, offset_ns: int | None = No
     значение нужно диагностике (скан сдвига) и тестам. Сама ``frame_time`` остаётся «чистой»
     шкалой видео: поправка — отдельное решение, которое видно в одном месте.
     """
-    if offset_ns is None:
-        offset_ns = video_time_offset_ns()
-    if isinstance(offset_ns, bool) or not isinstance(offset_ns, int):
-        raise ValueError(f"offset_ns: ожидалось целое число, получено {offset_ns!r}")
-    return track.pose_at(int(frame.ts_ns) + offset_ns)
+    return track.pose_at(pose_time_ns(frame, offset_ns))
 
 
 def pose_at_frame_split(
@@ -403,6 +443,11 @@ class PoseTrack:
     Храним только нужное: ``ts`` (Unix ns, строго возрастает), 33 позиции, кватернион
     головы (4 колонки) и 2 флага. 21 787 сэмплов занимают ≈ 6 МБ, поэтому файл читается
     один раз (``load_poses``).
+
+    ``extra_keys`` (задача 08e) — дополнительные суставы, которых нет среди 5 точек рендера
+    (``index_proximal`` и т.п.): их позиции лежат в тех же колонках, что и остальные, но в
+    :class:`Pose` не попадают — рендер и CSV остаются 5-точечными (их расширение — 08f).
+    Читаются они через :meth:`joint_at` с той же интерполяцией, что и поза.
     """
 
     def __init__(
@@ -410,6 +455,7 @@ class PoseTrack:
         ts: Sequence[int],
         values: Mapping[str, Sequence[float]],
         active: Mapping[str, Sequence[bool]],
+        extra_keys: Sequence[str] = (),
     ) -> None:
         self.ts = tuple(int(t) for t in ts)
         if not self.ts:
@@ -417,7 +463,8 @@ class PoseTrack:
         for a, b in zip(self.ts, self.ts[1:]):
             if b <= a:
                 raise ValueError(f"PoseTrack: время сэмплов не возрастает ({a} → {b})")
-        for name in (*POSITION_FIELDS, *QUAT_FIELDS):
+        extra = _extra_keys(extra_keys)
+        for name in (*POSITION_FIELDS, *QUAT_FIELDS, *_extra_fields(extra)):
             column = values.get(name) if values else None
             if column is None:
                 raise ValueError(f"PoseTrack: нет колонки {name!r}")
@@ -433,7 +480,11 @@ class PoseTrack:
                 raise ValueError(
                     f"PoseTrack: флаг {side!r} длиной {len(column)}, а сэмплов {len(self.ts)}"
                 )
-        self._values = {name: tuple(values[name]) for name in (*POSITION_FIELDS, *QUAT_FIELDS)}
+        self.extra_keys = extra
+        self._values = {
+            name: tuple(values[name])
+            for name in (*POSITION_FIELDS, *QUAT_FIELDS, *_extra_fields(extra))
+        }
         self._active = {side: tuple(bool(v) for v in active[side]) for side in ("left", "right")}
 
     def __len__(self) -> int:
@@ -514,15 +565,9 @@ class PoseTrack:
           битого сэмпла хуже. В реальных данных таких сэмплов нет (max ||q| − 1| ≈ 1.2e-7).
         """
         t = _int_ns(t_ns, "t_ns")
-        if t <= self.ts[0]:
-            return self.sample_pose(0, t)
-        if t >= self.ts[-1]:
-            return self.sample_pose(len(self.ts) - 1, t)
-        i = bisect_right(self.ts, t) - 1
-        if self.ts[i] == t:
+        i, j, w = self._bracket(t)
+        if j is None:
             return self.sample_pose(i, t)
-        j = i + 1
-        w = (t - self.ts[i]) / (self.ts[j] - self.ts[i])
         nearest = self.nearest_index(t)
         values = {name: self._lerp(name, i, j, w) for name in POSITION_FIELDS}
         head = (values["head_x"], values["head_y"], values["head_z"])
@@ -544,25 +589,86 @@ class PoseTrack:
             active=active,
         )
 
+    def _bracket(self, t_ns: int) -> tuple[int, int | None, float]:
+        """Соседние сэмплы и вес интерполяции на момент ``t_ns``: ``(i, j, w)``.
 
-def load_poses(tracking_path: str | Path) -> PoseTrack:
+        ``j = None`` значит «интерполировать нечего»: момент попал ровно в сэмпл ``i`` или
+        вышел за диапазон (край замораживается) — те же три случая, что разбирает
+        :meth:`pose_at`. Вынесено отдельно, чтобы :meth:`joint_at` считал дополнительные
+        суставы по ровно тем же правилам, что и позу.
+        """
+        t = _int_ns(t_ns, "t_ns")
+        if t <= self.ts[0]:
+            return 0, None, 0.0
+        if t >= self.ts[-1]:
+            return len(self.ts) - 1, None, 0.0
+        i = bisect_right(self.ts, t) - 1
+        if self.ts[i] == t:
+            return i, None, 0.0
+        j = i + 1
+        return i, j, (t - self.ts[i]) / (self.ts[j] - self.ts[i])
+
+    def joint_at(self, t_ns: int, key: str) -> tuple[float, float, float]:
+        """Позиция дополнительного сустава ``key`` на момент ``t_ns`` (задача 08e).
+
+        ``key`` — ключ из ``extra_keys`` (``"left_index_proximal"`` и т.п.). Правила те же,
+        что у :meth:`pose_at`: край замораживается, точное попадание в сэмпл берётся без
+        float-арифметики, NaN на любом конце интервала даёт NaN (через «нет данных» не мостим).
+        Значения совпадают с :meth:`pose_at` для тех же суставов, если они входят в позу.
+        """
+        if key not in self.extra_keys:
+            raise ValueError(
+                f"PoseTrack.joint_at: {key!r} нет среди extra_keys {self.extra_keys}"
+            )
+        i, j, w = self._bracket(t_ns)
+        if j is None:
+            return tuple(  # type: ignore[return-value]
+                self._values[f"{key}_{axis}"][i] for axis in AXES
+            )
+        return tuple(  # type: ignore[return-value]
+            self._lerp(f"{key}_{axis}", i, j, w) for axis in AXES
+        )
+
+
+def load_poses(tracking_path: str | Path, extra_keys: Sequence[str] = ()) -> PoseTrack:
     """Читает файл трекинга потоково и складывает сэмплы колонками в :class:`PoseTrack`.
 
     Разбор — ``parse_tracking.extract_sample`` (поза головы + 5 точек на руку, NaN для
     невалидных). Ошибка формата позы поднимается с номером строки через ``iter_samples``,
     но без поля сэмпла: при погоне за конкретным суставом включите ``where`` в отладке.
+
+    ``extra_keys`` (08e) — дополнительные суставы, которых нет среди 5 точек рендера; они
+    читаются теми же колонками и доступны через :meth:`PoseTrack.joint_at`, но в
+    :class:`Pose` не попадают. Неизвестное имя сустава — ``ValueError`` на первом сэмпле
+    (а не ``KeyError`` из середины разбора).
+
+    Локти (08h, :data:`src.parse_tracking.ELBOW_KEYS`) лежат не в ``Hand``, а в ``Body``,
+    поэтому парсер включает их в запись только когда они запрошены: ``include_forearm``
+    передаётся, если среди ``extra_keys`` есть ``left_elbow``/``right_elbow``. Так
+    ``tracking.csv`` и путь без предплечья остаются ровно прежними.
     """
+    extra = _extra_keys(extra_keys)
+    fields = (*POSITION_FIELDS, *QUAT_FIELDS, *_extra_fields(extra))
     ts = array("q")
-    values: dict[str, array] = {name: array("d") for name in (*POSITION_FIELDS, *QUAT_FIELDS)}
+    values: dict[str, array] = {name: array("d") for name in fields}
     active: dict[str, array] = {"left": array("b"), "right": array("b")}
+    include_forearm = any(key in ELBOW_KEYS for key in extra)
+    checked = False
     for sample in iter_samples(tracking_path):
-        record = extract_sample(sample)
+        record = extract_sample(sample, include_forearm=include_forearm)
+        if not checked:
+            missing = [name for name in _extra_fields(extra) if name not in record]
+            if missing:
+                raise ValueError(
+                    f"load_poses: в данных нет колонок {missing} (extra_keys={extra!r})"
+                )
+            checked = True
         ts.append(int(record["timeStampNs"]))
         for name in values:
             values[name].append(float(record[name]))
         for side in active:
             active[side].append(int(record[f"{side}_active"]))
-    return PoseTrack(ts, values, active)
+    return PoseTrack(ts, values, active, extra_keys=extra)
 
 
 def iter_frame_poses(

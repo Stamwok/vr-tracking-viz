@@ -44,11 +44,20 @@
 (:func:`convention_from_config`), прогоняет её по эталону 07a и сверяет метрику с 07b —
 то есть отвечает на вопрос «рендер по текущему конфигу воспроизводится?».
 
+Задача 08e добавила к этому вторую метрику — **на костях** (:mod:`src.calib_bones`): та же
+конвенция и те же интринсики, но сравнивается не «точка внутри рамки», а расстояние от
+проекции отрезков скелета до размеченных отрезков ``calib_frames.BONE_FRAMES`` (7–9 точек
+на руку) плюс счётчик изломов. ``--verify-config`` печатает обе метрики: старая 40/40
+остаётся критерием (код возврата от неё), костная — справочная, потому что её разметка
+грубее (±30–50 px). Проектор для костей — :func:`head_projector`, он повторяет математику
+:func:`evaluate`, а не дублирует её поведение для 5 точек.
+
 Запуск:
     python src/calib_search.py data/trackingData_*.txt
     python src/calib_search.py data/trackingData_*.txt --video data/CameraRecord_*.mp4
     python src/calib_search.py data/trackingData_*.txt --json > output/debug/calib/calibration.json
     python src/calib_search.py data/trackingData_*.txt --verify-config
+    python src/calib_search.py data/trackingData_*.txt --verify-config --bones-table
 """
 from __future__ import annotations
 
@@ -64,7 +73,7 @@ from typing import Any, Iterable, Sequence
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src import calib_frames, camera_model, sync  # noqa: E402
+from src import calib_bones, calib_frames, camera_model, sync  # noqa: E402
 from src.parse_tracking import read_header, timestamp_range  # noqa: E402
 
 #: Суставы, которые сравниваются с разметкой (5 точек на руку, как в 03c/07a).
@@ -652,6 +661,39 @@ def evaluate_convention(data: CalibData, convention: Convention) -> Metrics:
     )
 
 
+def head_projector(
+    intrinsics: camera_model.Intrinsics,
+    rotation: Sequence[Sequence[float]],
+    camera_offset: Sequence[float] = (0.0, 0.0, 0.0),
+) -> calib_bones.Projector:
+    """Проектор «система головы → пиксель левого глаза» для костной метрики (08e).
+
+    Ровно та же математика, что в :func:`evaluate` (``rotation`` = оси головы → камеры,
+    ``camera_offset`` = положение камеры в системе головы, ``b = −A·offset``): точка за
+    камерой (``Z ≤ MIN_DEPTH_M``) или вне кадра левого глаза даёт ``None``. Вынесено
+    отдельной функцией, чтобы 5-точечная метрика осталась нетронутой, а костная считалась
+    по тому же пути — расхождение двух метрик тогда означает разницу эталонов, а не кода.
+    """
+    matrix = rotation_basis(rotation)
+    offset = (float(camera_offset[0]), float(camera_offset[1]), float(camera_offset[2]))
+    shift = _matvec3(matrix, offset)
+    shift = (-shift[0], -shift[1], -shift[2])
+    eye_w, eye_h = calib_frames.EYE_WIDTH, calib_frames.EYE_HEIGHT
+
+    def project(head: Sequence[float]) -> tuple[float, float] | None:
+        x, y, z = _matvec3(matrix, head)
+        x, y, z = x + shift[0], y + shift[1], z + shift[2]
+        if z <= camera_model.MIN_DEPTH_M:
+            return None
+        u = intrinsics.fx * x / z + intrinsics.cx
+        v = intrinsics.fy * y / z + intrinsics.cy
+        if not (0.0 <= u < eye_w and 0.0 <= v < eye_h):
+            return None
+        return u, v
+
+    return project
+
+
 def convention_from_config() -> Convention:
     """Конвенция, собранная из ``src/config.py`` (07c), — проверка калибровки без перебора.
 
@@ -1031,12 +1073,21 @@ def save_overlay_sheets(
     return written
 
 
-def _verify_config(data: CalibData) -> int:
+def _verify_config(
+    data: CalibData,
+    bone_data: calib_bones.BoneData | None = None,
+    table: bool = False,
+) -> int:
     """Режим ``--verify-config`` (07c): метрика конвенции из ``src/config.py`` на эталоне 07a.
 
     Никакого перебора: параметры берутся из конфига, поэтому код проверки — ровно тот
     путь, которым пойдёт рендер (08a). Ненулевая ошибка или чужие руки означают, что
     конфиг «расползся» относительно калибровки 07b, и это возвращает код 1.
+
+    ``bone_data`` (08e) добавляет вторую метрику — на костях: та же конвенция, те же
+    интринсики, но сравнение проекции отрезков скелета с разметкой 7–9 точек на руку.
+    Её вердикт справочный: код возврата по-прежнему определяет метрика рамок 07b, поэтому
+    поведение 5-точечного пути не меняется.
     """
     try:
         summary = camera_model.check_config()
@@ -1060,7 +1111,35 @@ def _verify_config(data: CalibData) -> int:
     criterion = metrics.mean_error_px <= MAX_MEAN_ERROR_PX and metrics.violations == 0
     print(f"  критерий 07b (≤ {MAX_MEAN_ERROR_PX:g} px и без чужих рук): "
           f"{'выполнен' if criterion else 'НЕ выполнен'}")
+    if bone_data is not None:
+        bone_metrics = evaluate_bone_convention(bone_data, convention)
+        print("  вторая метрика (08e, справочно):")
+        for line in bone_metrics.format_lines():
+            print(f"  {line}")
+        strict = evaluate_bone_convention(bone_data, convention, min_confidence="medium")
+        if strict.bones != bone_metrics.bones:
+            print("  строгая выборка (только точки medium/high — без угаданных фаланг k = 30):")
+            for line in strict.format_lines():
+                print(f"  {line}")
+        if table:
+            print()
+            print(calib_bones.format_table(bone_metrics))
     return 0 if criterion else 1
+
+
+def evaluate_bone_convention(
+    bone_data: calib_bones.BoneData,
+    convention: Convention,
+    min_confidence: str = "low",
+) -> calib_bones.BoneMetrics:
+    """Костная метрика (08e) для той же конвенции: общий путь проекции с ``evaluate``."""
+    projector = head_projector(
+        bone_data.intrinsics, convention.rotation, convention.camera_offset
+    )
+    return calib_bones.evaluate_bones(
+        bone_data, projector, invert_quat=convention.invert_quat,
+        min_confidence=min_confidence,
+    )
 
 
 def main(argv: Iterable[str] | None = None) -> int:
@@ -1092,6 +1171,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         "--verify-config", action="store_true",
         help="не искать, а проверить калибровку src/config.py на эталоне 07a (07c)",
     )
+    parser.add_argument(
+        "--bones-table", action="store_true",
+        help="в режиме --verify-config напечатать построчную таблицу костной метрики (08e)",
+    )
     parser.add_argument("--json", action="store_true", help="напечатать JSON победителя в stdout")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -1106,7 +1189,12 @@ def main(argv: Iterable[str] | None = None) -> int:
           f"допуск разметки ±{TOLERANCE_PX} px)")
 
     if args.verify_config:
-        return _verify_config(data)
+        try:
+            bone_data = calib_bones.load_bone_data(args.tracking, args.meta)
+        except (OSError, ValueError) as exc:
+            print(f"ошибка костной разметки: {exc}", file=sys.stderr)
+            return 1
+        return _verify_config(data, bone_data, table=args.bones_table)
     print("перебор: 24 собственные ротации осей × 2 конвенции кватерниона × "
           f"{len(offset_grid())} положений камеры")
     candidates = search_discrete(data)

@@ -3,8 +3,10 @@
 Задача 03a: читаем 258 МБ построчно, отдаём header и итератор сэмплов.
 Задача 03b: ``parse_pose()`` — строка "x,y,z,qx,qy,qz,qw" с десятичной запятой → 7 float
 (проверка |q| ≈ 1.0). Задача 03c: ``extract_sample()`` — плоская запись: 3+4 головы,
-по 5 точек на руку, невалидные точки → NaN. Задача 03d: ``write_tracking_csv()`` —
-output/tracking.csv + сводная статистика.
+точки рук, невалидные точки → NaN. Задача 03d: ``write_tracking_csv()`` —
+output/tracking.csv + сводная статистика. Задача 08d: в данные и CSV попадают все
+26 джойнтов OpenXR на руку (``HAND_JOINTS_FULL``), рендер по-прежнему использует
+5-точечный набор ``HAND_JOINTS``.
 
 Формат файла (21 788 строк = header + 21 787 сэмплов):
   * строка 1 — header: ``timeStampNs`` (int), ``cameraIntrinsics`` и ``cameraExtrinsics``
@@ -36,10 +38,58 @@ QUAT_NORM_TOL = 1e-6
 
 _WHOLE_TOKEN = re.compile(r"[+-]?\d+")
 
-#: Точки OpenXR, попадающие в плоскую запись: (имя, индекс в HandJointLocations).
+#: Все 26 джойнтов OpenXR на руку: (имя, индекс в ``HandJointLocations``).
+#:
+#: Индексы OpenXR: 0 palm, 1 wrist, 2–5 thumb, 6–10 index, 11–15 middle, 16–20 ring,
+#: 21–25 little. Кончик пальца сохраняет короткое имя (``thumb``/``index``/...),
+#: потому что эти имена уже используются рендером и калибровкой; промежуточные
+#: фаланги получают полные имена (``*_metacarpal/proximal/intermediate/distal``).
+HAND_JOINTS_FULL = (
+    ("palm", 0),
+    ("wrist", 1),
+    ("thumb_metacarpal", 2),
+    ("thumb_proximal", 3),
+    ("thumb_distal", 4),
+    ("thumb", 5),
+    ("index_metacarpal", 6),
+    ("index_proximal", 7),
+    ("index_intermediate", 8),
+    ("index_distal", 9),
+    ("index", 10),
+    ("middle_metacarpal", 11),
+    ("middle_proximal", 12),
+    ("middle_intermediate", 13),
+    ("middle_distal", 14),
+    ("middle", 15),
+    ("ring_metacarpal", 16),
+    ("ring_proximal", 17),
+    ("ring_intermediate", 18),
+    ("ring_distal", 19),
+    ("ring", 20),
+    ("little_metacarpal", 21),
+    ("little_proximal", 22),
+    ("little_intermediate", 23),
+    ("little_distal", 24),
+    ("little", 25),
+)
+
+#: Пять точек на руку для рендера и калибровки (03c→08a): подмножество полного набора.
+#: Имена и индексы совпадают с ``HAND_JOINTS_FULL``, поэтому старые колонки CSV и
+#: ``sync.POINT_KEYS`` не меняются при расширении данных до 26 джойнтов (08d).
 HAND_JOINTS = (("palm", 0), ("wrist", 1), ("thumb", 5), ("index", 10), ("middle", 15))
 
-#: Колонки tracking.csv: время, поза головы, по 5 точек на руку, флаги активности.
+#: Локти из ``Body.joints`` (задача 08h): 18 — левый, 19 — правый. В Hand локтя нет
+#: (26 джойнтов — запястье и пальцы), поэтому единственный источник локтя — Body.
+#: Запястья Body (20/21) в данные **не** добавляются: концом ребра служит точный
+#: ``Hand.wrist`` (Body.wrist — его же аппроксимация, см. ``docs/NOTES.md``, 08h).
+#: ``CSV_COLUMNS`` от этого не меняется: elbow живёт только в пути рендера, иначе
+#: поехали бы sha256-эталоны 08d/08g.
+BODY_ELBOW_JOINTS = (("left_elbow", 18), ("right_elbow", 19))
+
+#: Плоские ключи локтей: ``left_elbow``/``right_elbow`` (для ``sync.extra_keys``).
+ELBOW_KEYS = tuple(name for name, _ in BODY_ELBOW_JOINTS)
+
+#: Колонки tracking.csv: время, поза головы, по 26 джойнтов на руку, флаги активности.
 CSV_COLUMNS = (
     "t_ns",
     "t_rel_s",
@@ -53,12 +103,16 @@ CSV_COLUMNS = (
     *(
         f"{side}_{name}_{axis}"
         for side in ("left", "right")
-        for name, _ in HAND_JOINTS
+        for name, _ in HAND_JOINTS_FULL
         for axis in ("x", "y", "z")
     ),
     "left_active",
     "right_active",
 )
+
+#: Сколько строк пишем в CSV за один проход (08d: 167 колонок × 21 787 строк ≈ 44 МБ,
+#: держать все строки в памяти незачем).
+CSV_CHUNK_ROWS = 2000
 
 
 def _next_nonempty_line(fh) -> str:
@@ -240,12 +294,71 @@ def _joint_xyz(
     return (pose[0], pose[1], pose[2])
 
 
-def extract_sample(sample: dict, where: str | None = None) -> dict:
-    """Плоская запись сэмпла: поза головы (3+4) + по 5 точек на руку (x, y, z) + isActive.
+def _body_joint_xyz(
+    joints: list[dict], index: int, where: str | None
+) -> tuple[float, float, float]:
+    """Позиция сустава ``Body.joints[index]`` или NaN×3, если её нет/она невалидна (08h).
+
+    У суставов Body **нет** флагов валидности (в отличие от ``HandJointLocations.s``):
+    в файле каждый джойнт — ``{p, t, va, wva}``, где ``p`` — позиция и кватернион, ``t`` —
+    метка времени. Поэтому валидность определяется по данным: конечность трёх координат и
+    защита от «все нули» (нулевая позиция — признак незаполненного джойнта, а не позы).
+    """
+    if not 0 <= index < len(joints):
+        return (math.nan, math.nan, math.nan)
+    joint = joints[index]
+    if not isinstance(joint, dict) or "p" not in joint:
+        return (math.nan, math.nan, math.nan)
+    pose = parse_pose(joint["p"], where=where)
+    if len(pose) < 3:
+        return (math.nan, math.nan, math.nan)
+    x, y, z = pose[0], pose[1], pose[2]
+    if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+        return (math.nan, math.nan, math.nan)
+    if x == 0.0 and y == 0.0 and z == 0.0:
+        # «все нули» — незаполненный джойнт; рисовать ребро от мировой точки (0, 0, 0) нельзя
+        return (math.nan, math.nan, math.nan)
+    return (x, y, z)
+
+
+def extract_forearm(sample: dict, where: str | None = None) -> dict[str, float]:
+    """Локти из ``Body.joints[18/19]``: ``{left,right}_elbow_{x,y,z}`` (задача 08h).
+
+    Возвращает только 6 координат — без запястий Body (20/21) и без остальных 24 джойнтов.
+    Невалидный/отсутствующий локоть — ``NaN`` (те же правила, что у рук: не рисовать, а не
+    подставлять ноль). Валидность Body-джойнта считается по значениям
+    (:func:`_body_joint_xyz`): флагов ``s`` у Body нет.
+    """
+    body = sample.get("Body")
+    joints = body.get("joints") if isinstance(body, dict) else None
+    joints = joints if isinstance(joints, list) else []
+    record: dict[str, float] = {}
+    for name, index in BODY_ELBOW_JOINTS:
+        joint_where = f"{where}, Body.joints[{index}]" if where else f"Body.joints[{index}]"
+        x, y, z = _body_joint_xyz(joints, index, joint_where)
+        record[f"{name}_x"] = x
+        record[f"{name}_y"] = y
+        record[f"{name}_z"] = z
+    return record
+
+
+def extract_sample(
+    sample: dict, where: str | None = None, *, include_forearm: bool = False
+) -> dict:
+    """Плоская запись сэмпла: поза головы (3+4) + все 26 джойнтов на руку (x, y, z) + isActive.
 
     Невалидные точки (``isActive == 0`` у руки или ``s == 0`` у сустава) — NaN, а не нули:
     у неактивной правой руки ``p`` содержит «замороженную» позу с |q| ≈ 1, так что без
     проверки флагов скелет нарисовался бы где-то в стороне от руки.
+
+    Набор джойнтов — :data:`HAND_JOINTS_FULL` (26 на руку, индексы OpenXR 0…25); рендер
+    использует его 5-точечное подмножество :data:`HAND_JOINTS`, но колонки с теми же
+    именами в плоской записи совпадают.
+
+    ``include_forearm`` (08h) добавляет к записи 6 координат локтей из ``Body.joints[18/19]``
+    (:func:`extract_forearm`). По умолчанию **выключено**, поэтому ``tracking.csv`` (08d) и
+    его sha256 не меняются: локти нужны только пути рендера, а ``sync.load_poses`` включает
+    их, когда среди ``extra_keys`` есть :data:`ELBOW_KEYS`.
     """
     head = sample["Head"]
     head_where = f"{where}, Head.pose" if where else "Head.pose"
@@ -254,13 +367,15 @@ def extract_sample(sample: dict, where: str | None = None) -> dict:
     record: dict[str, float | int] = {"timeStampNs": int(sample["timeStampNs"])}
     for key, value in zip(("x", "y", "z", "qx", "qy", "qz", "qw"), pose):
         record[f"head_{key}"] = value
+    if include_forearm:
+        record.update(extract_forearm(sample, where=where))
 
     for side, hand_key in (("left", "leftHand"), ("right", "rightHand")):
         hand = sample["Hand"].get(hand_key, {})
         active = bool(hand.get("isActive"))
         joints = hand.get("HandJointLocations", [])
         record[f"{side}_active"] = 1 if active else 0
-        for name, index in HAND_JOINTS:
+        for name, index in HAND_JOINTS_FULL:
             joint_where = f"{where}, {side} {name}" if where else f"{side} {name}"
             x, y, z = _joint_xyz(joints, index, active, joint_where)
             record[f"{side}_{name}_x"] = x
@@ -302,6 +417,14 @@ def frame_stats(frame) -> dict:
 def write_tracking_csv(tracking_path: str | Path, out_path: str | Path, header: dict | None = None) -> dict:
     """Читает txt потоково, пишет tracking.csv (NaN → пустые поля) и возвращает статистику.
 
+    Строки пишутся порциями по :data:`CSV_CHUNK_ROWS`: после 08d в строке 167 колонок
+    (26 джойнтов × 2 руки), и держать все 21 787 строк-словарей в памяти незачем.
+    Выход собирается в ``<out>.part`` и подменяет целевой файл атомарно; недописанный
+    ``.part`` удаляется при ошибке.
+
+    ``frame_stats`` получает только три нужные колонки (время и флаги рук), а не весь
+    кадр, — сводка считается по полным данным, память остаётся ограниченной.
+
     pandas импортируется локально: read_header/parse_pose/extract_sample остаются
     без зависимости от него.
     """
@@ -309,12 +432,43 @@ def write_tracking_csv(tracking_path: str | Path, out_path: str | Path, header: 
 
     header = header or read_header(tracking_path)
     base_ts = header["timeStampNs"]
-    rows = [_csv_row(extract_sample(sample), base_ts) for sample in iter_samples(tracking_path)]
-
-    frame = pd.DataFrame(rows, columns=list(CSV_COLUMNS))
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(out_path, index=False)
+    part_path = out_path.with_name(f"{out_path.name}.part")
+
+    columns = list(CSV_COLUMNS)
+    timestamps: list[int] = []
+    left_active: list[int] = []
+    right_active: list[int] = []
+    chunk: list[dict] = []
+
+    def write_chunk(rows: list[dict], first: bool) -> None:
+        chunk_frame = pd.DataFrame(rows, columns=columns)
+        chunk_frame.to_csv(fh, index=False, header=first)
+
+    try:
+        with part_path.open("w", encoding="utf-8", newline="") as fh:
+            first_chunk = True
+            for sample in iter_samples(tracking_path):
+                record = extract_sample(sample)
+                timestamps.append(record["timeStampNs"])
+                left_active.append(record["left_active"])
+                right_active.append(record["right_active"])
+                chunk.append(_csv_row(record, base_ts))
+                if len(chunk) >= CSV_CHUNK_ROWS:
+                    write_chunk(chunk, first_chunk)
+                    first_chunk = False
+                    chunk.clear()
+            if chunk or first_chunk:
+                write_chunk(chunk, first_chunk)
+        part_path.replace(out_path)
+    except BaseException:
+        part_path.unlink(missing_ok=True)
+        raise
+
+    frame = pd.DataFrame(
+        {"t_ns": timestamps, "left_active": left_active, "right_active": right_active}
+    )
     return frame_stats(frame)
 
 
@@ -372,12 +526,14 @@ def main() -> None:
 
         record = extract_sample(first_sample, where="первый сэмпл")
         right_nan = sum(
-            math.isnan(record[f"right_{name}_{axis}"]) for name, _ in HAND_JOINTS for axis in "xyz"
+            math.isnan(record[f"right_{name}_{axis}"])
+            for name, _ in HAND_JOINTS_FULL
+            for axis in "xyz"
         )
         print(
             f"  извлечение: head=({record['head_x']:.3f}, {record['head_y']:.3f}, {record['head_z']:.3f}), "
             f"left_active={record['left_active']}, right_active={record['right_active']}, "
-            f"right NaN = {right_nan}/{3 * len(HAND_JOINTS)}"
+            f"right NaN = {right_nan}/{3 * len(HAND_JOINTS_FULL)}"
         )
 
 

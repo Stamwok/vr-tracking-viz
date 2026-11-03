@@ -22,6 +22,63 @@
   не перекрывает ни одной размеченной кисти (:func:`hud_rect`). Подписи латиницей, потому
   что ``cv2.putText`` с Hershey-шрифтами кириллицу не рисует.
 
+Задача 08f рисует **густой скелет** вместо 5 точек: список рёбер задан явно в коде
+(:data:`DENSE_BONES` для 17 суставов по умолчанию, :data:`FULL_BONES` — все 26 джойнтов
+OpenXR с пястными костями). Политика разрывов та же, что у 5-точечного варианта: кость
+рисуется, только если **оба** её конца видны; ``NaN`` («нет данных», правило 04b) и точка
+за камерой дают ``visible = False``, поэтому через дырку линия не проводится и не
+интерполируется. Пять опорных суставов берутся из :class:`sync.Pose` (как в 08a), остальные —
+через :meth:`sync.PoseTrack.joint_at` с той же интерполяцией и тем же моментом времени
+(:func:`src.calib_bones` использует этот путь с 08e). CLI: по умолчанию густой скелет,
+``--all-joints`` — все 26 суставов, ``--five-points`` — прежний 5-точечный кадр 08a
+(для сравнений «до/после»).
+
+Задача 08g кодирует **глубину цветом**: множитель к цвету руки зависит от ``z`` сустава
+в системе камеры (``p_cam.z``, а не от мировой координаты и не от min–max по кадру — окно
+абсолютное, :data:`DEPTH_NEAR_M`…:data:`DEPTH_FAR_M`, поэтому яркость не «дышит» и не
+мигает). Ближние кости и точки рисуются полным цветом, дальние — не темнее
+:data:`DEPTH_MIN_FACTOR`; оттенок руки и геометрия не меняются, калибровка и время кадра
+не трогаются. 5-точечный кадр 08a по умолчанию остаётся плоским, режим переключается
+``--depth-color``/``--no-depth-color``.
+
+Доработка 08g-fix2 добавляет **второй канал глубины — прозрачность** (``alpha``): ближняя
+кость/точка непрозрачна, дальняя полупрозрачна (:func:`depth_alpha`, пол
+:data:`DEPTH_MIN_ALPHA`), поэтому глубина читается не только по яркости, но и по тому, что
+сквозь дальнюю кость виден фон. Кость по-прежнему рисуется :data:`DEPTH_BONE_SEGMENTS`
+отрезками, и каждый отрезок получает свою alpha по средней глубине своих концов; у точки —
+alpha по её глубине, а чёрная обводка остаётся полностью непрозрачной (иначе точка исчезает
+на тёмном фоне). Так как ``cv2.line``/``cv2.circle`` не умеют alpha, отрезок и круг рисуются
+в маску размером со свой bbox (:func:`_blend_line`, :func:`_blend_point`) — тот же приём, что
+у следа 08b, иначе на кадр лёг бы полупрозрачный тёмный прямоугольник. В режиме alpha
+дальние кости и точки рисуются **до** ближних (сортировка по ``p_cam.z`` по убыванию), чтобы
+полупрозрачная дальняя кость не просвечивала поверх непрозрачной ближней. Флаги —
+``--depth-alpha``/``--no-depth-alpha`` (по умолчанию включено для густого скелета и
+``--all-joints``, выключено для 5-точечного 08a), ``--no-depth-color`` отключает и яркость,
+и alpha; ``--no-depth-alpha`` воспроизводит кадр 08g-fix (только яркость).
+
+Доработка 08g-fix3 делает шкалу глубины **относительной**: для каждой руки отдельно находится
+ближайший к камере видимый сустав (``z_ref``, :func:`depth_reference`) и глубина отсчитывается
+от него (:func:`relative_depth`), ``near = 0``, ``far = DEPTH_RELATIVE_FAR_M`` — это ширина
+окна, а не абсолютные метры. Поэтому ближняя кость руки **всегда** получает полный цвет, а
+дальняя приглушается по разбросу глубин внутри руки, а не по её абсолютному удалению от
+шлема. Абсолютная разница между руками в относительном режиме по яркости/alpha не читается
+(обе ближние кости — 1.0); она остаётся в абсолютном режиме и в порядке alpha-наложения. Окно и
+пол шкалы (0.30 у яркости, 0.45 у alpha) те же, что в 08g-fix/08g-fix2. ``z_ref`` считается по
+каждому кадру отдельно (сглаживания по времени нет — см. ``docs/NOTES.md``, 08g-fix3). Флаги
+``--depth-relative``/``--no-depth-relative``: ``--no-depth-relative`` — прежняя абсолютная
+шкала (кадр 08g-fix2 побайтово), ``--no-depth-alpha`` — абсолютная яркость 08g-fix.
+
+Доработка 08g-fix4 делает шкалу **нелинейной**: параметр вдоль окна
+``t = clamp((z − near)/(far − near), 0, 1)`` возводится в степень ``γ`` (:func:`gamma_parameter`),
+и множитель яркости/alpha считается от ``t' = t**γ``; градиент вдоль кости — по ``t'`` середины
+каждого отрезка. ``γ < 1`` сильнее приглушает середину окна, поэтому контраст ближняя/дальняя
+кость растёт; чтобы дальние суставы при этом не упирались в пол, само окно шире, чем в 08g-fix3 (``DEPTH_GAMMA_FAR_M = 0.18`` вместо 0.155 м): по замеру 14 507 пар
+«кадр × рука» разброс глубин внутри руки доходит до 0.167 м, и 72 сустава (0.019 %) упирались
+в пол; 0.18 покрывает максимум, поэтому суставов ровно в полу не остаётся. ``γ = 1.0`` —
+прежняя линейная шкала 08g-fix3 целиком (окно 0.155 м): ``--no-depth-gamma`` воспроизводит её
+побайтово, а явный ``--depth-gamma G`` задаёт степень (0 < γ ≤ 1, иначе ``ValueError``).
+Окно — часть нелинейного режима: при γ = 1.0 берётся 0.155 м, иначе 0.18 м.
+
 Поза головы = поза камеры (камера в голове, ``T_head_cam`` из ``config.py``), поэтому
 отдельного маркера головы в кадре нет — о ней говорит HUD (время и номер кадра).
 
@@ -68,10 +125,19 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src import camera_model, sync
-from src.parse_tracking import HAND_JOINTS, read_header, timestamp_range
+from src.parse_tracking import (
+    ELBOW_KEYS,
+    HAND_JOINTS,
+    HAND_JOINTS_FULL,
+    read_header,
+    timestamp_range,
+)
 
 #: Имена 5 суставов на руку в порядке отрисовки (те же, что в ``tracking.csv``).
 JOINTS = tuple(name for name, _ in HAND_JOINTS)
+
+#: Имена всех 26 джойнтов OpenXR на руку (порядок и индексы — ``parse_tracking.HAND_JOINTS_FULL``).
+FULL_JOINTS = tuple(name for name, _ in HAND_JOINTS_FULL)
 
 #: Кости скелета: ладонь → запястье и три «пальцевые» точки (ТЗ: 3–5 точек на руку).
 HAND_CHAINS = (
@@ -80,6 +146,471 @@ HAND_CHAINS = (
     ("palm", "index"),
     ("palm", "middle"),
 )
+
+# --- 08f: густой скелет ---------------------------------------------------------------
+
+#: Суставы густого скелета по умолчанию (17 на руку). Указательный и средний пальцы —
+#: целиком, большой — без пястной кости, безымянный и мизинец — проксимальная фаланга и
+#: кончик (иначе не уложиться в бюджет карточки «15–18 точек»). Пястные кости в кадре
+#: лежат внутри силуэта ладони, поэтому в наборе по умолчанию их нет; ``--all-joints``
+#: рисует все 26 суставов и полные цепочки.
+DENSE_JOINTS = (
+    "palm",
+    "wrist",
+    "thumb_proximal",
+    "thumb_distal",
+    "thumb",
+    "index_proximal",
+    "index_intermediate",
+    "index_distal",
+    "index",
+    "middle_proximal",
+    "middle_intermediate",
+    "middle_distal",
+    "middle",
+    "ring_proximal",
+    "ring",
+    "little_proximal",
+    "little",
+)
+
+#: Рёбра густого скелета — та же структура, что :data:`HAND_CHAINS`: (начало, конец).
+#: У безымянного и мизинца в наборе по умолчанию нет промежуточной и дистальной фаланг,
+#: поэтому ребро «проксимальная → кончик» — прямая через согнутый палец: это осознанное
+#: упрощение ради бюджета точек, а не точная кость (полные цепочки — :data:`FULL_BONES`).
+DENSE_BONES = (
+    ("palm", "wrist"),
+    ("palm", "thumb_proximal"),
+    ("thumb_proximal", "thumb_distal"),
+    ("thumb_distal", "thumb"),
+    ("palm", "index_proximal"),
+    ("index_proximal", "index_intermediate"),
+    ("index_intermediate", "index_distal"),
+    ("index_distal", "index"),
+    ("palm", "middle_proximal"),
+    ("middle_proximal", "middle_intermediate"),
+    ("middle_intermediate", "middle_distal"),
+    ("middle_distal", "middle"),
+    ("palm", "ring_proximal"),
+    ("ring_proximal", "ring"),
+    ("palm", "little_proximal"),
+    ("little_proximal", "little"),
+)
+
+#: Рёбра полного скелета 26 джойнтов OpenXR: запястье → ладонь, ладонь → пястная кость
+#: каждого пальца, дальше цепочка фаланг до кончика (у большого пальца нет промежуточной).
+FULL_BONES = (
+    ("palm", "wrist"),
+    ("palm", "thumb_metacarpal"),
+    ("thumb_metacarpal", "thumb_proximal"),
+    ("thumb_proximal", "thumb_distal"),
+    ("thumb_distal", "thumb"),
+    ("palm", "index_metacarpal"),
+    ("index_metacarpal", "index_proximal"),
+    ("index_proximal", "index_intermediate"),
+    ("index_intermediate", "index_distal"),
+    ("index_distal", "index"),
+    ("palm", "middle_metacarpal"),
+    ("middle_metacarpal", "middle_proximal"),
+    ("middle_proximal", "middle_intermediate"),
+    ("middle_intermediate", "middle_distal"),
+    ("middle_distal", "middle"),
+    ("palm", "ring_metacarpal"),
+    ("ring_metacarpal", "ring_proximal"),
+    ("ring_proximal", "ring_intermediate"),
+    ("ring_intermediate", "ring_distal"),
+    ("ring_distal", "ring"),
+    ("palm", "little_metacarpal"),
+    ("little_metacarpal", "little_proximal"),
+    ("little_proximal", "little_intermediate"),
+    ("little_intermediate", "little_distal"),
+    ("little_distal", "little"),
+)
+
+
+@dataclass(frozen=True)
+class Skeleton:
+    """Набор суставов и рёбер одной руки, который рисует :func:`draw_skeleton`.
+
+    Проверки в :meth:`__post_init__` — не формальность: список рёбер задан руками, и
+    опечатка в имени сустава иначе проявилась бы молчаливым ``KeyError`` на середине
+    рендера 7279 кадров. Ошибка здесь падает сразу при импорте модуля.
+    """
+
+    #: Короткое имя для CLI и статистики: ``five``, ``dense``, ``all``.
+    name: str
+    #: Человекочитаемое описание для логов: «густой (17 суставов)».
+    title: str
+    #: Имена суставов (без префикса руки) в порядке отрисовки точек.
+    joints: tuple[str, ...]
+    #: Рёбра ``(начало, конец)`` — тоже без префикса руки.
+    bones: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError(f"Skeleton.name: ожидалось непустое имя, получено {self.name!r}")
+        if not isinstance(self.title, str) or not self.title:
+            raise ValueError(f"Skeleton.title: ожидалось непустое описание, получено {self.title!r}")
+        if not self.joints:
+            raise ValueError(f"Skeleton {self.name!r}: пустой список суставов")
+        seen: set[str] = set()
+        for joint in self.joints:
+            if joint not in FULL_JOINTS:
+                raise ValueError(f"Skeleton {self.name!r}: неизвестный сустав {joint!r}")
+            if joint in seen:
+                raise ValueError(f"Skeleton {self.name!r}: сустав {joint!r} повторяется")
+            seen.add(joint)
+        used: set[frozenset[str]] = set()
+        for bone in self.bones:
+            if not isinstance(bone, tuple) or len(bone) != 2:
+                raise ValueError(f"Skeleton {self.name!r}: ребро {bone!r} — не пара суставов")
+            start, end = bone
+            for joint in (start, end):
+                if joint not in seen:
+                    raise ValueError(
+                        f"Skeleton {self.name!r}: ребро {start!r}→{end!r} ссылается на "
+                        f"сустав {joint!r}, которого нет в наборе"
+                    )
+            if start == end:
+                raise ValueError(f"Skeleton {self.name!r}: ребро {start!r}→{end!r} вырождено")
+            key = frozenset(bone)
+            if key in used:
+                raise ValueError(f"Skeleton {self.name!r}: ребро {start!r}→{end!r} повторяется")
+            used.add(key)
+
+    @property
+    def extra_keys(self) -> tuple[str, ...]:
+        """Ключи ``sync.PoseTrack.extra_keys`` для этого скелета (для обеих рук).
+
+        Пять опорных суставов уже лежат в :class:`sync.Pose`; остальные нужно догрузить
+        в трек: ``sync.load_poses(tracking, extra_keys=skeleton.extra_keys)`` (или
+        ``load_scene(..., extra_keys=...)``), иначе :meth:`sync.PoseTrack.joint_at`
+        не найдёт колонку.
+        """
+        names = tuple(joint for joint in self.joints if joint not in JOINTS)
+        return tuple(f"{side}_{joint}" for side in ("left", "right") for joint in names)
+
+
+#: Прежний 5-точечный скелет 08a (значения по умолчанию у функций рисования).
+FIVE_POINT = Skeleton("five", "5 точек", JOINTS, HAND_CHAINS)
+
+#: Густой скелет по умолчанию: 17 суставов на руку (задача 08f).
+DENSE = Skeleton("dense", "густой (17 суставов)", DENSE_JOINTS, DENSE_BONES)
+
+#: Полный скелет: все 26 джойнтов OpenXR на руку (``--all-joints``).
+ALL_JOINTS = Skeleton("all", "все 26 суставов", FULL_JOINTS, FULL_BONES)
+
+#: Все скелеты по имени (для CLI и тестов).
+SKELETONS: Mapping[str, Skeleton] = {
+    skeleton.name: skeleton for skeleton in (FIVE_POINT, DENSE, ALL_JOINTS)
+}
+
+#: Скелет, который рисует CLI без флагов (задача 08f).
+DEFAULT_SKELETON = DENSE
+
+#: Скелет, кадр которого должен воспроизводиться без новых эффектов (задача 08a).
+FLAT_SKELETON = FIVE_POINT
+
+
+# --- 08h: предплечье (elbow из Body → Hand.wrist) --------------------------------------
+
+#: Ключи локтей в ``sync.PoseTrack.extra_keys``: ``left_elbow``/``right_elbow``.
+#: Локти лежат в ``Body.joints[18/19]`` (в Hand локтя нет) и грузятся в трек тем же
+#: путём, что дополнительные суставы скелета 08f (``extra_keys`` + ``joint_at``).
+FOREARM_KEYS = ELBOW_KEYS
+
+#: Допустимая длина ребра ``elbow → wrist``, метры. Вне этого диапазона ребро не рисуется:
+#: локоть Body — IK-оценка, и «улетевший» локоть (длина предплечья 0.2…0.38 м вместо
+#: физических ~0.25 м) дал бы линию через пол-кадра. Замер по записи: 0.192…0.376 м,
+#: p50 0.230/0.303 м; окно 0.15…0.40 м с запасом покрывает валидные значения и отсекает
+#: выбросы. Константы — часть защиты, а не калибровки: они не меняют проекцию.
+FOREARM_MIN_LENGTH_M = 0.15
+FOREARM_MAX_LENGTH_M = 0.40
+
+#: Толщина ребра-оценки на кадре 1080×810, px (у костей кисти 2, с глубиной 3): ребро
+#: визуально тоньше и не спорит с измеренным скелетом. Отличается от костей кисти именно
+#: толщиной, **не цветом** (08h-fix): ребро рисуется ровно базовым цветом руки.
+FOREARM_LINE_THICKNESS_PX = 2
+
+#: Кандидаты в дополнительные рёбра, которые **сознательно не рисуются** (08h).
+#: ``shoulder → elbow`` (Body.joints[16/17] → [18/19]) выглядит осмысленно, но замер по
+#: всем 21 787 сэмплам даёт длину ровно 0.2290 м слева и 0.2307 м справа со std 0.0000 м
+#: во всех кадрах: это зашитая константа скелета Body, а не измерение позы. Рисовать её
+#: значило бы выдавать константу за данные, поэтому список пуст, а плечо остаётся
+#: невидимым. Если появится валидное измеренное ребро, его место — здесь.
+OPTIONAL_BONES: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class Forearm:
+    """Ребро «локоть → запястье» одной руки на кадре (задача 08h).
+
+    ``elbow``/``wrist`` — пиксели глаза (``ProjectedPoint``: видимость уже посчитана),
+    ``length`` — длина ребра **в мире** (метры). Глубины здесь нет намеренно: ребро —
+    IK-оценка, и красить его глубиной значило бы выдать оценку за измерение; в кадре оно
+    всегда плоское — ровно базовым цветом руки (08h-fix), без множителя, alpha и градиента.
+    Концом ребра служит точный
+    ``Hand.wrist``, а не ``Body.wrist``: Body-запястье лишь аппроксимирует его (медиана
+    0.9/7.2 мм, max 16/60 мм), и подмена внесла бы второй источник координат.
+    """
+
+    side: str
+    elbow: camera_model.ProjectedPoint
+    wrist: camera_model.ProjectedPoint
+    length: float
+
+    @property
+    def out_of_range(self) -> bool:
+        """Локоть «улетел»: конечная длина ребра вне 0.15…0.40 м (``NaN`` — не выброс)."""
+        if not math.isfinite(self.length):
+            return False
+        return not (FOREARM_MIN_LENGTH_M <= self.length <= FOREARM_MAX_LENGTH_M)
+
+    @property
+    def drawable(self) -> bool:
+        """Ребро можно рисовать: оба конца видимы и длина в допустимом диапазоне."""
+        return (
+            self.elbow.visible
+            and self.wrist.visible
+            and math.isfinite(self.length)
+            and not self.out_of_range
+        )
+
+    @property
+    def status(self) -> str:
+        """Короткий маркер для HUD: ``IK`` (нарисовано) или ``n/a`` (пропущено)."""
+        return "IK" if self.drawable else "n/a"
+
+
+def forearm_length(
+    elbow: Sequence[float], wrist: Sequence[float]
+) -> float:
+    """Длина ребра ``elbow → wrist`` в метрах; ``NaN``, если координаты не конечны (08h).
+
+    Считается в мировых координатах (те же единицы — метры), поэтому порог 0.15…0.40 м
+    не зависит от проекции и от калибровки. Валидация не бросает исключение: у неактивной
+    руки координаты — ``NaN``, и это штатное «нет данных», а не ошибка формата.
+    """
+    if len(elbow) != 3 or len(wrist) != 3:
+        raise ValueError(f"forearm_length: ожидались 3+3 координаты, получено {elbow!r}, {wrist!r}")
+    values = (*elbow, *wrist)
+    if not all(math.isfinite(float(value)) for value in values):
+        return math.nan
+    dx = float(elbow[0]) - float(wrist[0])
+    dy = float(elbow[1]) - float(wrist[1])
+    dz = float(elbow[2]) - float(wrist[2])
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
+
+
+def _require_forearm_track(track: sync.PoseTrack | None) -> None:
+    """Проверить, что в треке есть локти (08h): ошибка до первого кадра, а не в середине."""
+    if track is None:
+        raise ValueError("предплечье: нужны локти Body — передайте track с extra_keys")
+    missing = [key for key in FOREARM_KEYS if key not in track.extra_keys]
+    if missing:
+        raise ValueError(
+            f"предплечье: в треке нет {missing!r}; загрузите сцену с "
+            "load_scene(..., extra_keys=... + FOREARM_KEYS)"
+        )
+
+
+def project_forearms(
+    pose: sync.Pose,
+    intrinsics: camera_model.Intrinsics,
+    track: sync.PoseTrack | None,
+    side: str = "left",
+) -> dict[str, Forearm]:
+    """Пиксели рёбер ``elbow → Hand.wrist`` обеих рук на кадре (08h).
+
+    Локоть берётся через ``track.joint_at(pose.ts_ns, f"{hand}_elbow")`` — та же линейная
+    интерполяция и тот же момент времени, что у дополнительных суставов скелета 08f;
+    запястье — из :class:`sync.Pose` (точный ``Hand.wrist``). Матрица ``мир → камера``
+    считается один раз на кадр, калибровка не меняется. Точка за камерой/``NaN`` даёт
+    ``visible = False``, длина вне 0.15…0.40 м — ``drawable = False``: оба случая рвут
+    ребро, но не роняют кадр.
+    """
+    _require_forearm_track(track)
+    if not isinstance(pose, sync.Pose):
+        raise ValueError(f"pose: ожидался sync.Pose, получено {type(pose).__name__}")
+    matrix = camera_model.world_to_camera_matrix(pose)
+    eye = camera_model.eye_intrinsics(intrinsics, side)
+    result: dict[str, Forearm] = {}
+    for hand in ("left", "right"):
+        elbow_world = track.joint_at(pose.ts_ns, f"{hand}_elbow")  # type: ignore[union-attr]
+        wrist_world = pose.hands[f"{hand}_wrist"]
+        length = forearm_length(elbow_world, wrist_world)
+        if not (all(math.isfinite(value) for value in elbow_world) and all(
+            math.isfinite(value) for value in wrist_world
+        )):
+            result[hand] = Forearm(
+                side=hand,
+                elbow=camera_model.ProjectedPoint(math.nan, math.nan, False),
+                wrist=camera_model.ProjectedPoint(math.nan, math.nan, False),
+                length=length,
+            )
+            continue
+        elbow_cam = camera_model.transform_point(matrix, elbow_world)
+        wrist_cam = camera_model.transform_point(matrix, wrist_world)
+        result[hand] = Forearm(
+            side=hand,
+            elbow=camera_model.project(elbow_cam, eye),
+            wrist=camera_model.project(wrist_cam, eye),
+            length=length,
+        )
+    return result
+
+
+def forearm_style(style: Style) -> Style:
+    """Стиль ребра-оценки: та же точка, толщина :data:`FOREARM_LINE_THICKNESS_PX` (08h).
+
+    Толщина масштабируется вместе с кадром и ``--scale`` так же, как у костей: отношение
+    к базовой :data:`LINE_THICKNESS_PX` сохраняется, но ребро остаётся тоньше измеренных
+    костей кисти (в режиме глубины у них :data:`DEPTH_LINE_THICKNESS_PX`).
+    """
+    if not isinstance(style, Style):
+        raise ValueError(f"style: ожидался Style, получено {style!r}")
+    factor = FOREARM_LINE_THICKNESS_PX / LINE_THICKNESS_PX
+    return Style(
+        point_radius=style.point_radius,
+        line_thickness=max(1, int(round(style.line_thickness * factor))),
+    )
+
+
+def draw_forearms(
+    image: Any,
+    forearms: Mapping[str, Forearm],
+    style: Style,
+    *,
+    colors: Mapping[str, tuple[int, int, int]] | None = None,
+) -> tuple[int, int, int]:
+    """Нарисовать рёбра-оценки (in place) и вернуть счётчики ``(drawn, skipped, out_of_range)``.
+
+    Ребро **плоское**: глубина, alpha и градиент к нему не применяются, потому что локоть
+    Body — IK-оценка, а не измерение; красить оценку глубиной значило бы выдать её за факт.
+    Цвет — **ровно базовый цвет руки** из :data:`COLORS` (08h-fix: без множителя, без
+    :func:`shade_color`, без alpha и без зависимости от ``--depth-color``/
+    ``--depth-relative``/``--depth-gamma``), толщина — :data:`FOREARM_LINE_THICKNESS_PX`.
+    Ребро рисуется **до** скелета кисти, поэтому всегда лежит под измеренными точками и
+    костями и не участвует в сортировке по глубине (она есть только у кисти). Точка за
+    камерой/``NaN`` или длина вне 0.15…0.40 м — ребро пропускается и попадает в счётчик;
+    ``out_of_range`` — отдельный счётчик именно «улетевшего» локтя.
+    """
+    if not isinstance(style, Style):
+        raise ValueError(f"style: ожидался Style, получено {style!r}")
+    if image is None or getattr(image, "ndim", 0) != 3:
+        raise ValueError("image: ожидался BGR-кадр (H×W×3)")
+    for side in ("left", "right"):
+        if side not in forearms:
+            raise ValueError(f"forearms: нет руки {side!r}")
+    palette = COLORS if colors is None else colors
+    draw_style = forearm_style(style)
+    drawn = skipped = out_of_range = 0
+    for side in ("left", "right"):
+        forearm = forearms[side]
+        if not isinstance(forearm, Forearm):
+            raise ValueError(f"forearms[{side!r}]: ожидался Forearm, получено {forearm!r}")
+        if not forearm.drawable:
+            skipped += 1
+            if forearm.out_of_range:
+                out_of_range += 1
+            continue
+        _paint_bone(image, forearm.elbow, forearm.wrist, tuple(palette[side]), draw_style)
+        drawn += 1
+    return drawn, skipped, out_of_range
+
+
+def resolve_depth_shading(value: bool | None, skeleton: Skeleton) -> bool:
+    """Включено ли кодирование глубины цветом (08g) для выбранного скелета.
+
+    ``None`` — авторежим: включено для любого скелета, кроме прежнего 5-точечного
+    (:data:`FLAT_SKELETON`). Так густой скелет по умолчанию получает подсказку глубины, а
+    кадр 08a (``--five-points``) остаётся прежним. Явные ``True``/``False`` (CLI
+    ``--depth-color``/``--no-depth-color``) перекрывают авторежим. Сравнение по имени, а не
+    по идентичности объекта: набор ``Skeleton("five", …)``, собранный заново, — тот же кадр.
+    """
+    if not isinstance(skeleton, Skeleton):
+        raise ValueError(f"skeleton: ожидался Skeleton, получено {skeleton!r}")
+    if value is None:
+        return skeleton.name != FLAT_SKELETON.name
+    if not isinstance(value, bool):
+        raise ValueError(f"depth_shading: ожидалось bool или None, получено {value!r}")
+    return value
+
+
+def resolve_depth_alpha(value: bool | None, skeleton: Skeleton) -> bool:
+    """Включена ли прозрачность по глубине (08g-fix2) для выбранного скелета.
+
+    Правило авторежима то же, что у яркости (:func:`resolve_depth_shading`): ``None`` —
+    включено для любого скелета, кроме прежнего 5-точечного (:data:`FLAT_SKELETON`); явные
+    ``True``/``False`` (CLI ``--depth-alpha``/``--no-depth-alpha``) перекрывают авторежим.
+    Сравнение по имени набора — см. :func:`resolve_depth_shading`.
+
+    Отдельная функция, а не флаг внутри :func:`resolve_depth_shading`: яркость и alpha —
+    независимые каналы, и их можно включать порознь (сравнение «только яркость» / «только
+    alpha» / «оба» — это проверка доработки). ``--no-depth-color`` отключает оба канала сразу,
+    поэтому при выключенной яркости alpha не включается (:func:`render_video`).
+    """
+    if not isinstance(skeleton, Skeleton):
+        raise ValueError(f"skeleton: ожидался Skeleton, получено {skeleton!r}")
+    if value is None:
+        return skeleton.name != FLAT_SKELETON.name
+    if not isinstance(value, bool):
+        raise ValueError(f"depth_alpha: ожидалось bool или None, получено {value!r}")
+    return value
+
+
+def resolve_depth_relative(value: bool | None, skeleton: Skeleton) -> bool:
+    """Относительная ли шкала глубины (08g-fix3) для выбранного скелета.
+
+    Правило авторежима то же, что у яркости и alpha (:func:`resolve_depth_shading`):
+    ``None`` — включено для любого скелета, кроме прежнего 5-точечного
+    (:data:`FLAT_SKELETON`); явные ``True``/``False`` (CLI ``--depth-relative``/
+    ``--no-depth-relative``) перекрывают авторежим. Сравнение по имени набора — см.
+    :func:`resolve_depth_shading`.
+
+    Взаимодействие с alpha задаёт CLI: ``--no-depth-alpha`` без явного ``--depth-relative``
+    выключает ещё и относительность, чтобы один флаг воспроизводил абсолютную яркость
+    08g-fix (см. :func:`main`). Сама функция об этом не знает — она только про шкалу.
+    """
+    if not isinstance(skeleton, Skeleton):
+        raise ValueError(f"skeleton: ожидался Skeleton, получено {skeleton!r}")
+    if value is None:
+        return skeleton.name != FLAT_SKELETON.name
+    if not isinstance(value, bool):
+        raise ValueError(f"depth_relative: ожидалось bool или None, получено {value!r}")
+    return value
+
+
+def resolve_depth_gamma(value: float | None, skeleton: Skeleton) -> float:
+    """Степень нелинейной шкалы глубины (08g-fix4) для выбранного скелета.
+
+    ``None`` — авторежим, как у остальных каналов глубины: для густого скелета и
+    ``--all-joints`` — :data:`DEPTH_GAMMA` (0.7), для 5-точечного :data:`FLAT_SKELETON` — 1.0
+    (плоский кадр 08a не трогаем). Явное значение из CLI (``--depth-gamma``) перекрывает
+    авторежим; ``--no-depth-gamma`` передаёт 1.0 — линейную шкалу 08g-fix3. Значение
+    проверяется :func:`_check_gamma` (0 < γ ≤ :data:`DEPTH_GAMMA_MAX`).
+    """
+    if not isinstance(skeleton, Skeleton):
+        raise ValueError(f"skeleton: ожидался Skeleton, получено {skeleton!r}")
+    if value is None:
+        return 1.0 if skeleton.name == FLAT_SKELETON.name else float(DEPTH_GAMMA)
+    _check_gamma(value)
+    return float(value)
+
+
+def relative_depth_window(gamma: float) -> tuple[float, float]:
+    """Окно относительной шкалы ``(near, far)`` для степени ``gamma`` (08g-fix4).
+
+    ``γ = 1.0`` — ровно окно 08g-fix3 (:data:`DEPTH_RELATIVE_NEAR_M`…
+    :data:`DEPTH_RELATIVE_FAR_M`, 0.155 м): только так ``--no-depth-gamma`` воспроизводит
+    прежний кадр побайтово. При ``γ < 1`` работает нелинейный режим с окном шире
+    (:data:`DEPTH_GAMMA_FAR_M`, 0.18 м), покрывающим максимальный разброс внутри руки (0.167 м).
+    Окно — часть нелинейного режима, а не отдельный флаг: CLI задаёт только степень.
+    """
+    _check_gamma(gamma)
+    far = DEPTH_RELATIVE_FAR_M if gamma == 1.0 else DEPTH_GAMMA_FAR_M
+    return (DEPTH_RELATIVE_NEAR_M, far)
+
 
 #: Ширина кадра глаза, к которой отнесены радиус и толщина по умолчанию.
 REFERENCE_WIDTH = 1080
@@ -139,6 +670,82 @@ HUD_ALPHA = 0.6
 HUD_TEXT_COLOR = (238, 238, 238)
 #: Цвет предупреждения «нет данных» (BGR: оранжево-жёлтый, заметен на панели и на видео).
 HUD_WARNING_COLOR = (0, 200, 255)
+
+
+# --- 08g: глубина → интенсивность цвета -------------------------------------------------
+
+#: Абсолютное окно глубины (``z`` в системе камеры), м: у ближней границы цвет полный, у
+#: дальней и за ней — приглушённый (не темнее :data:`DEPTH_MIN_FACTOR`). Именно абсолютные
+#: метры, а не min–max по кадру: иначе множитель пересчитывался бы каждый кадр и на паузе
+#: скелет мигал бы. Дооборудовано в доработке 08g: окно сужено с 0.22…0.58 до 0.22…0.48 м,
+#: а нижняя граница множителя опущена с 0.45 до 0.30 — иначе разброс внутри одной кисти
+#: (p50 0.10 м по суставам) давал контраст ≈1.2× и был неразличим. Замер: 14 507 пар
+#: «кадр × рука», 246 619 видимых суставов; z суставов 0.072…0.640, z средних по костям
+#: 0.224…0.556; кости за 0.48 м упираются в пол 0.30 (около 25 % пар) — дальняя рука тёмная,
+#: но остаётся различимой. Типичные кадры дают контраст ближняя/дальняя кость одной руки
+#: ≥ 1.6× примерно в половине случаев (p50 1.61 по суставам), на крайних кадрах (k = 4285,
+#: рука на вытяжку за 0.5 м) дальняя кисть упирается в пол — там глубина читается как
+#: «вся рука дальше», а не как тонкая градация внутри неё.
+DEPTH_NEAR_M = 0.22
+DEPTH_FAR_M = 0.48
+
+#: Нижняя граница множителя: дальняя кость приглушается, но не исчезает — на тёмном фоне
+#: (корзина, тени) линия остаётся различимой. Верхняя граница — 1.0 (полный цвет руки).
+DEPTH_MIN_FACTOR = 0.30
+
+#: Нижняя граница прозрачности в режиме глубины (доработка 08g-fix2), alpha: ближняя кость
+#: или точка полностью непрозрачна (1.0), дальняя — не прозрачнее 0.45. Это второй канал,
+#: независимый от яркости: сквозь дальнюю кость виден фон, поэтому глубина читается и на
+#: пёстром фоне, где приглушение насыщенного цвета руки само по себе почти незаметно
+#: (наблюдение пользователя по 08g-fix). Окно по умолчанию — то же :data:`DEPTH_NEAR_M`…
+#: :data:`DEPTH_FAR_M`: одна шкала для обоих каналов проще для интерпретации.
+DEPTH_MIN_ALPHA = 0.45
+
+#: Окно **относительной** шкалы глубины 08g-fix3 (доработка 08g-fix4), м: глубина
+#: отсчитывается от ближайшего к камере видимого сустава своей руки (``z_ref``,
+#: :func:`depth_reference`), т.е. ``near = DEPTH_RELATIVE_NEAR_M = 0`` — это сама ближайшая
+#: кость руки (полный цвет), а ``far`` задаёт **ширину** окна в метрах, а не абсолютное
+#: расстояние от шлема. Ширина подобрана по замеру разброса ``max(z) − min(z)`` по видимым
+#: суставам одной руки на всех 7279 кадрах (14 507 пар «кадр × рука», 26 суставов):
+#: p50 0.103 м, p90 0.129, p99 0.148, max 0.167. ``0.155`` — окно 08g-fix3: p50 даёт контраст
+#: 1.87×, p99 (0.148) внутри, самый малый разброс активной кисти 07a (0.100 м, k = 7200) —
+#: 1.83×. В 08g-fix4 это окно остаётся **только для линейного режима** (``γ = 1.0``), чтобы
+#: ``--no-depth-gamma`` воспроизводил 08g-fix3 побайтово; нелинейный режим использует
+#: :data:`DEPTH_GAMMA_FAR_M`. Полы — :data:`DEPTH_MIN_FACTOR`/:data:`DEPTH_MIN_ALPHA`.
+DEPTH_RELATIVE_NEAR_M = 0.0
+DEPTH_RELATIVE_FAR_M = 0.155
+
+#: Окно относительной шкалы в **нелинейном** режиме 08g-fix4 (``γ < 1``), м. Замер по всем
+#: 14 507 парам «кадр × рука»: разброс глубин внутри руки p50 0.103 / p90 0.129 / p99 0.148 /
+#: max 0.167; за окном 0.155 упирались в пол 72 сустава из 377 182 (0.019 %, 54 пары).
+#: ``0.18`` покрывает максимум с запасом 13 мм, поэтому суставов ровно в полу не остаётся
+#: вовсе; 0.20 покрывает то же, но снижает типичный контраст (γ = 0.6: p50 1.89 против 2.00).
+#: Ширина подобрана по сетке γ × окно — см. ``docs/NOTES.md``, 08g-fix4.
+DEPTH_GAMMA_FAR_M = 0.18
+
+#: Степень нелинейной шкалы по умолчанию (08g-fix4): ``t' = t**γ``. ``1.0`` — прежняя линейная
+#: шкала (в :func:`depth_factor`/:func:`depth_alpha` это значение по умолчанию и побайтовое
+#: совпадение с 08g-fix3), ``0.7`` — выбранное по замеру значение: при окне 0.18 типичный
+#: контраст ближняя/дальняя кость p50 **1.90×** (в 08g-fix3 1.87×), минимум на 5 кадрах 07a и
+#: k = 4285 **1.87×**. Это максимальная γ из сетки, проходящая оба порога (p50 ≥ 1.7 и
+#: предельные ≥ 1.8): γ = 0.8 даёт 1.81/1.78 и порог нарушает, а 0.5–0.6 дают больше контраста
+#: ценой более сильного сжатия градации дальних суставов — ровно того, что задача чинит.
+DEPTH_GAMMA = 0.7
+
+#: Верхняя граница степени: ``γ > 1`` не нужна — она повышает множитель в середине окна и
+#: усиливает слияние дальних суставов в полу. Проверка — :func:`_check_gamma`.
+DEPTH_GAMMA_MAX = 1.0
+
+#: Сколько отрезков рисуется на одну кость в режиме глубины (градиент вдоль кости, 08g).
+#: 5 — компромисс: градиент читается на линии толщиной 3 px, но не рвёт её на «рябь»;
+#: цвет отрезка берётся по множителю в его середине. При ``depths=None`` кость, как раньше,
+#: рисуется одной линией.
+DEPTH_BONE_SEGMENTS = 5
+
+#: Толщина кости в режиме глубины на кадре 1080×810, px (доработка 08g). Толще обычных
+#: :data:`LINE_THICKNESS_PX`, потому что градиент на линии 2 px почти не читается; только
+#: для густого скелета/всех 26 джойнтов — 5-точечный кадр 08a не трогается.
+DEPTH_LINE_THICKNESS_PX = 3
 
 
 @dataclass(frozen=True)
@@ -267,6 +874,7 @@ def load_scene(
     tracking_path: str | Path | None = None,
     *,
     data_dir: str | Path = "data",
+    extra_keys: Sequence[str] = (),
 ) -> Scene:
     """Прочитать метаданные видео и трекинг, проверить согласованность.
 
@@ -274,7 +882,13 @@ def load_scene(
     молча выбрать один из нескольких файлов значило бы отрендерить не ту запись).
     Размер кадра из ``video_meta.json`` передаётся в :meth:`Intrinsics.from_header`, поэтому
     расхождение интринсиков с видео (не тот файл, другая раскладка) падает сразу.
+
+    ``extra_keys`` (08f) — дополнительные суставы густого скелета
+    (``skeleton.extra_keys``, ``None`` не принимается): без них рисуется только 5-точечный
+    скелет, а густой упадёт с понятной ошибкой до первого кадра, а не на середине рендера.
     """
+    if extra_keys is None:
+        raise ValueError("extra_keys: ожидался список ключей, получено None")
     meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
     if not isinstance(meta, dict):
         raise ValueError(f"{meta_path}: ожидался JSON-объект video_meta")
@@ -300,7 +914,7 @@ def load_scene(
         meta=meta,
         header_ns=int(header["timeStampNs"]),
         tracking_end_ns=int(timestamp_range(tracking)[1]),
-        track=sync.load_poses(tracking),
+        track=sync.load_poses(tracking, extra_keys=extra_keys),
         intrinsics=intrinsics,
         time_offset_ns=sync.video_time_offset_ns(),
     )
@@ -346,11 +960,751 @@ def project_hands(
     return result
 
 
+def _require_skeleton_track(track: sync.PoseTrack | None, skeleton: Skeleton) -> None:
+    """Проверить, что в треке есть дополнительные суставы скелета (08f).
+
+    Ошибка до первого кадра: иначе :meth:`sync.PoseTrack.joint_at` упал бы на середине
+    рендера 7279 кадров, уже записав часть файла.
+    """
+    if not isinstance(skeleton, Skeleton):
+        raise ValueError(f"skeleton: ожидался Skeleton, получено {skeleton!r}")
+    extra = skeleton.extra_keys
+    if not extra:
+        return
+    if track is None:
+        raise ValueError(
+            f"скелет {skeleton.name!r}: нужны дополнительные суставы {extra[:3]}… — "
+            "передайте track с extra_keys"
+        )
+    missing = [key for key in extra if key not in track.extra_keys]
+    if missing:
+        raise ValueError(
+            f"скелет {skeleton.name!r}: в треке нет {len(missing)} ключей (например "
+            f"{missing[0]!r}); загрузите сцену с load_scene(..., "
+            f"extra_keys=SKELETONS[{skeleton.name!r}].extra_keys)"
+        )
+
+
+def _skeleton_world_points(
+    pose: sync.Pose, skeleton: Skeleton, track: sync.PoseTrack | None
+) -> dict[str, dict[str, tuple[float, float, float]]]:
+    """Мировые координаты суставов скелета кадра: ``side → joint → (x, y, z)``.
+
+    Пять опорных суставов лежат в :class:`sync.Pose` (интерполяция 04b/04c), остальные
+    берутся из ``track.joint_at(pose.ts_ns, key)`` — та же интерполяция и тот же момент
+    времени. Вынесено из :func:`project_skeleton`, чтобы глубина (08g) считалась по тем же
+    самым точкам, что и пиксели, — иначе два прохода могли бы разойтись.
+    """
+    _require_skeleton_track(track, skeleton)
+    result: dict[str, dict[str, tuple[float, float, float]]] = {}
+    for hand in ("left", "right"):
+        joints: dict[str, tuple[float, float, float]] = {}
+        for joint in skeleton.joints:
+            key = f"{hand}_{joint}"
+            if key in pose.hands:
+                world = pose.hands[key]
+            else:
+                world = track.joint_at(pose.ts_ns, key)  # type: ignore[union-attr]
+            joints[joint] = (world[0], world[1], world[2])
+        result[hand] = joints
+    return result
+
+
+def project_skeleton_depth(
+    pose: sync.Pose,
+    intrinsics: camera_model.Intrinsics,
+    skeleton: Skeleton = DENSE,
+    *,
+    track: sync.PoseTrack | None = None,
+    side: str = "left",
+) -> tuple[
+    dict[str, dict[str, camera_model.ProjectedPoint]],
+    dict[str, dict[str, float]],
+]:
+    """Пиксели скелета кадра **и** глубина каждого сустава в системе камеры (08g).
+
+    Возвращает ``(pixels, depths)``: ``pixels`` — ровно то же, что у
+    :func:`project_skeleton` (``side → joint → ProjectedPoint``), ``depths`` —
+    ``side → joint → z`` точки камеры в метрах: ``z`` вперёд по взгляду, из той же матрицы
+    ``мир → камера``, что даёт пиксели. Глубина не кладётся в :class:`ProjectedPoint`
+    намеренно: у него контракт «пиксель + видимость» (тест 05c), а рендеру 08a глубина не
+    нужна. ``NaN`` вместо глубины — «нет данных» у сустава (как ``visible = False`` у
+    пикселя): у неактивной руки и невалидных джойнтов ``NaN`` в данных, у точки за камерой
+    ``z`` бывает конечным, но она невидима и не рисуется.
+
+    Калибровка и :func:`camera_model.project` не меняются: глубина — просто ``z`` уже
+    посчитанной точки камеры, а не второй источник проекции.
+    """
+    world = _skeleton_world_points(pose, skeleton, track)
+    eye = camera_model.eye_intrinsics(intrinsics, side)
+    matrix = camera_model.world_to_camera_matrix(pose)
+    pixels: dict[str, dict[str, camera_model.ProjectedPoint]] = {}
+    depths: dict[str, dict[str, float]] = {}
+    for hand, joints in world.items():
+        hand_pixels: dict[str, camera_model.ProjectedPoint] = {}
+        hand_depths: dict[str, float] = {}
+        for joint, point in joints.items():
+            if not all(math.isfinite(value) for value in point):
+                hand_pixels[joint] = camera_model.ProjectedPoint(math.nan, math.nan, False)
+                hand_depths[joint] = math.nan
+                continue
+            p_cam = camera_model.transform_point(matrix, point)
+            hand_pixels[joint] = camera_model.project(p_cam, eye)
+            hand_depths[joint] = p_cam[2]
+        pixels[hand] = hand_pixels
+        depths[hand] = hand_depths
+    return pixels, depths
+
+
+def project_skeleton(
+    pose: sync.Pose,
+    intrinsics: camera_model.Intrinsics,
+    skeleton: Skeleton = DENSE,
+    *,
+    track: sync.PoseTrack | None = None,
+    side: str = "left",
+) -> dict[str, dict[str, camera_model.ProjectedPoint]]:
+    """Пиксели выбранного скелета на кадре: ``side → joint → ProjectedPoint`` (08f).
+
+    Пять опорных суставов берутся из позы (:class:`sync.Pose`, интерполяция 04b/04c),
+    остальные — ``track.joint_at(pose.ts_ns, key)``: та же интерполяция, тот же момент
+    времени (этим же путём пользуется метрика 08e). Матрица ``мир → камера`` считается
+    один раз на кадр. ``NaN`` («нет данных») и точка за камерой дают ``visible = False`` —
+    :func:`draw_skeleton` не рисует такую точку и не проводит кости к ней.
+
+    Глубины не возвращает (это :func:`project_skeleton_depth`): путь 08f и его числа
+    остаются ровно прежними.
+    """
+    pixels, _depths = project_skeleton_depth(
+        pose, intrinsics, skeleton, track=track, side=side
+    )
+    return pixels
+
+
 def _coord(value: float) -> int:
     """Координата для cv2: целое, ограниченное :data:`COORD_LIMIT` (защита от int32)."""
     if not math.isfinite(value):
         raise ValueError(f"координата: нефинитное значение {value!r}")
     return max(-COORD_LIMIT, min(COORD_LIMIT, int(round(value))))
+
+
+def depth_reference(points_depths: Iterable[float]) -> float | None:
+    """Ближайшая к камере глубина среди точек: ``min`` по конечным положительным ``z`` (08g-fix3).
+
+    Это опорная точка ``z_ref`` относительной шкалы: берётся по **видимым** суставам одной
+    руки на одном кадре (у невидимых глубина ``NaN`` или ``z ≤ 0``). Возвращает ``None``,
+    если точек нет или ни одна не годится: тогда рука не рисуется, и опорная точка не нужна.
+    ``NaN``/``±inf`` и ``z ≤ 0`` игнорируются, а не портят минимум; ноль — не «ближайшая
+    точка», а «нет данных» у проекции (:data:`camera_model.MIN_DEPTH_M`).
+
+    Функция чистая: только вход и результат, без обращения к кадру и без состояния между
+    кадрами (поэтому ``z_ref`` руки плавно следует за рукой, а не скачет от min–max по кадру).
+    """
+    best: float | None = None
+    for value in points_depths:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"points_depths: ожидалось число, получено {value!r}")
+        candidate = float(value)
+        if not math.isfinite(candidate) or candidate <= 0.0:
+            continue
+        if best is None or candidate < best:
+            best = candidate
+    return best
+
+
+def relative_depth(depth: float, z_ref: float) -> float:
+    """Глубина относительно опорной точки руки: ``depth − z_ref`` (08g-fix3).
+
+    При ``z_ref = 0`` это ровно прежняя абсолютная глубина, поэтому относительный режим
+    «выключается» нулевой опорной точкой, а не отдельной ветвью формулы. Знак и форма шкалы
+    не меняются: ближе к камере — меньше, дальше — больше; нефинитные значения проходят как
+    есть (``NaN``), их отсекает :func:`depth_factor`/:func:`depth_alpha`.
+    """
+    for name, value in (("depth", depth), ("z_ref", z_ref)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name}: ожидалось число, получено {value!r}")
+    return float(depth) - float(z_ref)
+
+
+def _check_gamma(gamma: float) -> None:
+    """Проверить степень шкалы: конечное число в ``(0, DEPTH_GAMMA_MAX]`` (08g-fix4).
+
+    ``γ ≤ 0`` не определена (нулевая степень дала бы ступеньку), ``γ > 1`` не нужна: она
+    поднимает множитель в середине окна и усиливает слияние дальних суставов. Допустимы
+    ``bool``-ловушки — ``True``/``False`` отвергаются как нечисла, чтобы ``gamma=1`` нельзя
+    было случайно передать флагом.
+    """
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise ValueError(f"gamma: ожидалось число, получено {gamma!r}")
+    if not math.isfinite(gamma):
+        raise ValueError(f"gamma: должно быть конечным, получено {gamma!r}")
+    if not 0.0 < gamma <= DEPTH_GAMMA_MAX:
+        raise ValueError(
+            f"gamma: ожидалось в (0, {DEPTH_GAMMA_MAX:g}], получено {gamma!r}"
+        )
+
+
+def depth_parameter(
+    depth: float,
+    *,
+    near: float = DEPTH_NEAR_M,
+    far: float = DEPTH_FAR_M,
+    z_ref: float = 0.0,
+) -> float:
+    """Параметр ``t`` вдоль окна глубины: ``clamp((z − z_ref − near)/(far − near), 0, 1)``.
+
+    Чистая функция (08g-fix4): только вход и результат, без кадра и состояния. ``0`` — ближняя
+    граница окна (полный цвет), ``1`` — дальняя (пол шкалы), дальше — зажим, а не экстраполяция.
+    ``near``/``far``/``z_ref`` проверяются так же, как в :func:`depth_factor`.
+
+    Неизвестная глубина (``NaN``, ``±inf``) и глубина за камерой (``z ≤ 0``) дают ``t = 0``:
+    множитель в этой точке — 1.0, т.е. отсутствие данных не выцветает скелет. Для видимой
+    точки ``t`` определён и монотонен по ``z``.
+    """
+    _check_depth_range(near, far, z_ref)
+    if isinstance(depth, bool) or not isinstance(depth, (int, float)):
+        raise ValueError(f"depth: ожидалось число, получено {depth!r}")
+    if not math.isfinite(depth) or depth <= 0.0:
+        return 0.0
+    t = (relative_depth(depth, z_ref) - near) / (far - near)
+    if t <= 0.0:
+        return 0.0
+    if t >= 1.0:
+        return 1.0
+    return float(t)
+
+
+def gamma_parameter(t: float, gamma: float) -> float:
+    """Нелинейный параметр ``t' = t**γ`` (08g-fix4), ``t`` уже зажат в ``[0, 1]``.
+
+    Края сохраняются ровно: ``t = 0 → 0``, ``t = 1 → 1`` (без ``0.9999999999999999``), поэтому
+    множители на границах окна остаются ровно 1.0 и полом. ``γ = 1.0`` возвращает ``t`` без
+    возведения в степень — это побайтовое совпадение с линейной формулой 08g-fix3. Функция
+    монотонна при любом допустимом ``γ``: чем дальше сустав, тем больше ``t'`` (и тем меньше
+    множитель). ``t`` вне ``[0, 1]`` — ``ValueError``: зажим делает :func:`depth_parameter`,
+    а не эта функция, иначе край окна перестал бы быть краем.
+    """
+    _check_gamma(gamma)
+    if isinstance(t, bool) or not isinstance(t, (int, float)):
+        raise ValueError(f"t: ожидалось число, получено {t!r}")
+    if not math.isfinite(t) or not 0.0 <= t <= 1.0:
+        raise ValueError(f"t: ожидалось в [0, 1], получено {t!r}")
+    if t <= 0.0:
+        return 0.0
+    if t >= 1.0:
+        return 1.0
+    if gamma == 1.0:
+        return float(t)
+    return float(t) ** float(gamma)
+
+
+def _check_depth_range(near: float, far: float, z_ref: float) -> None:
+    """Проверить окно глубины и опорную точку (без нижней границы шкалы)."""
+    for name, value in (("near", near), ("far", far), ("z_ref", z_ref)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name}: ожидалось число, получено {value!r}")
+        if not math.isfinite(value):
+            raise ValueError(f"{name}: должно быть конечным, получено {value!r}")
+    if z_ref == 0.0:
+        if near <= 0:
+            raise ValueError(f"near: должно быть > 0, получено {near!r}")
+    elif near < 0:
+        raise ValueError(f"near: при относительной шкале должно быть ≥ 0, получено {near!r}")
+    if far <= near:
+        raise ValueError(f"far: должно быть больше near ({near!r}), получено {far!r}")
+
+
+def _check_depth_window(
+    near: float, far: float, minimum: float, floor_name: str, *, z_ref: float = 0.0
+) -> None:
+    """Проверить окно глубины и нижнюю границу шкалы (общая для множителя и alpha).
+
+    ``minimum`` — значение шкалы на дальнем конце окна (множитель яркости или alpha),
+    ``floor_name`` — его имя для текста ошибки. Окно ``near``…``far`` — метры системы камеры.
+    ``z_ref`` (08g-fix3) — опорная точка относительной шкалы: при нуле окно абсолютное, и
+    ``near`` обязан быть > 0 (как раньше); при ненулевой опоре ``near = 0`` — законная
+    граница («сама ближайшая кость руки»), поэтому проверка ослаблена до ``near ≥ 0``.
+    """
+    _check_depth_range(near, far, z_ref)
+    if isinstance(minimum, bool) or not isinstance(minimum, (int, float)):
+        raise ValueError(f"{floor_name}: ожидалось число, получено {minimum!r}")
+    if not math.isfinite(minimum):
+        raise ValueError(f"{floor_name}: должно быть конечным, получено {minimum!r}")
+    if not 0.0 < minimum <= 1.0:
+        raise ValueError(f"{floor_name}: ожидалось в (0, 1], получено {minimum!r}")
+
+
+def depth_factor(
+    depth: float,
+    *,
+    near: float = DEPTH_NEAR_M,
+    far: float = DEPTH_FAR_M,
+    min_factor: float = DEPTH_MIN_FACTOR,
+    z_ref: float = 0.0,
+    gamma: float = 1.0,
+) -> float:
+    """Множитель к цвету руки по глубине: 1.0 ближе ``near``, ``min_factor`` дальше ``far``.
+
+    Шкала нелинейная (08g-fix4): параметр вдоль окна ``t`` (:func:`depth_parameter`) возводится
+    в степень ``γ`` (:func:`gamma_parameter`), и множитель считается от ``t'``:
+    ``1 − (1 − min_factor)·t'``. При ``γ = 1.0`` это ровно прежняя линейная формула (значение по
+    умолчанию, побайтово 08g-fix3); ``γ < 1`` сильнее приглушает середину окна, поэтому контраст
+    ближняя/дальняя кость выше (цена — более сжатая градация в дальней половине, которую
+    компенсирует расширенное окно :func:`relative_depth_window`). Монотонность по ``z`` при
+    этом сохраняется: больше глубина — меньше множитель.
+
+    По умолчанию окно **абсолютное**, в метрах системы камеры (:data:`DEPTH_NEAR_M`…
+    :data:`DEPTH_FAR_M` замерены по всей записи), поэтому множитель не зависит от того, что
+    попало в кадр, и не «дышит» от кадра к кадру.
+
+    ``z_ref`` (08g-fix3) сдвигает точку отсчёта: глубина заменяется на
+    :func:`relative_depth` ``z − z_ref``. При ``z_ref = 0`` формула и числа ровно прежние
+    (абсолютная шкала). При относительной шкале ``near = 0``, ``far`` — ширина окна
+    (:func:`relative_depth_window`): ближайшая кость руки получает 1.0, дальняя — тем меньше,
+    чем больше разброс внутри руки, независимо от абсолютного расстояния до шлема.
+
+    Неизвестная глубина (``NaN``, ``±inf``) даёт 1.0 — полный цвет: невидимая точка всё
+    равно не рисуется, а выцветать из-за отсутствия данных скелет не должен. Глубина за
+    камерой (``z ≤ 0``) тоже упирается в ближнюю границу окна и даёт 1.0 — такая точка в
+    кадр не попадает, множитель для неё смысла не имеет.
+    """
+    _check_depth_window(near, far, min_factor, "min_factor", z_ref=z_ref)
+    _check_gamma(gamma)
+    t = depth_parameter(depth, near=near, far=far, z_ref=z_ref)
+    if t <= 0.0:
+        return 1.0
+    if t >= 1.0:
+        return float(min_factor)
+    t_prime = gamma_parameter(t, gamma)
+    return 1.0 - (1.0 - float(min_factor)) * t_prime
+
+
+def depth_alpha(
+    depth: float,
+    *,
+    near: float = DEPTH_NEAR_M,
+    far: float = DEPTH_FAR_M,
+    min_alpha: float = DEPTH_MIN_ALPHA,
+    z_ref: float = 0.0,
+    gamma: float = 1.0,
+) -> float:
+    """Прозрачность по глубине: 1.0 ближе ``near``, ``min_alpha`` дальше ``far`` (08g-fix2).
+
+    Второй, независимый от яркости канал: ближняя кость или точка рисуется полностью
+    непрозрачной, дальняя — полупрозрачной, сквозь неё виден фон. Шкала нелинейная так же,
+    как у :func:`depth_factor` (08g-fix4): ``t' = t**γ``, ``γ = 1.0`` — прежняя линейная шкала
+    побайтово; окно по умолчанию — **то же**, что у :func:`depth_factor`
+    (:data:`DEPTH_NEAR_M`…:data:`DEPTH_FAR_M`), ``near``/``far``/``min_alpha`` можно перекрыть.
+
+    ``z_ref`` (08g-fix3) — как у :func:`depth_factor`: сдвиг точки отсчёта на ближайший
+    сустав руки; ``near = 0``, ``far`` = ширина относительного окна
+    (:func:`relative_depth_window`). При ``z_ref = 0`` поведение и числа прежние.
+
+    Неизвестная глубина (``NaN``, ``±inf``) и глубина за камерой (``z ≤ 0``) дают 1.0 —
+    полную непрозрачность: отсутствие данных не повод «выцветать» или прятать точку, а такая
+    точка в кадр не попадает. Крайние значения окна возвращают ровно 1.0 / ``min_alpha``
+    (без ``0.44999999999999996``), дальше — зажим, а не экстраполяция.
+    """
+    _check_depth_window(near, far, min_alpha, "min_alpha", z_ref=z_ref)
+    _check_gamma(gamma)
+    t = depth_parameter(depth, near=near, far=far, z_ref=z_ref)
+    if t <= 0.0:
+        return 1.0
+    if t >= 1.0:
+        return float(min_alpha)
+    t_prime = gamma_parameter(t, gamma)
+    return 1.0 - (1.0 - float(min_alpha)) * t_prime
+
+
+
+def shade_color(color: Sequence[int], factor: float) -> tuple[int, int, int]:
+    """Умножить цвет BGR на ``factor`` (0…1) с округлением и зажимом в 0…255.
+
+    Умножение сохраняет оттенок руки (все каналы масштабируются одинаково) и меняет только
+    яркость/насыщенность — вторая палитра не появляется, левая/правая рука по-прежнему
+    различимы. Множитель обычно приходит из :func:`depth_factor`, где снизу ограничен
+    :data:`DEPTH_MIN_FACTOR`, поэтому дальняя кость не превращается в чёрную.
+    """
+    channels = tuple(color)
+    if len(channels) != 3:
+        raise ValueError(f"color: ожидался BGR из 3 каналов, получено {color!r}")
+    for value in channels:
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 255:
+            raise ValueError(f"color: канал должен быть int 0…255, получено {value!r}")
+    if isinstance(factor, bool) or not isinstance(factor, (int, float)):
+        raise ValueError(f"factor: ожидалось число, получено {factor!r}")
+    if not math.isfinite(factor) or not 0.0 <= factor <= 1.0:
+        raise ValueError(f"factor: ожидалось в 0…1, получено {factor!r}")
+    shaded = (min(255, max(0, int(round(value * factor)))) for value in channels)
+    return tuple(shaded)  # type: ignore[return-value]
+
+
+def _check_segments(segments: int) -> None:
+    """Проверить число отрезков кости (общая проверка цветов и alpha по глубине)."""
+    if isinstance(segments, bool) or not isinstance(segments, int):
+        raise ValueError(f"segments: ожидалось целое число, получено {segments!r}")
+    if segments < 1:
+        raise ValueError(f"segments: должно быть ≥ 1, получено {segments!r}")
+
+
+def bone_gradient_colors(
+    color: Sequence[int],
+    depth_start: float,
+    depth_end: float,
+    *,
+    segments: int = DEPTH_BONE_SEGMENTS,
+    z_ref: float = 0.0,
+    near: float = DEPTH_NEAR_M,
+    far: float = DEPTH_FAR_M,
+    gamma: float = 1.0,
+) -> tuple[tuple[int, int, int], ...]:
+    """Цвета ``segments`` отрезков кости: множитель плавно идёт от одного конца к другому.
+
+    Порядок цветов — от сустава ``depth_start`` к ``depth_end`` (это начало и конец ребра).
+    Внутри отрезка цвет постоянен и берётся по множителю в его середине, ``t = (i + 0.5)/N``,
+    — так градиент вдоль кости не зависит от длины в пикселях и от толщины линии.
+    Множители концов — :func:`depth_factor` от ``z``: ближний конец ярче, дальний темнее,
+    поэтому на экране видно, каким концом кость смотрит в камеру.
+
+    ``gamma`` (08g-fix4) — степень нелинейной шкалы. При ``γ = 1.0`` сохраняется прежний,
+    линейный расчёт (интерполяция множителей концов) — побайтово 08g-fix3; при ``γ < 1``
+    множитель каждого отрезка считается по ``t'`` **середины** отрезка
+    (:func:`depth_parameter` → :func:`gamma_parameter` → :func:`depth_factor`), поэтому
+    градиент соответствует той же нелинейной шкале, что у точек, а не является интерполяцией
+    линейных множителей.
+
+    ``z_ref``/``near``/``far`` (08g-fix3) прокидываются в :func:`depth_factor`: при
+    относительной шкале ``z_ref`` — ближайший сустав руки, ``near = 0``, ``far`` — ширина
+    окна (:func:`relative_depth_window`). По умолчанию (``z_ref = 0``) окно и числа прежние,
+    абсолютные.
+
+    Глубина хотя бы одного конца неизвестна (``NaN``/``±inf``) — все отрезки получают
+    полный цвет руки: кость выглядит как прежняя плоская линия. Неположительное число
+    отрезков или недопустимая ``γ`` — ``ValueError``.
+    """
+    _check_segments(segments)
+    _check_gamma(gamma)
+    if not (math.isfinite(depth_start) and math.isfinite(depth_end)):
+        base = shade_color(color, 1.0)
+        return (base,) * segments
+    if gamma == 1.0:
+        # 08g-fix3 побайтово: линейная интерполяция множителей концов
+        start_factor = depth_factor(depth_start, near=near, far=far, z_ref=z_ref)
+        end_factor = depth_factor(depth_end, near=near, far=far, z_ref=z_ref)
+        step = end_factor - start_factor
+        return tuple(
+            shade_color(color, start_factor + step * ((index + 0.5) / segments))
+            for index in range(segments)
+        )
+    span = float(depth_end) - float(depth_start)
+    return tuple(
+        shade_color(
+            color,
+            depth_factor(
+                float(depth_start) + span * ((index + 0.5) / segments),
+                near=near,
+                far=far,
+                z_ref=z_ref,
+                gamma=gamma,
+            ),
+        )
+        for index in range(segments)
+    )
+
+
+def bone_gradient_alphas(
+    depth_start: float,
+    depth_end: float,
+    *,
+    segments: int = DEPTH_BONE_SEGMENTS,
+    z_ref: float = 0.0,
+    near: float = DEPTH_NEAR_M,
+    far: float = DEPTH_FAR_M,
+    gamma: float = 1.0,
+) -> tuple[float, ...]:
+    """Alpha ``segments`` отрезков кости — по средней глубине концов отрезка (08g-fix2).
+
+    Ровно как у :func:`bone_gradient_colors`, но для прозрачности: параметр вдоль кости
+    ``t = (i + 0.5)/N`` переводится в глубину (линейно между глубинами концов), а alpha
+    берётся :func:`depth_alpha` в этой точке. Средняя глубина концов отрезка — это и есть
+    глубина его середины, поэтому вдоль кости виден не только градиент яркости, но и
+    градиент плотности: ближний конец плотный, дальний просвечивает. ``gamma`` (08g-fix4)
+    прокидывается в :func:`depth_alpha`, т.е. нелинейная шкала применяется к ``t'`` середины
+    отрезка (при ``γ = 1.0`` — прежняя линейная, побайтово 08g-fix3).
+
+    ``z_ref``/``near``/``far`` (08g-fix3) прокидываются в :func:`depth_alpha` так же, как у
+    цветов: при ``z_ref = 0`` окно и числа прежние.
+
+    Глубина хотя бы одного конца неизвестна (``NaN``/``±inf``) — все отрезки непрозрачны
+    (1.0): отсутствие данных не делает кость полупрозрачной. Неположительное число отрезков
+    или недопустимая ``γ`` — ``ValueError``.
+    """
+    _check_segments(segments)
+    _check_gamma(gamma)
+    if not (math.isfinite(depth_start) and math.isfinite(depth_end)):
+        return (1.0,) * segments
+    step = (float(depth_end) - float(depth_start)) / segments
+    return tuple(
+        depth_alpha(
+            depth_start + step * (index + 0.5), near=near, far=far, z_ref=z_ref, gamma=gamma
+        )
+        for index in range(segments)
+    )
+
+
+def _lerp_point(
+    first: camera_model.ProjectedPoint, second: camera_model.ProjectedPoint, t: float
+) -> tuple[int, int]:
+    """Точка на отрезке ``first → second`` в параметре ``t`` (0 — first, 1 — second)."""
+    return (
+        _coord(first.u + (second.u - first.u) * t),
+        _coord(first.v + (second.v - first.v) * t),
+    )
+
+
+def _draw_segment(
+    image: Any,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    color: tuple[int, int, int],
+    thickness: int,
+    alpha: float = 1.0,
+) -> None:
+    """Отрезок между пикселями: alpha 1.0 — обычный ``cv2.line``, иначе смешивание по маске.
+
+    ``cv2.line`` не умеет alpha, поэтому прозрачный отрезок рисуется в маску размером со свой
+    ограничивающий прямоугольник (:func:`_blend_line`), иначе на кадр лёг бы полупрозрачный
+    тёмный прямоугольник вокруг линии (та же ловушка, что у следа 08b).
+    """
+    import cv2  # noqa: PLC0415
+
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise ValueError(f"alpha: ожидалось число, получено {alpha!r}")
+    if not 0.0 < alpha <= 1.0:
+        raise ValueError(f"alpha: должно быть в (0, 1], получено {alpha!r}")
+    if alpha >= 1.0:
+        cv2.line(image, start, end, color, thickness, cv2.LINE_AA)
+        return
+    _blend_line(image, start, end, color, thickness, alpha)
+
+
+def _draw_bone(
+    image: Any,
+    first: camera_model.ProjectedPoint,
+    second: camera_model.ProjectedPoint,
+    color: tuple[int, int, int],
+    style: Style,
+    alpha: float = 1.0,
+) -> None:
+    """Одна линия ``first → second`` цветом ``color`` (плоский режим и кость в одном множителе)."""
+    _draw_segment(
+        image,
+        (_coord(first.u), _coord(first.v)),
+        (_coord(second.u), _coord(second.v)),
+        color,
+        style.line_thickness,
+        alpha,
+    )
+
+
+def _blend_bone_gradient(
+    image: Any,
+    first: camera_model.ProjectedPoint,
+    second: camera_model.ProjectedPoint,
+    segment_colors: Sequence[tuple[int, int, int]],
+    segment_alphas: Sequence[float],
+    thickness: int,
+) -> bool:
+    """Кость с прозрачностью: цвет и alpha на отрезок, но смешивание **один раз** (08g-fix2).
+
+    Если рисовать каждый из :data:`DEPTH_BONE_SEGMENTS` отрезков отдельным
+    :func:`_blend_line`, то на стыках два антиалиасных конца ложатся друг на друга и смешивание
+    идёт дважды: на кадре появляются «бусины» — более плотные точки через каждые 20 % кости
+    (видно на 6× зуме). Поэтому кость кладётся в **одну** маску (cv2.line с AA), а затем
+    каждый пиксель маски относится к своему отрезку по проекции на ось кости
+    ``t = (P−A)·(B−A)/|B−A|²``; цвет и alpha берутся по номеру отрезка, и смешивание с кадром
+    происходит ровно один раз. Швов между отрезками нет, а ступенька цвета на границе
+    отрезков остаётся (это и есть градиент из 5 отрезков).
+
+    Возврат — было ли что рисовать (кость целиком вне кадра — ``False``).
+    """
+    import cv2  # noqa: PLC0415
+    import numpy as np  # noqa: PLC0415
+
+    if len(segment_colors) != len(segment_alphas):
+        raise ValueError("segment_colors и segment_alphas: разная длина")
+    start = (_coord(first.u), _coord(first.v))
+    end = (_coord(second.u), _coord(second.v))
+    height, width = image.shape[:2]
+    pad = thickness + 2
+    left = max(0, min(start[0], end[0]) - pad)
+    top = max(0, min(start[1], end[1]) - pad)
+    right = min(width, max(start[0], end[0]) + pad)
+    bottom = min(height, max(start[1], end[1]) + pad)
+    if right <= left or bottom <= top:
+        return False
+    mask = np.zeros((bottom - top, right - left), np.uint8)
+    cv2.line(
+        mask,
+        (start[0] - left, start[1] - top),
+        (end[0] - left, end[1] - top),
+        255,
+        thickness,
+        cv2.LINE_AA,
+    )
+    if not mask.any():
+        return False
+    ax, ay = start[0] - left, start[1] - top
+    bx, by = end[0] - left, end[1] - top
+    dx, dy = bx - ax, by - ay
+    rows, cols = np.mgrid[0 : mask.shape[0], 0 : mask.shape[1]]
+    length2 = dx * dx + dy * dy
+    if length2:
+        t = ((cols - ax) * dx + (rows - ay) * dy) / float(length2)
+    else:
+        t = np.zeros_like(cols, dtype=np.float32)
+    np.clip(t, 0.0, 1.0, out=t)
+    count = len(segment_colors)
+    index = np.minimum((t * count).astype(np.int32), count - 1)
+    colors = np.asarray(segment_colors, np.float32)[index]
+    alphas = np.asarray(segment_alphas, np.float32)[index]
+    weight = ((mask.astype(np.float32) / 255.0) * alphas)[..., None]
+    roi = image[top:bottom, left:right]
+    blended = roi.astype(np.float32) * (1.0 - weight) + colors * weight
+    roi[:] = np.rint(blended).astype(np.uint8)
+    return True
+
+
+def _depth_sort_key(depth: float) -> float:
+    """Ключ сортировки «дальние раньше»: неизвестная глубина — раньше всех (она непрозрачная)."""
+    return depth if math.isfinite(depth) else math.inf
+
+
+def _bone_mean_depth(depths: Mapping[str, float], bone: tuple[str, str]) -> float:
+    """Средняя глубина концов ребра (глубина его середины); без данных — ``inf``."""
+    start, end = bone
+    first, second = depths[start], depths[end]
+    if not (math.isfinite(first) and math.isfinite(second)):
+        return math.inf
+    return (first + second) / 2.0
+
+
+def _paint_bone(
+    image: Any,
+    first: camera_model.ProjectedPoint,
+    second: camera_model.ProjectedPoint,
+    color: tuple[int, int, int],
+    style: Style,
+    depth_start: float | None = None,
+    depth_end: float | None = None,
+    *,
+    shade: bool = True,
+    alpha: bool = False,
+    z_ref: float = 0.0,
+    near: float = DEPTH_NEAR_M,
+    far: float = DEPTH_FAR_M,
+    gamma: float = 1.0,
+) -> None:
+    """Нарисовать ребро: плоское, с градиентом яркости и/или прозрачности по глубине.
+
+    ``depth_start``/``depth_end`` — ``None`` в плоском режиме (одна линия полного цвета).
+    Иначе цвет и alpha идут вдоль кости :data:`DEPTH_BONE_SEGMENTS` отрезками: цвет — по
+    множителю в середине отрезка (:func:`bone_gradient_colors`), alpha — по средней глубине
+    его концов (:func:`bone_gradient_alphas`). ``z_ref``/``near``/``far`` (08g-fix3) задают
+    шкалу: по умолчанию абсолютную, при относительной ``z_ref`` — ближайший сустав руки,
+    ``near = 0``, ``far`` — ширина окна. ``gamma`` (08g-fix4) — степень нелинейной шкалы,
+    прокидывается в :func:`bone_gradient_colors`/:func:`bone_gradient_alphas` (γ = 1.0 —
+    линейный расчёт 08g-fix3 побайтово). Если вся кость в одном множителе и одной alpha
+    (дальний конец упёрся в пол, глубина неизвестна, у `--no-depth-alpha`), она рисуется одной
+    линией — ровно как плоская, без швов антиалиасинга между стыкующимися отрезками.
+    """
+    if depth_start is None or depth_end is None:
+        _draw_bone(image, first, second, color, style)
+        return
+    segment_colors = (
+        bone_gradient_colors(
+            color, depth_start, depth_end, z_ref=z_ref, near=near, far=far, gamma=gamma
+        )
+        if shade
+        else (shade_color(color, 1.0),) * DEPTH_BONE_SEGMENTS
+    )
+    segment_alphas = (
+        bone_gradient_alphas(
+            depth_start, depth_end, z_ref=z_ref, near=near, far=far, gamma=gamma
+        )
+        if alpha
+        else None
+    )
+    alphas_uniform = segment_alphas is None or len(set(segment_alphas)) == 1
+    if len(set(segment_colors)) == 1 and alphas_uniform:
+        _draw_bone(
+            image,
+            first,
+            second,
+            segment_colors[0],
+            style,
+            1.0 if segment_alphas is None else segment_alphas[0],
+        )
+        return
+    if segment_alphas is not None and any(value < 1.0 for value in segment_alphas):
+        if len(set(segment_colors)) == 1 and len(set(segment_alphas)) == 1:
+            _draw_bone(image, first, second, segment_colors[0], style, segment_alphas[0])
+        else:
+            _blend_bone_gradient(
+                image, first, second, segment_colors, segment_alphas, style.line_thickness
+            )
+        return
+    segments = len(segment_colors)
+    for index, segment_color in enumerate(segment_colors):
+        _draw_segment(
+            image,
+            _lerp_point(first, second, index / segments),
+            _lerp_point(first, second, (index + 1) / segments),
+            segment_color,
+            style.line_thickness,
+            1.0 if segment_alphas is None else segment_alphas[index],
+        )
+
+
+def _paint_point(
+    image: Any,
+    point: camera_model.ProjectedPoint,
+    color: tuple[int, int, int],
+    style: Style,
+    depth: float | None = None,
+    *,
+    shade: bool = True,
+    alpha: bool = False,
+    z_ref: float = 0.0,
+    near: float = DEPTH_NEAR_M,
+    far: float = DEPTH_FAR_M,
+    gamma: float = 1.0,
+) -> None:
+    """Нарисовать точку сустава: цвет и прозрачность по её глубине, обводка всегда чёрная.
+
+    Обводка не прозрачная намеренно: иначе дальняя точка «исчезает» на тёмном фоне, а на
+    светлом остаётся цветное пятно без границы. ``depth = None`` — плоский кадр 08a/08f.
+    ``z_ref``/``near``/``far`` (08g-fix3) — шкала глубины: по умолчанию абсолютная, при
+    относительной ``z_ref`` — ближайший сустав руки, ``near = 0``, ``far`` — ширина окна.
+    ``gamma`` (08g-fix4) — степень нелинейной шкалы (γ = 1.0 — прежняя линейная, побайтово).
+    """
+    import cv2  # noqa: PLC0415
+
+    center = (_coord(point.u), _coord(point.v))
+    fill_color = color
+    fill_alpha = 1.0
+    if depth is not None and math.isfinite(depth):
+        if shade:
+            fill_color = shade_color(
+                color, depth_factor(depth, near=near, far=far, z_ref=z_ref, gamma=gamma)
+            )
+        if alpha:
+            fill_alpha = depth_alpha(depth, near=near, far=far, z_ref=z_ref, gamma=gamma)
+    if fill_alpha >= 1.0:
+        cv2.circle(image, center, style.point_radius, fill_color, -1, cv2.LINE_AA)
+    else:
+        _blend_point(image, center, style.point_radius, fill_color, fill_alpha)
+    cv2.circle(image, center, style.point_radius, OUTLINE_COLOR, OUTLINE_THICKNESS, cv2.LINE_AA)
 
 
 def draw_skeleton(
@@ -359,49 +1713,232 @@ def draw_skeleton(
     style: Style,
     *,
     colors: Mapping[str, tuple[int, int, int]] = COLORS,
+    joints: Sequence[str] = JOINTS,
+    bones: Sequence[tuple[str, str]] = HAND_CHAINS,
+    depths: Mapping[str, Mapping[str, float]] | None = None,
+    alpha: bool = False,
+    shade: bool = True,
+    relative: bool = False,
+    gamma: float = 1.0,
 ) -> int:
     """Нарисовать скелет на кадре (in place) и вернуть число видимых точек.
 
-    Порядок: сначала линии (под точками), потом точки. Пара, в которой хотя бы одна точка
-    невидима, линией не соединяется — иначе отрезок «прибил» бы руку к точке за камерой.
-    Точки, вышедшие за край кадра, всё равно рисуются: cv2 обрежет круг/отрезок по границе,
-    и видимая часть кисти останется на месте.
-    """
-    import cv2  # noqa: PLC0415 — локальный импорт: чистые функции модуля работают без OpenCV
+    ``joints``/``bones`` (08f) — набор суставов и рёбер одной руки; по умолчанию прежний
+    5-точечный скелет 08a. Порядок: сначала линии (под точками), потом точки: точка сустава
+    всегда остаётся видимой поверх своей кости. Пара, в которой хотя бы одна точка невидима,
+    линией не соединяется — иначе отрезок «прибил» бы руку к точке за камерой, а ``NaN``
+    («нет данных», 04b) дал бы линию через дырку. Точки, вышедшие за край кадра, всё равно
+    рисуются: cv2 обрежет круг/отрезок по границе, и видимая часть кисти останется на месте.
 
+    ``depths`` (08g) — глубина суставов в системе камеры, ``side → joint → z`` (как у
+    :func:`project_skeleton_depth`). Если передана, цвет руки умножается на
+    :func:`depth_factor`: у точки — по её глубине, у кости — **градиентом вдоль кости**:
+    ребро рисуется :data:`DEPTH_BONE_SEGMENTS` отрезками, множитель линейно идёт от
+    множителя начала к множителю конца (:func:`bone_gradient_colors`), поэтому видно,
+    каким концом кость ближе к камере. ``NaN`` у конца кости или у точки даёт полный цвет
+    (глубина неизвестна). Обводка точки остаётся чёрной при любом множителе — контраст на
+    светлом фоне сохраняется. ``None`` (по умолчанию) — плоские цвета 08a: одна линия на
+    кость, та же картинка, что до 08g.
+
+    ``alpha`` (08g-fix2) — второй канал глубины: у точки прозрачность по её глубине
+    (:func:`depth_alpha`), у кости — по средней глубине концов каждого отрезка
+    (:func:`bone_gradient_alphas`). Чтобы полупрозрачная дальняя кость не просвечивала поверх
+    непрозрачной ближней, в этом режиме кости и точки рисуются **от дальних к ближним**
+    (сортировка по ``z`` по убыванию, в пределах кадра обе руки): неизвестная глубина идёт
+    первой, точки — после всех костей. Без ``alpha`` порядок остаётся прежним (список
+    ``bones``, затем точки, левая рука, правая), поэтому кадр 08g-fix воспроизводится
+    побайтово.
+
+    ``shade=False`` — отключить множитель яркости, оставив прозрачность: это режим «только
+    alpha» для сравнения каналов (CLI такого флага не имеет, см. ``docs/overlay.md``).
+    Плоский кадр (``depths=None``) он не трогает.
+
+    ``relative`` (08g-fix3) — относительная шкала глубины **на каждую руку отдельно**: для
+    каждой руки берётся ``z_ref = min`` по её видимым суставам (:func:`depth_reference`), и
+    цвет/alpha считаются от ``z − z_ref`` с окном ``near = 0``…
+    :data:`DEPTH_RELATIVE_FAR_M` (ширина, а не абсолютные метры). Ближний сустав руки всегда
+    получает 1.0, дальний — по разбросу внутри руки; между руками абсолютная разница глубин
+    сохраняется. ``False`` (по умолчанию) — прежняя абсолютная шкала (08g-fix2), кадр
+    воспроизводится побайтово. Без ``depths`` относительная шкала невозможна — ``ValueError``
+    (ноль глубин не из чего отсчитывать); плоский кадр включайте только через ``depths=None``.
+
+    ``gamma`` (08g-fix4) — степень нелинейной шкалы ``t' = t**γ`` (0 < γ ≤ 1): множитель
+    яркости/alpha и градиент кости считаются от ``t'`` (:func:`depth_parameter`,
+    :func:`gamma_parameter`). ``γ = 1.0`` (по умолчанию) — ровно линейная шкала 08g-fix3
+    побайтово, включая окно 0.155 м; ``γ < 1`` включает окно :data:`DEPTH_GAMMA_FAR_M`
+    (0.18 м) и усиливает контраст ближняя/дальняя кость (см. :func:`relative_depth_window`).
+    """
+    for name, value in (("alpha", alpha), ("shade", shade), ("relative", relative)):
+        if not isinstance(value, bool):
+            raise ValueError(f"{name}: ожидалось bool, получено {value!r}")
+    _check_gamma(gamma)
+    if alpha and depths is None:
+        raise ValueError("alpha: прозрачность по глубине невозможна без depths")
+    if relative and depths is None:
+        raise ValueError("relative: относительная шкала невозможна без depths")
     if not isinstance(style, Style):
         raise ValueError(f"style: ожидался Style, получено {style!r}")
     if image is None or getattr(image, "ndim", 0) != 3:
         raise ValueError("image: ожидался BGR-кадр (H×W×3)")
-    drawn = 0
+    names = tuple(joints)
+    if not names:
+        raise ValueError("joints: пустой список суставов")
+    pairs = tuple(bones)
+    for start, end in pairs:
+        for joint in (start, end):
+            if joint not in names:
+                raise ValueError(
+                    f"bones: ребро {start!r}→{end!r} ссылается на сустав {joint!r}, "
+                    "которого нет в joints"
+                )
+    if depths is not None and not isinstance(depths, Mapping):
+        raise ValueError(f"depths: ожидался Mapping side → joint → z, получено {depths!r}")
+
+    hands: dict[str, Mapping[str, camera_model.ProjectedPoint]] = {}
+    hand_depths: dict[str, Mapping[str, float]] = {}
     for side in ("left", "right"):
-        color = colors[side]
-        joints = pixels.get(side)
-        if joints is None:
+        hand = pixels.get(side)
+        if hand is None:
             raise ValueError(f"pixels: нет руки {side!r}")
-        for start, end in HAND_CHAINS:
-            first, second = joints[start], joints[end]
+        missing = [joint for joint in names if joint not in hand]
+        if missing:
+            raise ValueError(f"pixels[{side!r}]: нет суставов {missing}")
+        hands[side] = hand
+        if depths is not None:
+            side_depths = depths.get(side)
+            if side_depths is None:
+                raise ValueError(f"depths: нет руки {side!r}")
+            missing = [joint for joint in names if joint not in side_depths]
+            if missing:
+                raise ValueError(f"depths[{side!r}]: нет суставов {missing}")
+            hand_depths[side] = side_depths
+
+    # 08g-fix3: у каждой руки своя опорная точка; без глубин шкала не нужна
+    z_refs: dict[str, float] = {"left": 0.0, "right": 0.0}
+    if relative:
+        for side in ("left", "right"):
+            reference = depth_reference(hand_depths[side].values())
+            z_refs[side] = 0.0 if reference is None else reference
+    if relative:
+        # 08g-fix4: γ = 1.0 — окно 08g-fix3 (побайтовое совпадение), γ < 1 — окно 0.18
+        scale_near, scale_far = relative_depth_window(gamma)
+    else:
+        scale_near, scale_far = (DEPTH_NEAR_M, DEPTH_FAR_M)
+
+    if depths is None:
+        # плоский кадр 08a/08f: кости в порядке списка, затем точки; руки — левая, правая
+        drawn = 0
+        for side in ("left", "right"):
+            for start, end in pairs:
+                first, second = hands[side][start], hands[side][end]
+                if first.visible and second.visible:
+                    _paint_bone(image, first, second, colors[side], style)
+            for joint in names:
+                point = hands[side][joint]
+                if point.visible:
+                    _paint_point(image, point, colors[side], style)
+                    drawn += 1
+        return drawn
+
+    if not alpha:
+        # 08g-fix: только яркость, порядок костей — как в списке ``bones``
+        drawn = 0
+        for side in ("left", "right"):
+            for start, end in pairs:
+                first, second = hands[side][start], hands[side][end]
+                if first.visible and second.visible:
+                    _paint_bone(
+                        image,
+                        first,
+                        second,
+                        colors[side],
+                        style,
+                        hand_depths[side][start],
+                        hand_depths[side][end],
+                        shade=shade,
+                        z_ref=z_refs[side],
+                        near=scale_near,
+                        far=scale_far,
+                        gamma=gamma,
+                    )
+            for joint in names:
+                point = hands[side][joint]
+                if point.visible:
+                    _paint_point(
+                        image,
+                        point,
+                        colors[side],
+                        style,
+                        hand_depths[side][joint],
+                        shade=shade,
+                        z_ref=z_refs[side],
+                        near=scale_near,
+                        far=scale_far,
+                        gamma=gamma,
+                    )
+                    drawn += 1
+        return drawn
+
+    # 08g-fix2: alpha как второй канал — сначала все кости от дальних к ближним, затем точки
+    # от дальних к ближним (точка сустава должна остаться видимой поверх своей кости)
+    bones_plan: list[
+        tuple[float, str, camera_model.ProjectedPoint, camera_model.ProjectedPoint, float, float]
+    ] = []
+    for side in ("left", "right"):
+        for start, end in pairs:
+            first, second = hands[side][start], hands[side][end]
             if not (first.visible and second.visible):
                 continue
-            cv2.line(
-                image,
-                (_coord(first.u), _coord(first.v)),
-                (_coord(second.u), _coord(second.v)),
-                color,
-                style.line_thickness,
-                cv2.LINE_AA,
+            depth_start = hand_depths[side][start]
+            depth_end = hand_depths[side][end]
+            bones_plan.append(
+                (
+                    _bone_mean_depth(hand_depths[side], (start, end)),
+                    side,
+                    first,
+                    second,
+                    depth_start,
+                    depth_end,
+                )
             )
-        for joint in JOINTS:
-            point = joints[joint]
-            if not point.visible:
-                continue
-            center = (_coord(point.u), _coord(point.v))
-            cv2.circle(image, center, style.point_radius, color, -1, cv2.LINE_AA)
-            cv2.circle(
-                image, center, style.point_radius, OUTLINE_COLOR, OUTLINE_THICKNESS, cv2.LINE_AA
-            )
-            drawn += 1
-    return drawn
+    bones_plan.sort(key=lambda item: item[0], reverse=True)
+    for _, side, first, second, depth_start, depth_end in bones_plan:
+        _paint_bone(
+            image,
+            first,
+            second,
+            colors[side],
+            style,
+            depth_start,
+            depth_end,
+            shade=shade,
+            alpha=True,
+            z_ref=z_refs[side],
+            near=scale_near,
+            far=scale_far,
+            gamma=gamma,
+        )
+    points_plan: list[tuple[float, str, str]] = []
+    for side in ("left", "right"):
+        for joint in names:
+            if hands[side][joint].visible:
+                points_plan.append((_depth_sort_key(hand_depths[side][joint]), side, joint))
+    points_plan.sort(key=lambda item: item[0], reverse=True)
+    for _, side, joint in points_plan:
+        _paint_point(
+            image,
+            hands[side][joint],
+            colors[side],
+            style,
+            hand_depths[side][joint],
+            shade=shade,
+            alpha=True,
+            z_ref=z_refs[side],
+            near=scale_near,
+            far=scale_far,
+            gamma=gamma,
+        )
+    return len(points_plan)
 
 
 def _trail_window(seconds: float, step_s: float) -> int:
@@ -516,13 +2053,87 @@ def _blend_line(
         thickness,
         cv2.LINE_AA,
     )
+    return _blend_mask(image, mask, left, top, color, alpha)
+
+
+def _blend_mask(
+    image: Any,
+    mask: Any,
+    left: int,
+    top: int,
+    color: tuple[int, int, int],
+    alpha: float,
+) -> bool:
+    """Смешать пиксели кадра с ``color`` по маске в позиции ``(left, top)`` (08b, 08g-fix2).
+
+    Общая часть :func:`_blend_line` и :func:`_blend_point`: OpenCV не умеет alpha в
+    примитивах, поэтому сначала примитив рисуется в одноканальную маску, а затем кадр
+    смешивается с цветом только там, где маска ненулевая. Иначе вокруг линии или круга лёг
+    бы полупрозрачный тёмный прямоугольник (ловушка из NOTES 08b). Возврат — было ли что
+    рисовать (маска не пуста).
+    """
+    import numpy as np  # noqa: PLC0415
+
+    if mask is None or getattr(mask, "ndim", 0) != 2:
+        raise ValueError("mask: ожидалась одноканальная маска")
     if not mask.any():
         return False
     weight = (mask.astype(np.float32) * (alpha / 255.0))[..., None]
-    roi = image[top:bottom, left:right]
+    height, width = mask.shape[:2]
+    roi = image[top : top + height, left : left + width]
     blended = roi.astype(np.float32) * (1.0 - weight) + np.asarray(color, np.float32) * weight
     roi[:] = np.rint(blended).astype(np.uint8)
     return True
+
+
+def _blend_point(
+    image: Any,
+    center: tuple[int, int],
+    radius: int,
+    color: tuple[int, int, int],
+    alpha: float,
+) -> bool:
+    """Круг с прозрачностью ``alpha``, только по своей маске (возврат — нарисован ли).
+
+    Аналог :func:`_blend_line` для точки сустава (08g-fix2): ``cv2.circle`` не умеет alpha,
+    поэтому круг кладётся в маску размером со свой bbox, и кадр смешивается с цветом только
+    там, где маска ненулевая — иначе вокруг точки появилось бы полупрозрачное тёмное пятно
+    на пёстром фоне. Антиалиасинг края сохраняется (``cv2.LINE_AA`` в маске).
+    """
+    import cv2  # noqa: PLC0415
+    import numpy as np  # noqa: PLC0415
+
+    if isinstance(center, bool) or not isinstance(center, tuple) or len(center) != 2:
+        raise ValueError(f"center: ожидалась пара (x, y), получено {center!r}")
+    for value in center:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"center: ожидались целые координаты, получено {center!r}")
+    if isinstance(radius, bool) or not isinstance(radius, int) or radius < 1:
+        raise ValueError(f"radius: ожидалось целое ≥ 1, получено {radius!r}")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise ValueError(f"alpha: ожидалось число, получено {alpha!r}")
+    if not 0.0 < alpha <= 1.0:
+        raise ValueError(f"alpha: должно быть в (0, 1], получено {alpha!r}")
+
+    height, width = image.shape[:2]
+    pad = radius + 2
+    left = max(0, center[0] - pad)
+    top = max(0, center[1] - pad)
+    right = min(width, center[0] + pad)
+    bottom = min(height, center[1] + pad)
+    if right <= left or bottom <= top:
+        return False  # точка целиком вне кадра
+
+    mask = np.zeros((bottom - top, right - left), np.uint8)
+    cv2.circle(
+        mask,
+        (center[0] - left, center[1] - top),
+        radius,
+        255,
+        -1,
+        cv2.LINE_AA,
+    )
+    return _blend_mask(image, mask, left, top, color, alpha)
 
 
 def draw_trail(
@@ -618,8 +2229,15 @@ def hud_items(
     frame_count: int,
     *,
     trail_seconds: float | None = TRAIL_SECONDS,
+    forearm: Mapping[str, bool] | None = None,
 ) -> list[tuple[str, tuple[int, int, int]]]:
-    """Строки HUD: время, кадр, состояние рук, след. Подписи латиницей (см. модуль)."""
+    """Строки HUD: время, кадр, состояние рук, след. Подписи латиницей (см. модуль).
+
+    ``forearm`` (08h) — состояние ребра-оценки на кадре: ``side → True`` для ``IK``
+    (ребро нарисовано) и ``False`` для ``n/a`` (локоть невалиден или длина вне диапазона).
+    ``None`` — режим без предплечья: строки рук остаются ровно прежними (кадр 08g-fix4
+    побайтово), поэтому маркер не появляется, когда флаг ``--forearm`` выключен.
+    """
     if not isinstance(moment, sync.FrameTime):
         raise ValueError(f"moment: ожидался sync.FrameTime, получено {type(moment).__name__}")
     if not isinstance(pose, sync.Pose):
@@ -628,10 +2246,20 @@ def hud_items(
         raise ValueError(f"frame_count: ожидалось целое > 0, получено {frame_count!r}")
     if not 0 <= moment.index < frame_count:
         raise ValueError(f"кадр {moment.index} вне 0…{frame_count - 1}")
+    if forearm is not None:
+        if not isinstance(forearm, Mapping):
+            raise ValueError(f"forearm: ожидался Mapping side → bool, получено {forearm!r}")
+        for side in ("left", "right"):
+            if side not in forearm:
+                raise ValueError(f"forearm: нет состояния руки {side!r}")
+            if not isinstance(forearm[side], bool):
+                raise ValueError(f"forearm[{side!r}]: ожидалось bool, получено {forearm[side]!r}")
 
     def hand_row(side: str) -> tuple[str, tuple[int, int, int]]:
         active = pose.active.get(side)
         text = f"{side}: {'OK' if active else 'NO DATA'}"
+        if forearm is not None:
+            text += f" | forearm: {'IK' if forearm[side] else 'n/a'}"
         return text, HUD_TEXT_COLOR if active else HUD_WARNING_COLOR
 
     rows = [
@@ -658,11 +2286,13 @@ def draw_hud(
     frame_count: int,
     *,
     trail_seconds: float | None = TRAIL_SECONDS,
+    forearm: Mapping[str, bool] | None = None,
 ) -> tuple[int, int, int, int]:
     """Нарисовать HUD (in place) и вернуть его прямоугольник.
 
     Панель полупрозрачная и стоит в левом верхнем углу; текст проверяется на вписывание в
-    панель до отрисовки, чтобы длинная строка не вылезала за её край.
+    панель до отрисовки, чтобы длинная строка не вылезала за её край. ``forearm`` (08h) —
+    маркер ``IK``/``n/a`` в строках рук; ``None`` — прежние строки без маркера.
     """
     import cv2  # noqa: PLC0415
     import numpy as np  # noqa: PLC0415
@@ -676,7 +2306,7 @@ def draw_hud(
     thickness = max(1, int(round(factor)))
     step = int(round(HUD_LINE_STEP_PX * factor))
     pad = int(round(HUD_PADDING_PX * factor))
-    rows = hud_items(moment, pose, frame_count, trail_seconds=trail_seconds)
+    rows = hud_items(moment, pose, frame_count, trail_seconds=trail_seconds, forearm=forearm)
 
     if pad * 2 + len(rows) * step > y1 - y0:
         raise ValueError(f"HUD: {len(rows)} строк не влезают в панель {x1 - x0}×{y1 - y0}")
@@ -723,9 +2353,86 @@ def _eye_view(image: Any, scene: Scene) -> Any:
     return image[:eye_height, :eye_width].copy()
 
 
-def _draw_pose(image: Any, pose: sync.Pose, scene: Scene, style: Style) -> int:
-    """Спроецировать кисти кадра и нарисовать их на уже обрезанном кадре глаза."""
-    return draw_skeleton(image, project_hands(pose, scene.intrinsics), style)
+@dataclass(frozen=True)
+class PoseDraw:
+    """Что нарисовано на кадре: суставы скелета и счётчики рёбер-оценок (08h)."""
+
+    joints: int
+    forearm_drawn: int = 0
+    forearm_skipped: int = 0
+    forearm_out_of_range: int = 0
+
+
+def _draw_pose(
+    image: Any,
+    pose: sync.Pose,
+    scene: Scene,
+    style: Style,
+    skeleton: Skeleton = FIVE_POINT,
+    *,
+    depth_shading: bool = False,
+    depth_alpha: bool = False,
+    depth_relative: bool = False,
+    depth_gamma: float = 1.0,
+    forearms: Mapping[str, Forearm] | None = None,
+) -> PoseDraw:
+    """Спроецировать скелет кадра и нарисовать его на уже обрезанном кадре глаза.
+
+    ``depth_shading`` (08g) — красить ли по глубине: тогда вместе с пикселями считается
+    ``z`` в системе камеры (:func:`project_skeleton_depth`), и цвет кости/точки гаснет с
+    расстоянием. По умолчанию выключено: кадр 08a воспроизводится без изменений.
+
+    ``depth_alpha`` (08g-fix2) — прозрачность по глубине (только вместе с ``depth_shading``:
+    без глубин её не из чего считать). Порядок отрисовки в этом режиме — от дальних костей и
+    точек к ближним, см. :func:`draw_skeleton`.
+
+    ``depth_relative`` (08g-fix3) — относительная шкала: каждая рука отсчитывает глубину от
+    своего ближайшего видимого сустава (только вместе с ``depth_shading``), см.
+    :func:`draw_skeleton`. Без яркости флаг игнорируется: платить за проекцию глубин незачем.
+
+    ``depth_gamma`` (08g-fix4) — степень нелинейной шкалы (только вместе с ``depth_shading``),
+    см. :func:`draw_skeleton`; 1.0 — прежняя линейная шкала 08g-fix3.
+
+    ``forearms`` (08h) — рёбра ``elbow → wrist`` обеих рук (:func:`project_forearms`).
+    ``None`` — режим без предплечья (кадр побайтово прежний). Иначе рёбра-оценки рисуются
+    **до** скелета кисти плоским цветом руки (без глубины, alpha и сортировки): измеренные
+    точки и кости ложатся поверх, ребро всегда под кистью. Возврат — :class:`PoseDraw`:
+    число суставов (как раньше) и счётчики рёбер.
+    """
+    if depth_shading:
+        pixels, depths = project_skeleton_depth(
+            pose, scene.intrinsics, skeleton, track=scene.track
+        )
+    else:
+        pixels, depths = project_skeleton(
+            pose, scene.intrinsics, skeleton, track=scene.track
+        ), None
+    forearm_counts = (0, 0, 0)
+    if forearms is not None:
+        forearm_counts = draw_forearms(image, forearms, style)
+    draw_style = style
+    if depth_shading and skeleton.name != FLAT_SKELETON.name:
+        # градиент вдоль кости виден только на линии потолще; 5-точечный кадр 08a не трогаем
+        target = max(1, int(round(DEPTH_LINE_THICKNESS_PX * scene.eye_size[0] / REFERENCE_WIDTH)))
+        if target > style.line_thickness:
+            draw_style = Style(point_radius=style.point_radius, line_thickness=target)
+    joints = draw_skeleton(
+        image,
+        pixels,
+        draw_style,
+        joints=skeleton.joints,
+        bones=skeleton.bones,
+        depths=depths,
+        alpha=depth_shading and depth_alpha,
+        relative=depth_shading and depth_relative,
+        gamma=depth_gamma if depth_shading else 1.0,
+    )
+    return PoseDraw(
+        joints=joints,
+        forearm_drawn=forearm_counts[0],
+        forearm_skipped=forearm_counts[1],
+        forearm_out_of_range=forearm_counts[2],
+    )
 
 
 def _codec_name(path: Path) -> str:
@@ -802,6 +2509,34 @@ class RenderStats:
     trail_segments: int = 0
     #: 08b: рисовался ли HUD.
     hud: bool = True
+    #: 08f: имя скелета (``five``/``dense``/``all``) и число суставов на руку в нём.
+    skeleton: str = "five"
+    joints_per_hand: int = 5
+    #: 08g: красился ли скелет по глубине (множитель к цвету руки).
+    depth_shading: bool = False
+    #: 08g-fix2: включалась ли прозрачность по глубине (второй канал, сортировка по z).
+    depth_alpha: bool = False
+    #: 08g-fix3: была ли шкала глубины относительной (z_ref своей руки на кадр).
+    depth_relative: bool = False
+    #: 08g-fix4: степень нелинейной шкалы (1.0 — линейная, 08g-fix3 побайтово).
+    depth_gamma: float = 1.0
+    #: 08h: рисовались ли рёбра-оценки предплечья и сколько их нарисовано/пропущено.
+    forearm: bool = False
+    forearm_drawn: int = 0
+    forearm_skipped: int = 0
+    #: 08h: из пропущенных — сколько именно из-за длины вне 0.15…0.40 м («улетевший» локоть).
+    forearm_out_of_range: int = 0
+
+    @property
+    def forearm_total(self) -> int:
+        """Сколько рёбер-оценок обработано (нарисовано + пропущено)."""
+        return self.forearm_drawn + self.forearm_skipped
+
+    @property
+    def forearm_drawn_share(self) -> float:
+        """Доля нарисованных рёбер среди обработанных (0…1); 0, если рёбер не было."""
+        total = self.forearm_total
+        return self.forearm_drawn / total if total else 0.0
 
     @property
     def frames(self) -> int:
@@ -852,6 +2587,12 @@ def render_video(
     trail: bool = True,
     hud: bool = True,
     trail_seconds: float = TRAIL_SECONDS,
+    skeleton: Skeleton = FIVE_POINT,
+    depth_shading: bool | None = None,
+    depth_alpha: bool | None = None,
+    depth_relative: bool | None = None,
+    depth_gamma: float | None = None,
+    forearm: bool = False,
     log: Callable[[str], None] = print,
 ) -> RenderStats:
     """Отрендерить диапазон кадров ``start…end`` в ``out`` и вернуть :class:`RenderStats`.
@@ -863,6 +2604,32 @@ def render_video(
     ``trail``/``hud`` — элементы 08b (след и панель состояния); ``trail_seconds`` — окно
     следа в секундах (выборка по времени, не по кадрам). Порядок отрисовки: след под
     скелетом, HUD поверх всего — так подписи остаются читаемыми.
+
+    ``skeleton`` (08f) — какой скелет рисовать: по умолчанию прежний 5-точечный (08a);
+    CLI передаёт :data:`DENSE` или :data:`ALL_JOINTS`. Для густого скелета сцена должна
+    быть загружена с ``extra_keys=skeleton.extra_keys`` — иначе ``ValueError`` до записи.
+
+    ``depth_shading`` (08g) — кодировать ли глубину цветом: ``None`` — авторежим
+    (:func:`resolve_depth_shading`: да для густого скелета, нет для 5-точечного 08a),
+    ``True``/``False`` — принудительно.
+
+    ``depth_alpha`` (08g-fix2) — прозрачность по глубине (второй канал): авторежим
+    (:func:`resolve_depth_alpha`) включается вместе с яркостью для густого скелета и
+    ``--all-joints``; без ``depth_shading`` не включается, потому что глубины не считаются.
+    Явное ``False`` — «только яркость», кадр 08g-fix.
+
+    ``depth_relative`` (08g-fix3) — относительная шкала глубины: авторежим
+    (:func:`resolve_depth_relative`) включается вместе с яркостью для густого скелета и
+    ``--all-joints``; без ``depth_shading`` не включается. Явное ``False`` — абсолютная шкала
+    08g-fix2.
+
+    ``depth_gamma`` (08g-fix4) — степень нелинейной шкалы: ``None`` — авторежим
+    (:func:`resolve_depth_gamma`: 0.7 для густого/26, 1.0 для 5 точек), ``1.0`` — линейная
+    шкала 08g-fix3 побайтово, 0 < γ < 1 — нелинейная. Без ``depth_shading`` не действует.
+
+    ``forearm`` (08h) — рисовать ли ребро-оценку ``elbow → wrist`` (по умолчанию выключено,
+    поэтому прежний кадр воспроизводится побайтово). Для него сцена должна быть загружена с
+    ``extra_keys``, включающими :data:`FOREARM_KEYS`; иначе ``ValueError`` до записи.
     """
     import cv2  # noqa: PLC0415
 
@@ -870,9 +2637,22 @@ def render_video(
         raise ValueError(f"progress_every: ожидалось целое число, получено {progress_every!r}")
     if progress_every < 0:
         raise ValueError(f"progress_every: должно быть ≥ 0, получено {progress_every!r}")
-    for name, value in (("trail", trail), ("hud", hud)):
+    for name, value in (("trail", trail), ("hud", hud), ("forearm", forearm)):
         if not isinstance(value, bool):
             raise ValueError(f"{name}: ожидалось bool, получено {value!r}")
+    _require_skeleton_track(scene.track, skeleton)
+    if forearm:
+        _require_forearm_track(scene.track)
+    shading = resolve_depth_shading(depth_shading, skeleton)
+    transparency = shading and resolve_depth_alpha(depth_alpha, skeleton)
+    relative = shading and resolve_depth_relative(depth_relative, skeleton)
+    # 08g-fix4: авто-γ — только для относительной шкалы; абсолютная остаётся линейной
+    # (08g-fix/08g-fix2 побайтово), явное значение γ действует и на абсолютную
+    gamma = (
+        resolve_depth_gamma(depth_gamma, skeleton)
+        if shading and (relative or depth_gamma is not None)
+        else 1.0
+    )
     if trail:
         _trail_window(trail_seconds, TRAIL_STEP_S)  # проверка окна до открытия файлов
     video = Path(video)
@@ -898,6 +2678,9 @@ def render_video(
         joints = 0
         trail_segments = 0
         after_tracking = 0
+        forearm_drawn = 0
+        forearm_skipped = 0
+        forearm_out_of_range = 0
         completed = False
         try:
             for k in range(first, last + 1):
@@ -911,7 +2694,25 @@ def render_video(
                     trail_segments += draw_trail(
                         view, pose, scene.track, scene.intrinsics, style, seconds=trail_seconds
                     )
-                joints += _draw_pose(view, pose, scene, style)
+                forearms = (
+                    project_forearms(pose, scene.intrinsics, scene.track) if forearm else None
+                )
+                drawn_pose = _draw_pose(
+                    view,
+                    pose,
+                    scene,
+                    style,
+                    skeleton,
+                    depth_shading=shading,
+                    depth_alpha=transparency,
+                    depth_relative=relative,
+                    depth_gamma=gamma,
+                    forearms=forearms,
+                )
+                joints += drawn_pose.joints
+                forearm_drawn += drawn_pose.forearm_drawn
+                forearm_skipped += drawn_pose.forearm_skipped
+                forearm_out_of_range += drawn_pose.forearm_out_of_range
                 if hud:
                     draw_hud(
                         view,
@@ -919,6 +2720,11 @@ def render_video(
                         pose,
                         scene.frame_count,
                         trail_seconds=trail_seconds if trail else None,
+                        forearm=(
+                            {side: item.drawable for side, item in forearms.items()}
+                            if forearms is not None
+                            else None
+                        ),
                     )
                 if not moment.in_tracking:
                     after_tracking += 1
@@ -960,6 +2766,16 @@ def render_video(
         trail_seconds=float(trail_seconds) if trail else 0.0,
         trail_segments=trail_segments,
         hud=hud,
+        skeleton=skeleton.name,
+        joints_per_hand=len(skeleton.joints),
+        depth_shading=shading,
+        depth_alpha=transparency,
+        depth_relative=relative,
+        depth_gamma=gamma,
+        forearm=forearm,
+        forearm_drawn=forearm_drawn,
+        forearm_skipped=forearm_skipped,
+        forearm_out_of_range=forearm_out_of_range,
     )
 
 
@@ -973,6 +2789,12 @@ def render_stills(
     trail: bool = True,
     hud: bool = True,
     trail_seconds: float = TRAIL_SECONDS,
+    skeleton: Skeleton = FIVE_POINT,
+    depth_shading: bool | None = None,
+    depth_alpha: bool | None = None,
+    depth_relative: bool | None = None,
+    depth_gamma: float | None = None,
+    forearm: bool = False,
     log: Callable[[str], None] = print,
 ) -> list[Path]:
     """Сохранить PNG-кадры с наложением (по умолчанию 5 отладочных кадров 07a).
@@ -982,15 +2804,40 @@ def render_stills(
     ``.gitignore``), поэтому коммитится не он, а выводы о проверке.
 
     ``trail``/``hud`` — как у :func:`render_video`: ``--no-trail --no-hud`` даёт кадр «как в
-    08a», он идёт в сравнение «до/после» (``docs/overlay.md``).
+    08a», он идёт в сравнение «до/после» (``docs/overlay.md``). ``skeleton`` — как у
+    :func:`render_video`: по умолчанию 5 точек, CLI передаёт густой скелет.
+    ``depth_shading`` (08g) — как у :func:`render_video`: ``None`` — авторежим (да для густого
+    скелета, нет для 5-точечного 08a), ``True``/``False`` — принудительно; на PNG это
+    видно без кодирования видео, поэтому «до/после» снимается именно ``--stills``.
+    ``depth_alpha`` (08g-fix2) — как у :func:`render_video`: прозрачность по глубине
+    (авторежим как у яркости, без яркости не включается).
+    ``depth_relative`` (08g-fix3) — как у :func:`render_video`: относительная шкала от
+    ближайшего сустава каждой руки (авторежим как у яркости).
+
+    ``depth_gamma`` (08g-fix4) — как у :func:`render_video`: степень нелинейной шкалы
+    (авторежим 0.7 для густого/26, 1.0 для 5 точек; явное значение — из ``--depth-gamma``).
+    ``forearm`` (08h) — рисовать ли ребро-оценку предплечья; по умолчанию выключено.
     """
     import cv2  # noqa: PLC0415
 
     video = Path(video)
     if not video.is_file():
         raise FileNotFoundError(f"нет видео: {video}")
+    if not isinstance(forearm, bool):
+        raise ValueError(f"forearm: ожидалось bool, получено {forearm!r}")
     indices = sorted(set(frames))
     style = style_for(scene.eye_size[0], scale)
+    _require_skeleton_track(scene.track, skeleton)
+    if forearm:
+        _require_forearm_track(scene.track)
+    shading = resolve_depth_shading(depth_shading, skeleton)
+    transparency = shading and resolve_depth_alpha(depth_alpha, skeleton)
+    relative = shading and resolve_depth_relative(depth_relative, skeleton)
+    gamma = (
+        resolve_depth_gamma(depth_gamma, skeleton)
+        if shading and (relative or depth_gamma is not None)
+        else 1.0
+    )
     if trail:
         _trail_window(trail_seconds, TRAIL_STEP_S)
     out = Path(out_dir)
@@ -1015,7 +2862,22 @@ def render_stills(
                 segments = draw_trail(
                     view, pose, scene.track, scene.intrinsics, style, seconds=trail_seconds
                 )
-            drawn = _draw_pose(view, pose, scene, style)
+            forearms = (
+                project_forearms(pose, scene.intrinsics, scene.track) if forearm else None
+            )
+            drawn_pose = _draw_pose(
+                view,
+                pose,
+                scene,
+                style,
+                skeleton,
+                depth_shading=shading,
+                depth_alpha=transparency,
+                depth_relative=relative,
+                depth_gamma=gamma,
+                forearms=forearms,
+            )
+            drawn = drawn_pose.joints
             if hud:
                 draw_hud(
                     view,
@@ -1023,6 +2885,11 @@ def render_stills(
                     pose,
                     scene.frame_count,
                     trail_seconds=trail_seconds if trail else None,
+                    forearm=(
+                        {side: item.drawable for side, item in forearms.items()}
+                        if forearms is not None
+                        else None
+                    ),
                 )
             if not moment.in_tracking:
                 log(f"  кадр {k:5d}: трекинга уже нет — поза заморожена (по 04a)")
@@ -1031,8 +2898,15 @@ def render_stills(
                 raise ValueError(f"не удалось записать {path}")
             written.append(path)
             trail_note = f", сегментов следа {segments}" if trail else ""
+            forearm_note = (
+                f", рёбер предплечья {drawn_pose.forearm_drawn} (пропущено "
+                f"{drawn_pose.forearm_skipped})"
+                if forearms is not None
+                else ""
+            )
             log(
-                f"  кадр {k:5d} (t = {moment.t_rel_s:9.3f} с): точек {drawn}/10{trail_note} → {path}"
+                f"  кадр {k:5d} (t = {moment.t_rel_s:9.3f} с): точек "
+                f"{drawn}/{2 * len(skeleton.joints)}{trail_note}{forearm_note} → {path}"
             )
     finally:
         capture.release()
@@ -1048,12 +2922,47 @@ def _format_stats(stats: RenderStats) -> str:
         if stats.trail_seconds > 0
         else f"след выключен; HUD: {'да' if stats.hud else 'нет'}"
     )
+    if stats.depth_shading:
+        if stats.depth_relative:
+            near, far = relative_depth_window(stats.depth_gamma)
+            shading_line = (
+                f"яркость: относительная (z_ref — ближайший сустав руки), ширина окна "
+                f"{near:g}…{far:g} м, γ {stats.depth_gamma:g}, множитель "
+                f"{DEPTH_MIN_FACTOR:g}…1.0"
+            )
+        else:
+            shading_line = (
+                f"яркость: абсолютная, окно {DEPTH_NEAR_M:g}…{DEPTH_FAR_M:g} м, множитель "
+                f"{DEPTH_MIN_FACTOR:g}…1.0"
+            )
+            if stats.depth_gamma != 1.0:
+                shading_line += f", γ {stats.depth_gamma:g}"
+        if stats.depth_alpha:
+            shading_line += (
+                f"; alpha: {DEPTH_MIN_ALPHA:g}…1.0, дальние раньше ближних"
+            )
+        else:
+            shading_line += "; только яркость, без alpha (кадр 08g-fix)"
+    else:
+        shading_line = "нет (плоские цвета рук)"
+    if stats.forearm:
+        forearm_line = (
+            f"да (базовый цвет руки, толщина {FOREARM_LINE_THICKNESS_PX} px, "
+            f"0.15…0.40 м): нарисовано {stats.forearm_drawn}, пропущено "
+            f"{stats.forearm_skipped} (из них длина вне диапазона "
+            f"{stats.forearm_out_of_range})"
+        )
+    else:
+        forearm_line = "нет (по умолчанию; флаг --forearm)"
     lines = [
         f"записано: {stats.out}",
         f"  кадры: {stats.first_frame}…{stats.last_frame} ({stats.frames}), "
         f"{stats.size[0]}×{stats.size[1]}, {stats.fps:.4f} fps → {stats.duration_s:.3f} с",
         f"  кодек: {stats.codec}; файл {megabytes:.1f} МиБ; "
         f"поправка времени {stats.time_offset_ms:+.0f} мс",
+        f"  скелет: {stats.skeleton} ({stats.joints_per_hand} суставов на руку)",
+        f"  глубина → цвет: {shading_line}",
+        f"  предплечье (оценка): {forearm_line}",
         f"  рендер: {stats.elapsed_s:.1f} с, {stats.frames_per_s:.1f} кадр/с "
         f"(видимых суставов {stats.joints_drawn})",
         f"  {trail}",
@@ -1065,7 +2974,7 @@ def _format_stats(stats: RenderStats) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI: полный рендер, фрагмент (``--start/--end``) или PNG-проверка (``--stills``)."""
     parser = argparse.ArgumentParser(
-        description="Рендер видео с наложением скелета кистей, следа и HUD (задачи 08a/08b)."
+        description="Рендер видео с наложением скелета кистей, следа и HUD (08a/08b/08f)."
     )
     parser.add_argument("video", type=Path, help="data/CameraRecord_*.mp4 (полный SBS-кадр)")
     parser.add_argument(
@@ -1102,10 +3011,136 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="не рисовать HUD (панель времени/кадра/состояния рук)")
     parser.add_argument("--trail-seconds", type=float, default=TRAIL_SECONDS,
                         help=f"окно следа в секундах (по умолчанию {TRAIL_SECONDS:g})")
+    skeleton_group = parser.add_mutually_exclusive_group()
+    skeleton_group.add_argument(
+        "--all-joints",
+        action="store_true",
+        help="рисовать все 26 суставов OpenXR на руку (по умолчанию густой скелет из 17)",
+    )
+    skeleton_group.add_argument(
+        "--five-points",
+        action="store_true",
+        help="рисовать прежний 5-точечный скелет 08a (для сравнений «до/после»)",
+    )
+    depth_group = parser.add_mutually_exclusive_group()
+    depth_group.add_argument(
+        "--depth-color",
+        dest="depth_shading",
+        action="store_true",
+        default=None,
+        help="кодировать глубину цветом принудительно (по умолчанию — для густого скелета)",
+    )
+    depth_group.add_argument(
+        "--no-depth-color",
+        dest="depth_shading",
+        action="store_false",
+        default=None,
+        help="плоские цвета рук, как в 08f (кадр 5 точек 08a воспроизводится без изменений)",
+    )
+    alpha_group = parser.add_mutually_exclusive_group()
+    alpha_group.add_argument(
+        "--depth-alpha",
+        dest="depth_alpha",
+        action="store_true",
+        default=None,
+        help="прозрачность по глубине принудительно (по умолчанию — для густого скелета)",
+    )
+    alpha_group.add_argument(
+        "--no-depth-alpha",
+        dest="depth_alpha",
+        action="store_false",
+        default=None,
+        help="только яркость, без прозрачности (кадр 08g-fix; без --depth-relative — абсолютная)",
+    )
+    relative_group = parser.add_mutually_exclusive_group()
+    relative_group.add_argument(
+        "--depth-relative",
+        dest="depth_relative",
+        action="store_true",
+        default=None,
+        help="глубина от ближайшего сустава каждой руки (по умолчанию — для густого скелета)",
+    )
+    relative_group.add_argument(
+        "--no-depth-relative",
+        dest="depth_relative",
+        action="store_false",
+        default=None,
+        help="абсолютная шкала 0.22…0.48 м, как в 08g-fix2",
+    )
+    gamma_group = parser.add_mutually_exclusive_group()
+    gamma_group.add_argument(
+        "--depth-gamma",
+        dest="depth_gamma",
+        type=float,
+        default=None,
+        metavar="G",
+        help=f"степень нелинейной шкалы 0 < G ≤ {DEPTH_GAMMA_MAX:g} "
+        f"(по умолчанию {DEPTH_GAMMA:g} для густого/26, 1.0 для 5 точек)",
+    )
+    gamma_group.add_argument(
+        "--no-depth-gamma",
+        dest="depth_gamma",
+        action="store_const",
+        const=1.0,
+        help="γ = 1.0: линейная шкала 08g-fix3 (побайтово), окно 0.155 м",
+    )
+    forearm_group = parser.add_mutually_exclusive_group()
+    forearm_group.add_argument(
+        "--forearm",
+        dest="forearm",
+        action="store_true",
+        default=False,
+        help="дорисовать ребро-оценку «локоть (Body) → запястье (Hand)»; по умолчанию выключено",
+    )
+    forearm_group.add_argument(
+        "--no-forearm",
+        dest="forearm",
+        action="store_false",
+        help="не рисовать предплечье (кадр по умолчанию, побайтово прежний)",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     try:
-        scene = load_scene(args.meta, args.tracking)
+        skeleton = (
+            ALL_JOINTS if args.all_joints
+            else FIVE_POINT if args.five_points
+            else DEFAULT_SKELETON
+        )
+        forearm = bool(args.forearm)
+        depth_shading = resolve_depth_shading(args.depth_shading, skeleton)
+        if args.depth_alpha is True and args.depth_shading is not False:
+            # alpha считается из глубин: явный --depth-alpha включает и яркость (кроме
+            # --no-depth-color, который отключает всё разом)
+            depth_shading = True
+        if args.depth_relative is True and args.depth_shading is not False:
+            # --depth-relative тоже требует проекции глубин и включает яркость, если её выключили
+            depth_shading = True
+        if (
+            args.depth_gamma is not None
+            and args.depth_gamma != 1.0
+            and args.depth_shading is not False
+        ):
+            # явная нелинейная γ требует глубин: включает яркость, если её выключили
+            depth_shading = True
+        if args.depth_gamma is not None:
+            _check_gamma(args.depth_gamma)  # ошибка видна даже при выключенной яркости
+        depth_alpha = depth_shading and resolve_depth_alpha(args.depth_alpha, skeleton)
+        depth_relative = depth_shading and resolve_depth_relative(args.depth_relative, skeleton)
+        if args.depth_relative is None and args.depth_alpha is False:
+            # 08g-fix3: --no-depth-alpha без явного --depth-relative воспроизводит 08g-fix —
+            # абсолютную яркость без прозрачности (согласовано с пользователем)
+            depth_relative = False
+        depth_gamma = (
+            resolve_depth_gamma(args.depth_gamma, skeleton)
+            if depth_shading and (depth_relative or args.depth_gamma is not None)
+            else 1.0
+        )
+    except ValueError as exc:
+        print(f"ошибка: {exc}", file=sys.stderr)
+        return 1
+    try:
+        extra_keys = tuple(skeleton.extra_keys) + (FOREARM_KEYS if forearm else ())
+        scene = load_scene(args.meta, args.tracking, extra_keys=extra_keys)
         if args.time_offset_ms is not None:
             scene = replace(
                 scene,
@@ -1121,6 +3156,45 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"+{(scene.tracking_end_ns - scene.header_ns) / 1e9:.3f} с от header; "
             f"поправка времени {scene.time_offset_ns / 1e6:+.0f} мс"
         )
+        print(
+            f"скелет: {skeleton.name} — {skeleton.title}, "
+            f"рёбер {len(skeleton.bones)} на руку (--all-joints — 26 суставов, "
+            f"--five-points — 5 точек)"
+        )
+        print(
+            f"глубина → цвет: {'да' if depth_shading else 'нет'}"
+            + (
+                (
+                    f" (относительная: z_ref — ближайший сустав руки, ширина окна "
+                    f"{relative_depth_window(depth_gamma)[0]:g}…"
+                    f"{relative_depth_window(depth_gamma)[1]:g} м, γ {depth_gamma:g}, "
+                    f"множитель {DEPTH_MIN_FACTOR:g}…1.0)"
+                    if depth_relative
+                    else (
+                        f" (абсолютная: окно {DEPTH_NEAR_M:g}…{DEPTH_FAR_M:g} м, множитель "
+                        f"{DEPTH_MIN_FACTOR:g}…1.0"
+                        + (f", γ {depth_gamma:g}" if depth_gamma != 1.0 else "")
+                        + ")"
+                    )
+                )
+                if depth_shading
+                else ""
+            )
+        )
+        print(
+            f"глубина → alpha: {'да' if depth_alpha else 'нет'}"
+            + (f" (пол {DEPTH_MIN_ALPHA:g}, дальние раньше ближних)" if depth_alpha else "")
+        )
+        print(
+            "предплечье (оценка): "
+            + (
+                f"да — Body.joints[18/19] → Hand.wrist, базовый цвет руки, "
+                f"толщина {FOREARM_LINE_THICKNESS_PX} px, ребро только при длине "
+                f"{FOREARM_MIN_LENGTH_M:g}…{FOREARM_MAX_LENGTH_M:g} м"
+                if forearm
+                else "нет (по умолчанию; включить — --forearm)"
+            )
+        )
         trail = not args.no_trail
         hud = not args.no_hud
         if args.stills is not None:
@@ -1133,6 +3207,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 trail=trail,
                 hud=hud,
                 trail_seconds=args.trail_seconds,
+                skeleton=skeleton,
+                depth_shading=depth_shading,
+                depth_alpha=depth_alpha,
+                depth_relative=depth_relative,
+                depth_gamma=depth_gamma,
+                forearm=forearm,
             )
             print(f"PNG с наложением: {len(paths)} файлов в {args.stills}")
             return 0
@@ -1149,6 +3229,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             trail=trail,
             hud=hud,
             trail_seconds=args.trail_seconds,
+            skeleton=skeleton,
+            depth_shading=depth_shading,
+            depth_alpha=depth_alpha,
+            depth_relative=depth_relative,
+            depth_gamma=depth_gamma,
+            forearm=forearm,
         )
     except (OSError, ValueError) as exc:
         print(f"ошибка: {exc}", file=sys.stderr)
