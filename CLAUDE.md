@@ -72,7 +72,23 @@ bbox) и `_blend_bone_gradient` (смешивание всей кости оди
 `--no-depth-alpha` = 08g-fix; побайтово: `--no-depth-color` и 5-точечный кадр = `VTR-08f`,
 `--no-depth-alpha` = `VTR-08g-fix` (sha256 5/5); метрики 07a **40/40**, 0 px, кости **10/48,
 60.9 px**, drift **34.6 px**; тесты **602/602**; 10-с рендер с alpha — 301 кадр, 3.9 МиБ, 4.0 с.
-Осталось `todo`: 10a–10c, 11, 12; мерж **08d → 08e → 08f → 08g → 08g-fix → 08g-fix2** —
+**08g-fix3 — `in_review`** (ветка `VTR-08g-fix3`, от `VTR-08g-fix2`): шкала глубины стала
+**относительной** — у каждой руки своя опорная точка `z_ref` (ближайший видимый сустав,
+`depth_reference`), глубина считается как `relative_depth(z, z_ref) = z − z_ref`, окно —
+ширина `near = 0`…`DEPTH_RELATIVE_FAR_M = 0.155` м: ближняя кость руки всегда 1.0, дальняя
+приглушается по разбросу внутри руки, а не по расстоянию до шлема. Замер разброса по 14 507
+парам «кадр × рука» на всех 7279 кадрах: p50 0.103 / p90 0.129 / p99 0.148 / max 0.167 м;
+0.155 выбрано компромиссом (p50 1.87×, все 5 кадров 07a ≥1.83×, p99 внутри окна; 0.16 давал
+1.78 на k = 7200). Контраст активной правой руки в относительном режиме — яркость **2.53 /
+2.15 / 2.28 / 1.94 / 1.83**, alpha **1.91 / 1.72 / 1.79 / 1.62 / 1.55**, на k = 4285 —
+**2.76 / 2.00** (было 1.00/1.00); флаги `--depth-relative`/`--no-depth-relative`,
+`RenderStats.depth_relative`; `--no-depth-relative` = `VTR-08g-fix2` (sha256 5/5),
+`--no-depth-alpha` = абсолютная яркость `VTR-08g-fix` (5/5), `--depth-relative
+--no-depth-alpha` — относительная яркость без alpha; сглаживание `z_ref` не вводилось (шаг
+≤ 0.013 м/кадр на 10-с окне); метрики **40/40**, 0 px, кости **10/48, 60.9 px**, drift
+**34.6 px**; тесты **628/628**; 10-с рендер `output/overlay_10s_relative.mp4` — 301 кадр,
+3.95 МиБ, 3.7 с.
+Осталось `todo`: 10a–10c, 11, 12; мерж **08d → 08e → 08f → 08g → 08g-fix → 08g-fix2 → 08g-fix3** —
 пользователь.
 В репозитории есть
 `src/{parse_tracking,sync,camera_model,calib_frames,calib_bones,calib_search,config,overlay_video,
@@ -316,7 +332,10 @@ pose = pose_at(t_frame_k)   # позиция — линейно, кватерн�
    режиме глубины (только густой/26, 5 точек не трогаем). Доработка 08g-fix2: второй канал —
    прозрачность (alpha 1.0 → 0.45 по тому же окну), дальние кости/точки рисуются раньше
    ближних, флаги `--depth-alpha`/`--no-depth-alpha`; «только яркость» = 08g-fix, плоские
-   цвета = 08f.
+   цвета = 08f. Доработка 08g-fix3: шкала глубины **относительная** — у каждой руки своя
+   опорная точка (ближайший видимый сустав, `depth_reference`), окно — ширина 0…0.155 м
+   (`DEPTH_RELATIVE_FAR_M`), ближняя кость руки всегда 1.0; флаги
+   `--depth-relative`/`--no-depth-relative` (`--no-depth-relative` = 08g-fix2).
 4. Работаем с левой половиной SBS-кадра (моно); правая — опционально для проверки стерео.
 5. Один подход, маленькое законченное решение; «приблизительность» наложения допустима и объясняется.
 6. Структура: `data/`, `src/{parse_tracking,video_meta,sync,camera_model,calib_frames,calib_search,
@@ -467,13 +486,18 @@ python -c "import cv2;c=cv2.VideoCapture('data/CameraRecord_20260505_165740.mp4'
   прозрачность (alpha 1.0→0.45 по тому же окну, 5 отрезков с alpha по средней глубине концов,
   обводка непрозрачная, смешивание всей кости один раз), порядок отрисовки от дальних к ближним,
   флаги `--depth-alpha`/`--no-depth-alpha` (`--no-depth-alpha` = 08g-fix, `--no-depth-color` = 08f),
+  относительная шкала 08g-fix3 (`depth_reference`/`relative_depth`, `z_ref` своей руки,
+  `DEPTH_RELATIVE_FAR_M = 0.155` — ширина окна, флаги `--depth-relative`/`--no-depth-relative`,
+  `--no-depth-relative` = 08g-fix2; следствие — ближняя кость каждой руки 1.0, межрукная
+  абсолютная разница видна только в абсолютном режиме),
   числа прогона (64.9 с / 202 108 отрезков у 08b; 08f — 7279 кадров, 100.2 МиБ, 246 619 суставов,
   686.8 с; 08g — 98.7 МиБ, 107.5 с; 08g-fix — 10-с фрагмент 4.0 МиБ / 3.0 с; 08g-fix2 — 10-с
-  фрагмент с alpha 3.9 МиБ / 4.0 с, 301 кадр),
+  фрагмент с alpha 3.9 МиБ / 4.0 с, 301 кадр; 08g-fix3 — 10-с фрагмент 3.95 МиБ / 3.7 с),
   картинки `docs/images/overlay_before_after.png`, `docs/images/overlay_dense_vs_five.png`
   (5 точек / густой 17 / все 26), `docs/images/overlay_depth_before_after.png` (5 кадров плоско/по
-  глубине), `docs/images/overlay_depth_zoom.png` (крупно) и
-  `docs/images/overlay_depth_alpha_modes.png` (3 режима: яркость / alpha / оба на k = 1800 и 4285),
+  глубине), `docs/images/overlay_depth_zoom.png` (крупно),
+  `docs/images/overlay_depth_alpha_modes.png` (3 режима: яркость / alpha / оба на k = 1800 и 4285)
+  и `docs/images/overlay_depth_relative_modes.png` (абсолютная / относительная / относительная+alpha),
   команды воспроизведения.
 - `src/parse_tracking.py` — стриминговый парсер (03a–03d, расширен в 08d): `read_header`,
   `iter_samples`, `parse_pose` (десятичная запятая), `extract_sample` (голова + **все 26**
@@ -553,7 +577,17 @@ python -c "import cv2;c=cv2.VideoCapture('data/CameraRecord_20260505_165740.mp4'
   `_draw_pose`/`render_video`/`render_stills` с `depth_alpha`, `RenderStats.depth_alpha`,
   `resolve_depth_alpha` (авто как у яркости), CLI `--depth-alpha`/`--no-depth-alpha` (явный
   `--depth-alpha` включает и яркость; `--no-depth-color` отключает всё); `--no-depth-alpha`
-  побайтово = 08g-fix, `--no-depth-color` и 5-точечный кадр = 08f. Вход — сырой
+  побайтово = 08g-fix, `--no-depth-color` и 5-точечный кадр = 08f. 08g-fix3 — относительная
+  шкала: `depth_reference(points_depths)` (min по конечным положительным, иначе `None`),
+  `relative_depth(z, z_ref) = z − z_ref`; `depth_factor`/`depth_alpha` с `z_ref=0.0`
+  (ноль — прежнее абсолютное поведение), при `z_ref > 0` разрешён `near = 0`;
+  `bone_gradient_colors`/`bone_gradient_alphas` с `z_ref`/`near`/`far`;
+  `draw_skeleton(..., relative=…)` считает свой `z_ref` на каждую руку
+  (`DEPTH_RELATIVE_NEAR_M = 0.0`, `DEPTH_RELATIVE_FAR_M = 0.155` — ширина окна, не абсолютные
+  метры), `_draw_pose`/`render_video`/`render_stills` с `depth_relative`,
+  `RenderStats.depth_relative`, `resolve_depth_relative`, CLI
+  `--depth-relative`/`--no-depth-relative` (явный `--depth-relative` включает и яркость;
+  `--no-depth-relative` = 08g-fix2). Вход — сырой
   `trackingData_*.txt`, не `tracking.csv`: для синхронизации нужен `header.timeStampNs`, которого
   в CSV нет.
 - `src/drift_diag.py` — диагностика слёта скелета (08a, расширена в 08c): 50 самых быстрых кадров
