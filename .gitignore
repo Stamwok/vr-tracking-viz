@@ -4,6 +4,8 @@ data/
 # Результаты прогонов: overlay.mp4, trajectory.html, tracking.csv
 output/
 *.mp4
+# …но короткий демо-фрагмент для README — часть репозитория (10c)
+!docs/media/*.mp4
 
 # --- Python ---
 .venv/

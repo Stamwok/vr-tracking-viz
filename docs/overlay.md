@@ -13,20 +13,32 @@
 ![Указатель на локоть: без флага и с --forearm на k = 1800 и 7200; внизу крупные кропы 10-см отрезка, растущего от кисти](images/overlay_forearm.png)
 
 Нижняя сетка — задача 08f: слева прежний 5-точечный скелет (`--five-points`), в центре
-густой по умолчанию (17 суставов на руку), справа все 26 джойнтов OpenXR (`--all-joints`).
+густой скелет 08f (17 суставов на руку, `--dense`), справа все 26 джойнтов OpenXR (`--all-joints` —
+режим по умолчанию с 10c).
 
 Слева — кадр 08a (только скелет, `--no-trail --no-hud`), справа — 08b (скелет + след + HUD).
 Верхний ряд — t = 60.0 с, нижний — t = 240.0 с: на нижнем кадре видно, откуда пришла правая
 кисть, — затухающий след тянется от трекера к корзине.
 
+## Режим по умолчанию (10c)
+
+CLI без флагов рисует то, что уходит в превью README и в `output/overlay.mp4`: **все 26
+джойнтов OpenXR** на каждую руку, **указатель на локоть** и **без следа**; HUD остаётся.
+Флаги возвращают прежние кадры: `--dense` — густой скелет 08f (17 суставов/16 рёбер),
+`--five-points` — 5 точек 08a, `--no-forearm` — кадр 08h-fix2 без указателя, `--trail` — след
+0.6 с, `--no-hud` — без панели. Этим режимом собран полный клип: 7279 кадров, 1080×810,
+**98.6 МиБ** (103 359 014 байт); фрагмент 301 кадра — 4.0 МиБ, 73.4 кадр/с. HTML-вьюер
+`sync_viewer.html` по просьбе пользователя удалён (10c): в проекте остаются видео и отдельный
+файл с интерактивными графиками `trajectory.html`.
+
 ## Порядок отрисовки
 
 1. **След кистей** — под скелетом, чтобы точки и линии читались поверх шлейфа.
-2. **Указатель на локоть (08h, длина — 08h-fix2; только `--forearm`)** — короткий отрезок
+2. **Указатель на локоть (08h, длина — 08h-fix2; включён по умолчанию)** — короткий отрезок
    **10 см** от запястья в сторону додуманного IK-локтя, **до** скелета кисти: точки и
-   измеренные кости ложатся поверх, указатель их не закрывает. По умолчанию не рисуется.
-3. **Скелет** — густой по умолчанию (17 суставов/16 рёбер на руку, 08f), 5 точек с
-   `--five-points` (08a) или все 26 джойнтов с `--all-joints`; цвета: левая голубая,
+   измеренные кости ложатся поверх, указатель их не закрывает. Отключается `--no-forearm`.
+3. **Скелет** — по умолчанию все 26 джойнтов OpenXR (10c), `--dense` — густой скелет 08f
+   (17 суставов/16 рёбер), `--five-points` — 5 точек (08a); цвета: левая голубая,
    правая красная. У густого скелета и `--all-joints` цвет дополнительно кодирует глубину
    (08g, ниже): ближние кости и точки ярче, дальние приглушены, оттенок руки тот же.
 4. **HUD** — поверх всего: подписи должны быть читаемыми на любом фоне.
@@ -260,8 +272,8 @@
 ## Указатель на локоть (08h, длина — 08h-fix2)
 
 - **Что это.** Короткий **указатель направления на локоть** — отрезок ровно **10 см**
-  (`FOREARM_POINTER_M = 0.10`) от точного `Hand.wrist` в сторону додуманного IK-локтя, и только
-  по флагу `--forearm` (по умолчанию выключено, кадр побайтово прежний). Это **не ребро
+  (`FOREARM_POINTER_M = 0.10`) от точного `Hand.wrist` в сторону додуманного IK-локтя; включён
+  по умолчанию (10c), `--no-forearm` возвращает кадр 08h-fix2 побайтово. Это **не ребро
   предплечья**: локоть в Hand не пишется (26 джойнтов OpenXR — запястье и пальцы), поэтому он
   берётся из `Body.joints[18]` (левый) и `[19]` (правый) и является **IK-оценкой**, а не
   измерением. Локоть задаёт только направление; сам отрезок заканчивается в 10 см от кисти.
@@ -324,10 +336,10 @@
   «ниточка»: отрезок всегда 10 см и начинается у кисти. Запястье Body — аппроксимация Hand.wrist
   (медиана 0.9/7.2 мм, max 16/60 мм), а Hand.palm ≠ Body.hand (~39 мм), поэтому подменять точки
   нельзя.
-- **Флаги.** `--forearm` включает указатель, `--no-forearm` — явное выключение (то же, что
-  по умолчанию). `RenderStats` печатает нарисованные/пропущенные указатели и число вырожденных
-  направлений; PNG-проверка — `--stills … --forearm`, короткий рендер — `--start 1750 --end 2050
-  --forearm`.
+- **Флаги.** Указатель включён по умолчанию (10c), `--no-forearm` — выключение.
+  `RenderStats` печатает нарисованные/пропущенные указатели и число вырожденных
+  направлений; PNG-проверка — `--stills …` (по умолчанию уже с указателем), короткий рендер —
+  `--start 1750 --end 2050`.
 
 ## HUD
 
@@ -338,18 +350,19 @@
 ```
 t =   60.007 s
 frame 1800 / 7278
-left: OK
-right: OK
-trail 0.6 s
+left: OK | forearm: fixed
+right: OK | forearm: fixed
+trail off
 ```
 
 - `left/right` — флаг `isActive` руки на кадре; при `isActive = 0` пишется `NO DATA` цветом
   предупреждения (оранжево-жёлтый) — например, правая рука в первые ~0.8 с записи и в
-  последнюю секунду. С `--forearm` к строке добавляется маркер `| forearm: fixed` (10-см
-  указатель нарисован) или `| forearm: n/a` (локоть/запястье невалидны, за камерой или
-  направление вырождено); без флага строки остаются ровно прежними (`left: OK`).
-- Последняя строка — окно следа (`trail off` при `--no-trail`), а после конца трекинга к ней
-  добавляется `| pose frozen` (поза последнего сэмпла, 04a).
+  последнюю секунду. Указатель включён по умолчанию (10c), поэтому к строке добавляется маркер
+  `| forearm: fixed` (10-см указатель нарисован) или `| forearm: n/a` (локоть/запястье
+  невалидны, за камерой или направление вырождено); с `--no-forearm` строки остаются ровно
+  прежними (`left: OK`).
+- Последняя строка — окно следа: `trail off` по умолчанию (10c) и `trail 0.6 s` с `--trail`;
+  после конца трекинга к ней добавляется `| pose frozen` (поза последнего сэмпла, 04a).
 - **Почему латиница.** `cv2.putText` с Hershey-шрифтами не рисует кириллицу; чтобы подписи
   были читаемыми, они английские, а русские пояснения живут в доках.
 - **Почему панель не двигается.** Размер и положение фиксированы, поэтому проверяемо: на
@@ -422,77 +435,83 @@ trail 0.6 s
 
 ## Как воспроизвести
 
+> С 10c CLI без флагов рисует все 26 суставов, указатель на локоть и без следа. Команды ниже
+> описывают кадры 08a–08h, поэтому где нужен прежний вид, флаги указаны явно; для точного
+> повторения картинок этого документа добавляйте `--dense --no-forearm` (а для «скелет + след
+> + HUD» — `--trail`).
+
 ```bash
 # кадры «до» (как в 08a) и «после» (08b):
 python src/overlay_video.py data/CameraRecord_*.mp4 \
     --stills output/debug/overlay_before --frames 1800,7200 --no-trail --no-hud
 python src/overlay_video.py data/CameraRecord_*.mp4 \
-    --stills output/debug/overlay_08b --frames 1800,7200
+    --stills output/debug/overlay_08b --frames 1800,7200 --dense --no-forearm
 
-# полный клип со следом и HUD (густой скелет по умолчанию):
+# полный клип (по умолчанию 10c: все 26 суставов, указатель на локоть, без следа):
 python src/overlay_video.py data/CameraRecord_*.mp4 --out output/overlay.mp4
 
-# скелет: 5 точек (08a-кадр), все 26 джойнтов (26 → 25 рёбер) или густой по умолчанию:
+# скелет: 5 точек (08a-кадр), все 26 джойнтов (26 → 25 рёбер) или густой скелет 08f:
 python src/overlay_video.py data/CameraRecord_*.mp4 --out /tmp/five.mp4 --five-points
 python src/overlay_video.py data/CameraRecord_*.mp4 --out /tmp/all.mp4 --all-joints
+python src/overlay_video.py data/CameraRecord_*.mp4 --out /tmp/dense.mp4 --dense
 
 # сравнение скелетов без следа и HUD (сетка images/overlay_dense_vs_five.png):
 python src/overlay_video.py data/CameraRecord_*.mp4 --frames 1800,7200 \
     --stills output/debug/cmp_five --five-points --no-trail --no-hud
 python src/overlay_video.py data/CameraRecord_*.mp4 --frames 1800,7200 \
-    --stills output/debug/cmp_dense --no-trail --no-hud
+    --stills output/debug/cmp_dense --dense --no-forearm --no-trail --no-hud
 python src/overlay_video.py data/CameraRecord_*.mp4 --frames 1800,7200 \
-    --stills output/debug/cmp_all --all-joints --no-trail --no-hud
+    --stills output/debug/cmp_all --all-joints --no-forearm --no-trail --no-hud
 
 # варианты: окно следа и выключение элементов
-python src/overlay_video.py data/CameraRecord_*.mp4 --out /tmp/overlay_1s.mp4 --trail-seconds 1.0
+python src/overlay_video.py data/CameraRecord_*.mp4 --out /tmp/overlay_1s.mp4 --trail --trail-seconds 1.0
 python src/overlay_video.py data/CameraRecord_*.mp4 --out /tmp/overlay_plain.mp4 --no-trail --no-hud
 
-# глубина → цвет (08g): по умолчанию для густого скелета, выключение — --no-depth-color
-python src/overlay_video.py data/CameraRecord_*.mp4 --stills output/debug/depth_after --no-trail --no-hud
+# глубина → цвет (08g): для прежнего густого кадра добавляйте --dense, выключение — --no-depth-color
+python src/overlay_video.py data/CameraRecord_*.mp4 --stills output/debug/depth_after --dense --no-forearm --no-trail --no-hud
 python src/overlay_video.py data/CameraRecord_*.mp4 --stills output/debug/depth_before \
-    --no-trail --no-hud --no-depth-color
+    --dense --no-forearm --no-trail --no-hud --no-depth-color
 python src/overlay_video.py data/CameraRecord_*.mp4 --frames 1800,4285 \
-    --stills output/debug/depth_cmp --no-trail --no-hud
+    --stills output/debug/depth_cmp --dense --no-forearm --no-trail --no-hud
 
-# короткая проверка 08g-fix: 10 секунд вокруг k = 1800 (301 кадр, ~3 с рендера)
+# короткая проверка 08g-fix: 10 секунд вокруг k = 1800 (301 кадр, ~4 с рендера)
 python src/overlay_video.py data/CameraRecord_*.mp4 --start 1750 --end 2050 \
     --out output/overlay_10s.mp4
 
 # 08g-fix2: три режима глубины (яркость / alpha / оба) на 5 кадрах 07a
-python src/overlay_video.py data/CameraRecord_*.mp4 --stills output/debug/depth_modes/both
+python src/overlay_video.py data/CameraRecord_*.mp4 --stills output/debug/depth_modes/both --dense --no-forearm
 python src/overlay_video.py data/CameraRecord_*.mp4 --stills output/debug/depth_modes/bright \
-    --no-depth-alpha
+    --dense --no-forearm --no-depth-alpha
 python src/overlay_video.py data/CameraRecord_*.mp4 --stills output/debug/depth_modes/alpha \
-    --depth-alpha   # alpha+яркость; «только alpha» — с shade=False из библиотеки
+    --dense --no-forearm --depth-alpha   # alpha+яркость; «только alpha» — с shade=False из библиотеки
 python src/overlay_video.py data/CameraRecord_*.mp4 --start 1750 --end 2050 \
-    --out output/overlay_10s_alpha.mp4
+    --out output/overlay_10s_alpha.mp4 --dense --no-forearm
 
 # 08g-fix3: относительная шкала (по умолчанию) / абсолютная и три режима на кадрах 07a
 python src/overlay_video.py data/CameraRecord_*.mp4 --frames 30,1800,3600,5400,7200,4285 \
-    --stills output/debug/rel/both                       # относительная + alpha (по умолчанию)
+    --stills output/debug/rel/both --dense --no-forearm          # относительная + alpha (по умолчанию)
 python src/overlay_video.py data/CameraRecord_*.mp4 --frames 30,1800,3600,5400,7200,4285 \
-    --stills output/debug/rel/bright --depth-relative --no-depth-alpha   # только яркость
+    --stills output/debug/rel/bright --dense --no-forearm --depth-relative --no-depth-alpha   # только яркость
 python src/overlay_video.py data/CameraRecord_*.mp4 --frames 30,1800,3600,5400,7200,4285 \
-    --stills output/debug/rel/absolute --no-depth-relative               # абсолютная, 08g-fix2
+    --stills output/debug/rel/absolute --dense --no-forearm --no-depth-relative               # абсолютная, 08g-fix2
 python src/overlay_video.py data/CameraRecord_*.mp4 --start 1750 --end 2050 \
-    --out output/overlay_10s_relative.mp4
+    --out output/overlay_10s_relative.mp4 --dense --no-forearm
 
 # 08g-fix4: нелинейная шкала (γ = 0.7 по умолчанию) и линейный откат
 python src/overlay_video.py data/CameraRecord_*.mp4 --start 1750 --end 2050 \
-    --out output/overlay_10s_gamma.mp4                        # γ = 0.7, окно 0.18
+    --out output/overlay_10s_gamma.mp4 --dense --no-forearm            # γ = 0.7, окно 0.18
 python src/overlay_video.py data/CameraRecord_*.mp4 --start 1750 --end 2050 \
-    --out output/overlay_10s_gamma1.mp4 --no-depth-gamma      # γ = 1.0, 08g-fix3
+    --out output/overlay_10s_gamma1.mp4 --dense --no-forearm --no-depth-gamma  # γ = 1.0, 08g-fix3
 python src/overlay_video.py data/CameraRecord_*.mp4 --frames 30,1800,3600,5400,7200,4285 \
-    --stills output/debug/gamma/g06 --depth-gamma 0.6         # сравнение кандидатов γ
+    --stills output/debug/gamma/g06 --dense --no-forearm --depth-gamma 0.6     # сравнение кандидатов γ
 
-# 08h-fix2: короткий указатель на локоть (10 см; по умолчанию выключено; HUD fixed / n/a)
+# 08h-fix2: короткий указатель на локоть (10 см); с 10c он включён по умолчанию, HUD — fixed / n/a
 python src/overlay_video.py data/CameraRecord_*.mp4 --frames 1800,7200 \
-    --stills output/debug/forearm/off                 # без указателя (побайтово прежний кадр)
+    --stills output/debug/forearm/off --no-forearm    # без указателя (побайтово кадр 08h-fix2)
 python src/overlay_video.py data/CameraRecord_*.mp4 --frames 1800,7200 \
-    --stills output/debug/forearm/on --forearm        # 10-см отрезок базовым цветом руки + маркер HUD
+    --stills output/debug/forearm/on                  # 10-см отрезок базовым цветом руки + маркер HUD
 python src/overlay_video.py data/CameraRecord_*.mp4 --start 1750 --end 2050 \
-    --out output/overlay_10s_forearm.mp4 --forearm
+    --out output/overlay_10s_forearm.mp4
 ```
 
 В репозиторий коммитится только собранная сетка `images/overlay_before_after.png` (2×2 из
