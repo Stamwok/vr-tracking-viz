@@ -68,6 +68,17 @@ alpha по её глубине, а чёрная обводка остаётся 
 ``--depth-relative``/``--no-depth-relative``: ``--no-depth-relative`` — прежняя абсолютная
 шкала (кадр 08g-fix2 побайтово), ``--no-depth-alpha`` — абсолютная яркость 08g-fix.
 
+Доработка 08g-fix4 делает шкалу **нелинейной**: параметр вдоль окна
+``t = clamp((z − near)/(far − near), 0, 1)`` возводится в степень ``γ`` (:func:`gamma_parameter`),
+и множитель яркости/alpha считается от ``t' = t**γ``; градиент вдоль кости — по ``t'`` середины
+каждого отрезка. ``γ < 1`` сильнее приглушает середину окна, поэтому контраст ближняя/дальняя
+кость растёт; чтобы дальние суставы при этом не упирались в пол, само окно шире, чем в 08g-fix3 (``DEPTH_GAMMA_FAR_M = 0.18`` вместо 0.155 м): по замеру 14 507 пар
+«кадр × рука» разброс глубин внутри руки доходит до 0.167 м, и 72 сустава (0.019 %) упирались
+в пол; 0.18 покрывает максимум, поэтому суставов ровно в полу не остаётся. ``γ = 1.0`` —
+прежняя линейная шкала 08g-fix3 целиком (окно 0.155 м): ``--no-depth-gamma`` воспроизводит её
+побайтово, а явный ``--depth-gamma G`` задаёт степень (0 < γ ≤ 1, иначе ``ValueError``).
+Окно — часть нелинейного режима: при γ = 1.0 берётся 0.155 м, иначе 0.18 м.
+
 Поза головы = поза камеры (камера в голове, ``T_head_cam`` из ``config.py``), поэтому
 отдельного маркера головы в кадре нет — о ней говорит HUD (время и номер кадра).
 
@@ -357,6 +368,37 @@ def resolve_depth_relative(value: bool | None, skeleton: Skeleton) -> bool:
     return value
 
 
+def resolve_depth_gamma(value: float | None, skeleton: Skeleton) -> float:
+    """Степень нелинейной шкалы глубины (08g-fix4) для выбранного скелета.
+
+    ``None`` — авторежим, как у остальных каналов глубины: для густого скелета и
+    ``--all-joints`` — :data:`DEPTH_GAMMA` (0.7), для 5-точечного :data:`FLAT_SKELETON` — 1.0
+    (плоский кадр 08a не трогаем). Явное значение из CLI (``--depth-gamma``) перекрывает
+    авторежим; ``--no-depth-gamma`` передаёт 1.0 — линейную шкалу 08g-fix3. Значение
+    проверяется :func:`_check_gamma` (0 < γ ≤ :data:`DEPTH_GAMMA_MAX`).
+    """
+    if not isinstance(skeleton, Skeleton):
+        raise ValueError(f"skeleton: ожидался Skeleton, получено {skeleton!r}")
+    if value is None:
+        return 1.0 if skeleton.name == FLAT_SKELETON.name else float(DEPTH_GAMMA)
+    _check_gamma(value)
+    return float(value)
+
+
+def relative_depth_window(gamma: float) -> tuple[float, float]:
+    """Окно относительной шкалы ``(near, far)`` для степени ``gamma`` (08g-fix4).
+
+    ``γ = 1.0`` — ровно окно 08g-fix3 (:data:`DEPTH_RELATIVE_NEAR_M`…
+    :data:`DEPTH_RELATIVE_FAR_M`, 0.155 м): только так ``--no-depth-gamma`` воспроизводит
+    прежний кадр побайтово. При ``γ < 1`` работает нелинейный режим с окном шире
+    (:data:`DEPTH_GAMMA_FAR_M`, 0.18 м), покрывающим максимальный разброс внутри руки (0.167 м).
+    Окно — часть нелинейного режима, а не отдельный флаг: CLI задаёт только степень.
+    """
+    _check_gamma(gamma)
+    far = DEPTH_RELATIVE_FAR_M if gamma == 1.0 else DEPTH_GAMMA_FAR_M
+    return (DEPTH_RELATIVE_NEAR_M, far)
+
+
 #: Ширина кадра глаза, к которой отнесены радиус и толщина по умолчанию.
 REFERENCE_WIDTH = 1080
 
@@ -446,20 +488,40 @@ DEPTH_MIN_FACTOR = 0.30
 #: :data:`DEPTH_FAR_M`: одна шкала для обоих каналов проще для интерпретации.
 DEPTH_MIN_ALPHA = 0.45
 
-#: Окно **относительной** шкалы глубины (доработка 08g-fix3), м: глубина отсчитывается от
-#: ближайшего к камере видимого сустава своей руки (``z_ref``, :func:`depth_reference`), т.е.
-#: ``near = DEPTH_RELATIVE_NEAR_M = 0`` — это сама ближайшая кость руки (полный цвет), а
-#: ``far`` задаёт **ширину** окна в метрах, а не абсолютное расстояние от шлема. Ширина
-#: подобрана по замеру разброса ``max(z) − min(z)`` по видимым суставам одной руки на всех
-#: 7279 кадрах (14 507 пар «кадр × рука», 26 суставов): p50 0.103 м, p90 0.129, p99 0.148,
-#: max 0.167. ``0.155`` — компромисс: p50 даёт контраст ближняя/дальняя кость 1.87×, p99
-#: (0.148) ещё внутри окна, а самый малый разброс активной кисти на 5 кадрах 07a (0.100 м,
-#: k = 7200) даёт 1.83× — при 0.16 он опускался до 1.78×, при 0.18 до 1.64×; зажим
-#: начинается только у экстремальных разбросов > 0.155 (≤ 1 % пар, max 0.167). Окно общее
-#: для яркости и alpha (как и абсолютное окно 08g-fix2), полы — :data:`DEPTH_MIN_FACTOR`/:
-#: :data:`DEPTH_MIN_ALPHA`.
+#: Окно **относительной** шкалы глубины 08g-fix3 (доработка 08g-fix4), м: глубина
+#: отсчитывается от ближайшего к камере видимого сустава своей руки (``z_ref``,
+#: :func:`depth_reference`), т.е. ``near = DEPTH_RELATIVE_NEAR_M = 0`` — это сама ближайшая
+#: кость руки (полный цвет), а ``far`` задаёт **ширину** окна в метрах, а не абсолютное
+#: расстояние от шлема. Ширина подобрана по замеру разброса ``max(z) − min(z)`` по видимым
+#: суставам одной руки на всех 7279 кадрах (14 507 пар «кадр × рука», 26 суставов):
+#: p50 0.103 м, p90 0.129, p99 0.148, max 0.167. ``0.155`` — окно 08g-fix3: p50 даёт контраст
+#: 1.87×, p99 (0.148) внутри, самый малый разброс активной кисти 07a (0.100 м, k = 7200) —
+#: 1.83×. В 08g-fix4 это окно остаётся **только для линейного режима** (``γ = 1.0``), чтобы
+#: ``--no-depth-gamma`` воспроизводил 08g-fix3 побайтово; нелинейный режим использует
+#: :data:`DEPTH_GAMMA_FAR_M`. Полы — :data:`DEPTH_MIN_FACTOR`/:data:`DEPTH_MIN_ALPHA`.
 DEPTH_RELATIVE_NEAR_M = 0.0
 DEPTH_RELATIVE_FAR_M = 0.155
+
+#: Окно относительной шкалы в **нелинейном** режиме 08g-fix4 (``γ < 1``), м. Замер по всем
+#: 14 507 парам «кадр × рука»: разброс глубин внутри руки p50 0.103 / p90 0.129 / p99 0.148 /
+#: max 0.167; за окном 0.155 упирались в пол 72 сустава из 377 182 (0.019 %, 54 пары).
+#: ``0.18`` покрывает максимум с запасом 13 мм, поэтому суставов ровно в полу не остаётся
+#: вовсе; 0.20 покрывает то же, но снижает типичный контраст (γ = 0.6: p50 1.89 против 2.00).
+#: Ширина подобрана по сетке γ × окно — см. ``docs/NOTES.md``, 08g-fix4.
+DEPTH_GAMMA_FAR_M = 0.18
+
+#: Степень нелинейной шкалы по умолчанию (08g-fix4): ``t' = t**γ``. ``1.0`` — прежняя линейная
+#: шкала (в :func:`depth_factor`/:func:`depth_alpha` это значение по умолчанию и побайтовое
+#: совпадение с 08g-fix3), ``0.7`` — выбранное по замеру значение: при окне 0.18 типичный
+#: контраст ближняя/дальняя кость p50 **1.90×** (в 08g-fix3 1.87×), минимум на 5 кадрах 07a и
+#: k = 4285 **1.87×**. Это максимальная γ из сетки, проходящая оба порога (p50 ≥ 1.7 и
+#: предельные ≥ 1.8): γ = 0.8 даёт 1.81/1.78 и порог нарушает, а 0.5–0.6 дают больше контраста
+#: ценой более сильного сжатия градации дальних суставов — ровно того, что задача чинит.
+DEPTH_GAMMA = 0.7
+
+#: Верхняя граница степени: ``γ > 1`` не нужна — она повышает множитель в середине окна и
+#: усиливает слияние дальних суставов в полу. Проверка — :func:`_check_gamma`.
+DEPTH_GAMMA_MAX = 1.0
 
 #: Сколько отрезков рисуется на одну кость в режиме глубины (градиент вдоль кости, 08g).
 #: 5 — компромисс: градиент читается на линии толщиной 3 px, но не рвёт её на «рябь»;
@@ -851,18 +913,81 @@ def relative_depth(depth: float, z_ref: float) -> float:
     return float(depth) - float(z_ref)
 
 
-def _check_depth_window(
-    near: float, far: float, minimum: float, floor_name: str, *, z_ref: float = 0.0
-) -> None:
-    """Проверить окно глубины и нижнюю границу шкалы (общая для множителя и alpha).
+def _check_gamma(gamma: float) -> None:
+    """Проверить степень шкалы: конечное число в ``(0, DEPTH_GAMMA_MAX]`` (08g-fix4).
 
-    ``minimum`` — значение шкалы на дальнем конце окна (множитель яркости или alpha),
-    ``floor_name`` — его имя для текста ошибки. Окно ``near``…``far`` — метры системы камеры.
-    ``z_ref`` (08g-fix3) — опорная точка относительной шкалы: при нуле окно абсолютное, и
-    ``near`` обязан быть > 0 (как раньше); при ненулевой опоре ``near = 0`` — законная
-    граница («сама ближайшая кость руки»), поэтому проверка ослаблена до ``near ≥ 0``.
+    ``γ ≤ 0`` не определена (нулевая степень дала бы ступеньку), ``γ > 1`` не нужна: она
+    поднимает множитель в середине окна и усиливает слияние дальних суставов. Допустимы
+    ``bool``-ловушки — ``True``/``False`` отвергаются как нечисла, чтобы ``gamma=1`` нельзя
+    было случайно передать флагом.
     """
-    for name, value in (("near", near), ("far", far), (floor_name, minimum), ("z_ref", z_ref)):
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise ValueError(f"gamma: ожидалось число, получено {gamma!r}")
+    if not math.isfinite(gamma):
+        raise ValueError(f"gamma: должно быть конечным, получено {gamma!r}")
+    if not 0.0 < gamma <= DEPTH_GAMMA_MAX:
+        raise ValueError(
+            f"gamma: ожидалось в (0, {DEPTH_GAMMA_MAX:g}], получено {gamma!r}"
+        )
+
+
+def depth_parameter(
+    depth: float,
+    *,
+    near: float = DEPTH_NEAR_M,
+    far: float = DEPTH_FAR_M,
+    z_ref: float = 0.0,
+) -> float:
+    """Параметр ``t`` вдоль окна глубины: ``clamp((z − z_ref − near)/(far − near), 0, 1)``.
+
+    Чистая функция (08g-fix4): только вход и результат, без кадра и состояния. ``0`` — ближняя
+    граница окна (полный цвет), ``1`` — дальняя (пол шкалы), дальше — зажим, а не экстраполяция.
+    ``near``/``far``/``z_ref`` проверяются так же, как в :func:`depth_factor`.
+
+    Неизвестная глубина (``NaN``, ``±inf``) и глубина за камерой (``z ≤ 0``) дают ``t = 0``:
+    множитель в этой точке — 1.0, т.е. отсутствие данных не выцветает скелет. Для видимой
+    точки ``t`` определён и монотонен по ``z``.
+    """
+    _check_depth_range(near, far, z_ref)
+    if isinstance(depth, bool) or not isinstance(depth, (int, float)):
+        raise ValueError(f"depth: ожидалось число, получено {depth!r}")
+    if not math.isfinite(depth) or depth <= 0.0:
+        return 0.0
+    t = (relative_depth(depth, z_ref) - near) / (far - near)
+    if t <= 0.0:
+        return 0.0
+    if t >= 1.0:
+        return 1.0
+    return float(t)
+
+
+def gamma_parameter(t: float, gamma: float) -> float:
+    """Нелинейный параметр ``t' = t**γ`` (08g-fix4), ``t`` уже зажат в ``[0, 1]``.
+
+    Края сохраняются ровно: ``t = 0 → 0``, ``t = 1 → 1`` (без ``0.9999999999999999``), поэтому
+    множители на границах окна остаются ровно 1.0 и полом. ``γ = 1.0`` возвращает ``t`` без
+    возведения в степень — это побайтовое совпадение с линейной формулой 08g-fix3. Функция
+    монотонна при любом допустимом ``γ``: чем дальше сустав, тем больше ``t'`` (и тем меньше
+    множитель). ``t`` вне ``[0, 1]`` — ``ValueError``: зажим делает :func:`depth_parameter`,
+    а не эта функция, иначе край окна перестал бы быть краем.
+    """
+    _check_gamma(gamma)
+    if isinstance(t, bool) or not isinstance(t, (int, float)):
+        raise ValueError(f"t: ожидалось число, получено {t!r}")
+    if not math.isfinite(t) or not 0.0 <= t <= 1.0:
+        raise ValueError(f"t: ожидалось в [0, 1], получено {t!r}")
+    if t <= 0.0:
+        return 0.0
+    if t >= 1.0:
+        return 1.0
+    if gamma == 1.0:
+        return float(t)
+    return float(t) ** float(gamma)
+
+
+def _check_depth_range(near: float, far: float, z_ref: float) -> None:
+    """Проверить окно глубины и опорную точку (без нижней границы шкалы)."""
+    for name, value in (("near", near), ("far", far), ("z_ref", z_ref)):
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"{name}: ожидалось число, получено {value!r}")
         if not math.isfinite(value):
@@ -874,6 +999,24 @@ def _check_depth_window(
         raise ValueError(f"near: при относительной шкале должно быть ≥ 0, получено {near!r}")
     if far <= near:
         raise ValueError(f"far: должно быть больше near ({near!r}), получено {far!r}")
+
+
+def _check_depth_window(
+    near: float, far: float, minimum: float, floor_name: str, *, z_ref: float = 0.0
+) -> None:
+    """Проверить окно глубины и нижнюю границу шкалы (общая для множителя и alpha).
+
+    ``minimum`` — значение шкалы на дальнем конце окна (множитель яркости или alpha),
+    ``floor_name`` — его имя для текста ошибки. Окно ``near``…``far`` — метры системы камеры.
+    ``z_ref`` (08g-fix3) — опорная точка относительной шкалы: при нуле окно абсолютное, и
+    ``near`` обязан быть > 0 (как раньше); при ненулевой опоре ``near = 0`` — законная
+    граница («сама ближайшая кость руки»), поэтому проверка ослаблена до ``near ≥ 0``.
+    """
+    _check_depth_range(near, far, z_ref)
+    if isinstance(minimum, bool) or not isinstance(minimum, (int, float)):
+        raise ValueError(f"{floor_name}: ожидалось число, получено {minimum!r}")
+    if not math.isfinite(minimum):
+        raise ValueError(f"{floor_name}: должно быть конечным, получено {minimum!r}")
     if not 0.0 < minimum <= 1.0:
         raise ValueError(f"{floor_name}: ожидалось в (0, 1], получено {minimum!r}")
 
@@ -885,18 +1028,26 @@ def depth_factor(
     far: float = DEPTH_FAR_M,
     min_factor: float = DEPTH_MIN_FACTOR,
     z_ref: float = 0.0,
+    gamma: float = 1.0,
 ) -> float:
     """Множитель к цвету руки по глубине: 1.0 ближе ``near``, ``min_factor`` дальше ``far``.
 
-    Линейно по глубине (без гаммы и ступеней) и монотонно не возрастает с ``z``: ближе —
-    ярче и насыщеннее, дальше — приглушённее. По умолчанию окно **абсолютное**, в метрах
-    системы камеры (:data:`DEPTH_NEAR_M`…:data:`DEPTH_FAR_M` замерены по всей записи), поэтому
-    множитель не зависит от того, что попало в кадр, и не «дышит» от кадра к кадру.
+    Шкала нелинейная (08g-fix4): параметр вдоль окна ``t`` (:func:`depth_parameter`) возводится
+    в степень ``γ`` (:func:`gamma_parameter`), и множитель считается от ``t'``:
+    ``1 − (1 − min_factor)·t'``. При ``γ = 1.0`` это ровно прежняя линейная формула (значение по
+    умолчанию, побайтово 08g-fix3); ``γ < 1`` сильнее приглушает середину окна, поэтому контраст
+    ближняя/дальняя кость выше (цена — более сжатая градация в дальней половине, которую
+    компенсирует расширенное окно :func:`relative_depth_window`). Монотонность по ``z`` при
+    этом сохраняется: больше глубина — меньше множитель.
+
+    По умолчанию окно **абсолютное**, в метрах системы камеры (:data:`DEPTH_NEAR_M`…
+    :data:`DEPTH_FAR_M` замерены по всей записи), поэтому множитель не зависит от того, что
+    попало в кадр, и не «дышит» от кадра к кадру.
 
     ``z_ref`` (08g-fix3) сдвигает точку отсчёта: глубина заменяется на
     :func:`relative_depth` ``z − z_ref``. При ``z_ref = 0`` формула и числа ровно прежние
     (абсолютная шкала). При относительной шкале ``near = 0``, ``far`` — ширина окна
-    (:data:`DEPTH_RELATIVE_FAR_M`): ближайшая кость руки получает 1.0, дальняя — тем меньше,
+    (:func:`relative_depth_window`): ближайшая кость руки получает 1.0, дальняя — тем меньше,
     чем больше разброс внутри руки, независимо от абсолютного расстояния до шлема.
 
     Неизвестная глубина (``NaN``, ``±inf``) даёт 1.0 — полный цвет: невидимая точка всё
@@ -905,18 +1056,14 @@ def depth_factor(
     кадр не попадает, множитель для неё смысла не имеет.
     """
     _check_depth_window(near, far, min_factor, "min_factor", z_ref=z_ref)
-    if isinstance(depth, bool) or not isinstance(depth, (int, float)):
-        raise ValueError(f"depth: ожидалось число, получено {depth!r}")
-    if not math.isfinite(depth):
-        return 1.0
-    if depth <= 0.0:
-        return 1.0
-    t = (relative_depth(depth, z_ref) - near) / (far - near)
+    _check_gamma(gamma)
+    t = depth_parameter(depth, near=near, far=far, z_ref=z_ref)
     if t <= 0.0:
         return 1.0
     if t >= 1.0:
-        return min_factor
-    return 1.0 - (1.0 - min_factor) * t
+        return float(min_factor)
+    t_prime = gamma_parameter(t, gamma)
+    return 1.0 - (1.0 - float(min_factor)) * t_prime
 
 
 def depth_alpha(
@@ -926,19 +1073,19 @@ def depth_alpha(
     far: float = DEPTH_FAR_M,
     min_alpha: float = DEPTH_MIN_ALPHA,
     z_ref: float = 0.0,
+    gamma: float = 1.0,
 ) -> float:
     """Прозрачность по глубине: 1.0 ближе ``near``, ``min_alpha`` дальше ``far`` (08g-fix2).
 
     Второй, независимый от яркости канал: ближняя кость или точка рисуется полностью
-    непрозрачной, дальняя — полупрозрачной, сквозь неё виден фон. Шкала линейная и
-    монотонно не возрастает с ``z``, окно по умолчанию — **то же**, что у
-    :func:`depth_factor` (:data:`DEPTH_NEAR_M`…:data:`DEPTH_FAR_M`): одна шкала на оба канала
-    проще для интерпретации, а ``near``/``far``/``min_alpha`` можно перекрыть (например, для
-    сравнения вариантов), не меняя яркость.
+    непрозрачной, дальняя — полупрозрачной, сквозь неё виден фон. Шкала нелинейная так же,
+    как у :func:`depth_factor` (08g-fix4): ``t' = t**γ``, ``γ = 1.0`` — прежняя линейная шкала
+    побайтово; окно по умолчанию — **то же**, что у :func:`depth_factor`
+    (:data:`DEPTH_NEAR_M`…:data:`DEPTH_FAR_M`), ``near``/``far``/``min_alpha`` можно перекрыть.
 
     ``z_ref`` (08g-fix3) — как у :func:`depth_factor`: сдвиг точки отсчёта на ближайший
-    сустав руки; ``near = 0``, ``far`` = ширина относительного окна. При ``z_ref = 0``
-    поведение и числа прежние.
+    сустав руки; ``near = 0``, ``far`` = ширина относительного окна
+    (:func:`relative_depth_window`). При ``z_ref = 0`` поведение и числа прежние.
 
     Неизвестная глубина (``NaN``, ``±inf``) и глубина за камерой (``z ≤ 0``) дают 1.0 —
     полную непрозрачность: отсутствие данных не повод «выцветать» или прятать точку, а такая
@@ -946,18 +1093,14 @@ def depth_alpha(
     (без ``0.44999999999999996``), дальше — зажим, а не экстраполяция.
     """
     _check_depth_window(near, far, min_alpha, "min_alpha", z_ref=z_ref)
-    if isinstance(depth, bool) or not isinstance(depth, (int, float)):
-        raise ValueError(f"depth: ожидалось число, получено {depth!r}")
-    if not math.isfinite(depth):
-        return 1.0
-    if depth <= 0.0:
-        return 1.0
-    t = (relative_depth(depth, z_ref) - near) / (far - near)
+    _check_gamma(gamma)
+    t = depth_parameter(depth, near=near, far=far, z_ref=z_ref)
     if t <= 0.0:
         return 1.0
     if t >= 1.0:
-        return min_alpha
-    return 1.0 - (1.0 - min_alpha) * t
+        return float(min_alpha)
+    t_prime = gamma_parameter(t, gamma)
+    return 1.0 - (1.0 - float(min_alpha)) * t_prime
 
 
 
@@ -1000,6 +1143,7 @@ def bone_gradient_colors(
     z_ref: float = 0.0,
     near: float = DEPTH_NEAR_M,
     far: float = DEPTH_FAR_M,
+    gamma: float = 1.0,
 ) -> tuple[tuple[int, int, int], ...]:
     """Цвета ``segments`` отрезков кости: множитель плавно идёт от одного конца к другому.
 
@@ -1009,23 +1153,48 @@ def bone_gradient_colors(
     Множители концов — :func:`depth_factor` от ``z``: ближний конец ярче, дальний темнее,
     поэтому на экране видно, каким концом кость смотрит в камеру.
 
+    ``gamma`` (08g-fix4) — степень нелинейной шкалы. При ``γ = 1.0`` сохраняется прежний,
+    линейный расчёт (интерполяция множителей концов) — побайтово 08g-fix3; при ``γ < 1``
+    множитель каждого отрезка считается по ``t'`` **середины** отрезка
+    (:func:`depth_parameter` → :func:`gamma_parameter` → :func:`depth_factor`), поэтому
+    градиент соответствует той же нелинейной шкале, что у точек, а не является интерполяцией
+    линейных множителей.
+
     ``z_ref``/``near``/``far`` (08g-fix3) прокидываются в :func:`depth_factor`: при
     относительной шкале ``z_ref`` — ближайший сустав руки, ``near = 0``, ``far`` — ширина
-    окна. По умолчанию (``z_ref = 0``) окно и числа прежние, абсолютные.
+    окна (:func:`relative_depth_window`). По умолчанию (``z_ref = 0``) окно и числа прежние,
+    абсолютные.
 
     Глубина хотя бы одного конца неизвестна (``NaN``/``±inf``) — все отрезки получают
     полный цвет руки: кость выглядит как прежняя плоская линия. Неположительное число
-    отрезков — ``ValueError``.
+    отрезков или недопустимая ``γ`` — ``ValueError``.
     """
     _check_segments(segments)
+    _check_gamma(gamma)
     if not (math.isfinite(depth_start) and math.isfinite(depth_end)):
         base = shade_color(color, 1.0)
         return (base,) * segments
-    start_factor = depth_factor(depth_start, near=near, far=far, z_ref=z_ref)
-    end_factor = depth_factor(depth_end, near=near, far=far, z_ref=z_ref)
-    step = end_factor - start_factor
+    if gamma == 1.0:
+        # 08g-fix3 побайтово: линейная интерполяция множителей концов
+        start_factor = depth_factor(depth_start, near=near, far=far, z_ref=z_ref)
+        end_factor = depth_factor(depth_end, near=near, far=far, z_ref=z_ref)
+        step = end_factor - start_factor
+        return tuple(
+            shade_color(color, start_factor + step * ((index + 0.5) / segments))
+            for index in range(segments)
+        )
+    span = float(depth_end) - float(depth_start)
     return tuple(
-        shade_color(color, start_factor + step * ((index + 0.5) / segments))
+        shade_color(
+            color,
+            depth_factor(
+                float(depth_start) + span * ((index + 0.5) / segments),
+                near=near,
+                far=far,
+                z_ref=z_ref,
+                gamma=gamma,
+            ),
+        )
         for index in range(segments)
     )
 
@@ -1038,6 +1207,7 @@ def bone_gradient_alphas(
     z_ref: float = 0.0,
     near: float = DEPTH_NEAR_M,
     far: float = DEPTH_FAR_M,
+    gamma: float = 1.0,
 ) -> tuple[float, ...]:
     """Alpha ``segments`` отрезков кости — по средней глубине концов отрезка (08g-fix2).
 
@@ -1045,21 +1215,26 @@ def bone_gradient_alphas(
     ``t = (i + 0.5)/N`` переводится в глубину (линейно между глубинами концов), а alpha
     берётся :func:`depth_alpha` в этой точке. Средняя глубина концов отрезка — это и есть
     глубина его середины, поэтому вдоль кости виден не только градиент яркости, но и
-    градиент плотности: ближний конец плотный, дальний просвечивает.
+    градиент плотности: ближний конец плотный, дальний просвечивает. ``gamma`` (08g-fix4)
+    прокидывается в :func:`depth_alpha`, т.е. нелинейная шкала применяется к ``t'`` середины
+    отрезка (при ``γ = 1.0`` — прежняя линейная, побайтово 08g-fix3).
 
     ``z_ref``/``near``/``far`` (08g-fix3) прокидываются в :func:`depth_alpha` так же, как у
     цветов: при ``z_ref = 0`` окно и числа прежние.
 
     Глубина хотя бы одного конца неизвестна (``NaN``/``±inf``) — все отрезки непрозрачны
-    (1.0): отсутствие данных не делает кость полупрозрачной. Неположительное число отрезков —
-    ``ValueError``.
+    (1.0): отсутствие данных не делает кость полупрозрачной. Неположительное число отрезков
+    или недопустимая ``γ`` — ``ValueError``.
     """
     _check_segments(segments)
+    _check_gamma(gamma)
     if not (math.isfinite(depth_start) and math.isfinite(depth_end)):
         return (1.0,) * segments
     step = (float(depth_end) - float(depth_start)) / segments
     return tuple(
-        depth_alpha(depth_start + step * (index + 0.5), near=near, far=far, z_ref=z_ref)
+        depth_alpha(
+            depth_start + step * (index + 0.5), near=near, far=far, z_ref=z_ref, gamma=gamma
+        )
         for index in range(segments)
     )
 
@@ -1215,6 +1390,7 @@ def _paint_bone(
     z_ref: float = 0.0,
     near: float = DEPTH_NEAR_M,
     far: float = DEPTH_FAR_M,
+    gamma: float = 1.0,
 ) -> None:
     """Нарисовать ребро: плоское, с градиентом яркости и/или прозрачности по глубине.
 
@@ -1223,7 +1399,9 @@ def _paint_bone(
     множителю в середине отрезка (:func:`bone_gradient_colors`), alpha — по средней глубине
     его концов (:func:`bone_gradient_alphas`). ``z_ref``/``near``/``far`` (08g-fix3) задают
     шкалу: по умолчанию абсолютную, при относительной ``z_ref`` — ближайший сустав руки,
-    ``near = 0``, ``far`` — ширина окна. Если вся кость в одном множителе и одной alpha
+    ``near = 0``, ``far`` — ширина окна. ``gamma`` (08g-fix4) — степень нелинейной шкалы,
+    прокидывается в :func:`bone_gradient_colors`/:func:`bone_gradient_alphas` (γ = 1.0 —
+    линейный расчёт 08g-fix3 побайтово). Если вся кость в одном множителе и одной alpha
     (дальний конец упёрся в пол, глубина неизвестна, у `--no-depth-alpha`), она рисуется одной
     линией — ровно как плоская, без швов антиалиасинга между стыкующимися отрезками.
     """
@@ -1231,12 +1409,16 @@ def _paint_bone(
         _draw_bone(image, first, second, color, style)
         return
     segment_colors = (
-        bone_gradient_colors(color, depth_start, depth_end, z_ref=z_ref, near=near, far=far)
+        bone_gradient_colors(
+            color, depth_start, depth_end, z_ref=z_ref, near=near, far=far, gamma=gamma
+        )
         if shade
         else (shade_color(color, 1.0),) * DEPTH_BONE_SEGMENTS
     )
     segment_alphas = (
-        bone_gradient_alphas(depth_start, depth_end, z_ref=z_ref, near=near, far=far)
+        bone_gradient_alphas(
+            depth_start, depth_end, z_ref=z_ref, near=near, far=far, gamma=gamma
+        )
         if alpha
         else None
     )
@@ -1283,6 +1465,7 @@ def _paint_point(
     z_ref: float = 0.0,
     near: float = DEPTH_NEAR_M,
     far: float = DEPTH_FAR_M,
+    gamma: float = 1.0,
 ) -> None:
     """Нарисовать точку сустава: цвет и прозрачность по её глубине, обводка всегда чёрная.
 
@@ -1290,6 +1473,7 @@ def _paint_point(
     светлом остаётся цветное пятно без границы. ``depth = None`` — плоский кадр 08a/08f.
     ``z_ref``/``near``/``far`` (08g-fix3) — шкала глубины: по умолчанию абсолютная, при
     относительной ``z_ref`` — ближайший сустав руки, ``near = 0``, ``far`` — ширина окна.
+    ``gamma`` (08g-fix4) — степень нелинейной шкалы (γ = 1.0 — прежняя линейная, побайтово).
     """
     import cv2  # noqa: PLC0415
 
@@ -1299,10 +1483,10 @@ def _paint_point(
     if depth is not None and math.isfinite(depth):
         if shade:
             fill_color = shade_color(
-                color, depth_factor(depth, near=near, far=far, z_ref=z_ref)
+                color, depth_factor(depth, near=near, far=far, z_ref=z_ref, gamma=gamma)
             )
         if alpha:
-            fill_alpha = depth_alpha(depth, near=near, far=far, z_ref=z_ref)
+            fill_alpha = depth_alpha(depth, near=near, far=far, z_ref=z_ref, gamma=gamma)
     if fill_alpha >= 1.0:
         cv2.circle(image, center, style.point_radius, fill_color, -1, cv2.LINE_AA)
     else:
@@ -1322,6 +1506,7 @@ def draw_skeleton(
     alpha: bool = False,
     shade: bool = True,
     relative: bool = False,
+    gamma: float = 1.0,
 ) -> int:
     """Нарисовать скелет на кадре (in place) и вернуть число видимых точек.
 
@@ -1363,10 +1548,17 @@ def draw_skeleton(
     сохраняется. ``False`` (по умолчанию) — прежняя абсолютная шкала (08g-fix2), кадр
     воспроизводится побайтово. Без ``depths`` относительная шкала невозможна — ``ValueError``
     (ноль глубин не из чего отсчитывать); плоский кадр включайте только через ``depths=None``.
+
+    ``gamma`` (08g-fix4) — степень нелинейной шкалы ``t' = t**γ`` (0 < γ ≤ 1): множитель
+    яркости/alpha и градиент кости считаются от ``t'`` (:func:`depth_parameter`,
+    :func:`gamma_parameter`). ``γ = 1.0`` (по умолчанию) — ровно линейная шкала 08g-fix3
+    побайтово, включая окно 0.155 м; ``γ < 1`` включает окно :data:`DEPTH_GAMMA_FAR_M`
+    (0.18 м) и усиливает контраст ближняя/дальняя кость (см. :func:`relative_depth_window`).
     """
     for name, value in (("alpha", alpha), ("shade", shade), ("relative", relative)):
         if not isinstance(value, bool):
             raise ValueError(f"{name}: ожидалось bool, получено {value!r}")
+    _check_gamma(gamma)
     if alpha and depths is None:
         raise ValueError("alpha: прозрачность по глубине невозможна без depths")
     if relative and depths is None:
@@ -1414,11 +1606,11 @@ def draw_skeleton(
         for side in ("left", "right"):
             reference = depth_reference(hand_depths[side].values())
             z_refs[side] = 0.0 if reference is None else reference
-    scale_near, scale_far = (
-        (DEPTH_RELATIVE_NEAR_M, DEPTH_RELATIVE_FAR_M)
-        if relative
-        else (DEPTH_NEAR_M, DEPTH_FAR_M)
-    )
+    if relative:
+        # 08g-fix4: γ = 1.0 — окно 08g-fix3 (побайтовое совпадение), γ < 1 — окно 0.18
+        scale_near, scale_far = relative_depth_window(gamma)
+    else:
+        scale_near, scale_far = (DEPTH_NEAR_M, DEPTH_FAR_M)
 
     if depths is None:
         # плоский кадр 08a/08f: кости в порядке списка, затем точки; руки — левая, правая
@@ -1454,6 +1646,7 @@ def draw_skeleton(
                         z_ref=z_refs[side],
                         near=scale_near,
                         far=scale_far,
+                        gamma=gamma,
                     )
             for joint in names:
                 point = hands[side][joint]
@@ -1468,6 +1661,7 @@ def draw_skeleton(
                         z_ref=z_refs[side],
                         near=scale_near,
                         far=scale_far,
+                        gamma=gamma,
                     )
                     drawn += 1
         return drawn
@@ -1509,6 +1703,7 @@ def draw_skeleton(
             z_ref=z_refs[side],
             near=scale_near,
             far=scale_far,
+            gamma=gamma,
         )
     points_plan: list[tuple[float, str, str]] = []
     for side in ("left", "right"):
@@ -1528,6 +1723,7 @@ def draw_skeleton(
             z_ref=z_refs[side],
             near=scale_near,
             far=scale_far,
+            gamma=gamma,
         )
     return len(points_plan)
 
@@ -1935,6 +2131,7 @@ def _draw_pose(
     depth_shading: bool = False,
     depth_alpha: bool = False,
     depth_relative: bool = False,
+    depth_gamma: float = 1.0,
 ) -> int:
     """Спроецировать скелет кадра и нарисовать его на уже обрезанном кадре глаза.
 
@@ -1949,6 +2146,9 @@ def _draw_pose(
     ``depth_relative`` (08g-fix3) — относительная шкала: каждая рука отсчитывает глубину от
     своего ближайшего видимого сустава (только вместе с ``depth_shading``), см.
     :func:`draw_skeleton`. Без яркости флаг игнорируется: платить за проекцию глубин незачем.
+
+    ``depth_gamma`` (08g-fix4) — степень нелинейной шкалы (только вместе с ``depth_shading``),
+    см. :func:`draw_skeleton`; 1.0 — прежняя линейная шкала 08g-fix3.
     """
     if depth_shading:
         pixels, depths = project_skeleton_depth(
@@ -1973,6 +2173,7 @@ def _draw_pose(
         depths=depths,
         alpha=depth_shading and depth_alpha,
         relative=depth_shading and depth_relative,
+        gamma=depth_gamma if depth_shading else 1.0,
     )
 
 
@@ -2059,6 +2260,8 @@ class RenderStats:
     depth_alpha: bool = False
     #: 08g-fix3: была ли шкала глубины относительной (z_ref своей руки на кадр).
     depth_relative: bool = False
+    #: 08g-fix4: степень нелинейной шкалы (1.0 — линейная, 08g-fix3 побайтово).
+    depth_gamma: float = 1.0
 
     @property
     def frames(self) -> int:
@@ -2113,6 +2316,7 @@ def render_video(
     depth_shading: bool | None = None,
     depth_alpha: bool | None = None,
     depth_relative: bool | None = None,
+    depth_gamma: float | None = None,
     log: Callable[[str], None] = print,
 ) -> RenderStats:
     """Отрендерить диапазон кадров ``start…end`` в ``out`` и вернуть :class:`RenderStats`.
@@ -2142,6 +2346,10 @@ def render_video(
     (:func:`resolve_depth_relative`) включается вместе с яркостью для густого скелета и
     ``--all-joints``; без ``depth_shading`` не включается. Явное ``False`` — абсолютная шкала
     08g-fix2.
+
+    ``depth_gamma`` (08g-fix4) — степень нелинейной шкалы: ``None`` — авторежим
+    (:func:`resolve_depth_gamma`: 0.7 для густого/26, 1.0 для 5 точек), ``1.0`` — линейная
+    шкала 08g-fix3 побайтово, 0 < γ < 1 — нелинейная. Без ``depth_shading`` не действует.
     """
     import cv2  # noqa: PLC0415
 
@@ -2156,6 +2364,13 @@ def render_video(
     shading = resolve_depth_shading(depth_shading, skeleton)
     transparency = shading and resolve_depth_alpha(depth_alpha, skeleton)
     relative = shading and resolve_depth_relative(depth_relative, skeleton)
+    # 08g-fix4: авто-γ — только для относительной шкалы; абсолютная остаётся линейной
+    # (08g-fix/08g-fix2 побайтово), явное значение γ действует и на абсолютную
+    gamma = (
+        resolve_depth_gamma(depth_gamma, skeleton)
+        if shading and (relative or depth_gamma is not None)
+        else 1.0
+    )
     if trail:
         _trail_window(trail_seconds, TRAIL_STEP_S)  # проверка окна до открытия файлов
     video = Path(video)
@@ -2203,6 +2418,7 @@ def render_video(
                     depth_shading=shading,
                     depth_alpha=transparency,
                     depth_relative=relative,
+                    depth_gamma=gamma,
                 )
                 if hud:
                     draw_hud(
@@ -2257,6 +2473,7 @@ def render_video(
         depth_shading=shading,
         depth_alpha=transparency,
         depth_relative=relative,
+        depth_gamma=gamma,
     )
 
 
@@ -2274,6 +2491,7 @@ def render_stills(
     depth_shading: bool | None = None,
     depth_alpha: bool | None = None,
     depth_relative: bool | None = None,
+    depth_gamma: float | None = None,
     log: Callable[[str], None] = print,
 ) -> list[Path]:
     """Сохранить PNG-кадры с наложением (по умолчанию 5 отладочных кадров 07a).
@@ -2292,6 +2510,9 @@ def render_stills(
     (авторежим как у яркости, без яркости не включается).
     ``depth_relative`` (08g-fix3) — как у :func:`render_video`: относительная шкала от
     ближайшего сустава каждой руки (авторежим как у яркости).
+
+    ``depth_gamma`` (08g-fix4) — как у :func:`render_video`: степень нелинейной шкалы
+    (авторежим 0.7 для густого/26, 1.0 для 5 точек; явное значение — из ``--depth-gamma``).
     """
     import cv2  # noqa: PLC0415
 
@@ -2304,6 +2525,11 @@ def render_stills(
     shading = resolve_depth_shading(depth_shading, skeleton)
     transparency = shading and resolve_depth_alpha(depth_alpha, skeleton)
     relative = shading and resolve_depth_relative(depth_relative, skeleton)
+    gamma = (
+        resolve_depth_gamma(depth_gamma, skeleton)
+        if shading and (relative or depth_gamma is not None)
+        else 1.0
+    )
     if trail:
         _trail_window(trail_seconds, TRAIL_STEP_S)
     out = Path(out_dir)
@@ -2337,6 +2563,7 @@ def render_stills(
                 depth_shading=shading,
                 depth_alpha=transparency,
                 depth_relative=relative,
+                depth_gamma=gamma,
             )
             if hud:
                 draw_hud(
@@ -2373,9 +2600,10 @@ def _format_stats(stats: RenderStats) -> str:
     )
     if stats.depth_shading:
         if stats.depth_relative:
+            near, far = relative_depth_window(stats.depth_gamma)
             shading_line = (
                 f"яркость: относительная (z_ref — ближайший сустав руки), ширина окна "
-                f"{DEPTH_RELATIVE_NEAR_M:g}…{DEPTH_RELATIVE_FAR_M:g} м, множитель "
+                f"{near:g}…{far:g} м, γ {stats.depth_gamma:g}, множитель "
                 f"{DEPTH_MIN_FACTOR:g}…1.0"
             )
         else:
@@ -2383,6 +2611,8 @@ def _format_stats(stats: RenderStats) -> str:
                 f"яркость: абсолютная, окно {DEPTH_NEAR_M:g}…{DEPTH_FAR_M:g} м, множитель "
                 f"{DEPTH_MIN_FACTOR:g}…1.0"
             )
+            if stats.depth_gamma != 1.0:
+                shading_line += f", γ {stats.depth_gamma:g}"
         if stats.depth_alpha:
             shading_line += (
                 f"; alpha: {DEPTH_MIN_ALPHA:g}…1.0, дальние раньше ближних"
@@ -2503,23 +2733,62 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="абсолютная шкала 0.22…0.48 м, как в 08g-fix2",
     )
+    gamma_group = parser.add_mutually_exclusive_group()
+    gamma_group.add_argument(
+        "--depth-gamma",
+        dest="depth_gamma",
+        type=float,
+        default=None,
+        metavar="G",
+        help=f"степень нелинейной шкалы 0 < G ≤ {DEPTH_GAMMA_MAX:g} "
+        f"(по умолчанию {DEPTH_GAMMA:g} для густого/26, 1.0 для 5 точек)",
+    )
+    gamma_group.add_argument(
+        "--no-depth-gamma",
+        dest="depth_gamma",
+        action="store_const",
+        const=1.0,
+        help="γ = 1.0: линейная шкала 08g-fix3 (побайтово), окно 0.155 м",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    skeleton = ALL_JOINTS if args.all_joints else FIVE_POINT if args.five_points else DEFAULT_SKELETON
-    depth_shading = resolve_depth_shading(args.depth_shading, skeleton)
-    if args.depth_alpha is True and args.depth_shading is not False:
-        # alpha считается из глубин: явный --depth-alpha включает и яркость (кроме
-        # --no-depth-color, который отключает всё разом)
-        depth_shading = True
-    if args.depth_relative is True and args.depth_shading is not False:
-        # --depth-relative тоже требует проекции глубин и включает яркость, если её выключили
-        depth_shading = True
-    depth_alpha = depth_shading and resolve_depth_alpha(args.depth_alpha, skeleton)
-    depth_relative = depth_shading and resolve_depth_relative(args.depth_relative, skeleton)
-    if args.depth_relative is None and args.depth_alpha is False:
-        # 08g-fix3: --no-depth-alpha без явного --depth-relative воспроизводит 08g-fix —
-        # абсолютную яркость без прозрачности (согласовано с пользователем)
-        depth_relative = False
+    try:
+        skeleton = (
+            ALL_JOINTS if args.all_joints
+            else FIVE_POINT if args.five_points
+            else DEFAULT_SKELETON
+        )
+        depth_shading = resolve_depth_shading(args.depth_shading, skeleton)
+        if args.depth_alpha is True and args.depth_shading is not False:
+            # alpha считается из глубин: явный --depth-alpha включает и яркость (кроме
+            # --no-depth-color, который отключает всё разом)
+            depth_shading = True
+        if args.depth_relative is True and args.depth_shading is not False:
+            # --depth-relative тоже требует проекции глубин и включает яркость, если её выключили
+            depth_shading = True
+        if (
+            args.depth_gamma is not None
+            and args.depth_gamma != 1.0
+            and args.depth_shading is not False
+        ):
+            # явная нелинейная γ требует глубин: включает яркость, если её выключили
+            depth_shading = True
+        if args.depth_gamma is not None:
+            _check_gamma(args.depth_gamma)  # ошибка видна даже при выключенной яркости
+        depth_alpha = depth_shading and resolve_depth_alpha(args.depth_alpha, skeleton)
+        depth_relative = depth_shading and resolve_depth_relative(args.depth_relative, skeleton)
+        if args.depth_relative is None and args.depth_alpha is False:
+            # 08g-fix3: --no-depth-alpha без явного --depth-relative воспроизводит 08g-fix —
+            # абсолютную яркость без прозрачности (согласовано с пользователем)
+            depth_relative = False
+        depth_gamma = (
+            resolve_depth_gamma(args.depth_gamma, skeleton)
+            if depth_shading and (depth_relative or args.depth_gamma is not None)
+            else 1.0
+        )
+    except ValueError as exc:
+        print(f"ошибка: {exc}", file=sys.stderr)
+        return 1
     try:
         scene = load_scene(args.meta, args.tracking, extra_keys=skeleton.extra_keys)
         if args.time_offset_ms is not None:
@@ -2547,12 +2816,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             + (
                 (
                     f" (относительная: z_ref — ближайший сустав руки, ширина окна "
-                    f"{DEPTH_RELATIVE_NEAR_M:g}…{DEPTH_RELATIVE_FAR_M:g} м, множитель "
-                    f"{DEPTH_MIN_FACTOR:g}…1.0)"
+                    f"{relative_depth_window(depth_gamma)[0]:g}…"
+                    f"{relative_depth_window(depth_gamma)[1]:g} м, γ {depth_gamma:g}, "
+                    f"множитель {DEPTH_MIN_FACTOR:g}…1.0)"
                     if depth_relative
                     else (
                         f" (абсолютная: окно {DEPTH_NEAR_M:g}…{DEPTH_FAR_M:g} м, множитель "
-                        f"{DEPTH_MIN_FACTOR:g}…1.0)"
+                        f"{DEPTH_MIN_FACTOR:g}…1.0"
+                        + (f", γ {depth_gamma:g}" if depth_gamma != 1.0 else "")
+                        + ")"
                     )
                 )
                 if depth_shading
@@ -2579,6 +2851,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 depth_shading=depth_shading,
                 depth_alpha=depth_alpha,
                 depth_relative=depth_relative,
+                depth_gamma=depth_gamma,
             )
             print(f"PNG с наложением: {len(paths)} файлов в {args.stills}")
             return 0
@@ -2599,6 +2872,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             depth_shading=depth_shading,
             depth_alpha=depth_alpha,
             depth_relative=depth_relative,
+            depth_gamma=depth_gamma,
         )
     except (OSError, ValueError) as exc:
         print(f"ошибка: {exc}", file=sys.stderr)
